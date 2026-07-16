@@ -1,0 +1,88 @@
+{
+  "loading": "Chargement des tâches…",
+  "empty": "Aucune tâche — lancez un OCR ou une indexation pour la voir apparaître ici.",
+  "machine": "Poste :",
+  "machineAll": "Tous",
+  "thisMachine": "ce poste",
+  "otherMachine": "un autre poste",
+  "type": {
+    "ocr": "OCR",
+    "index": "Index"
+  },
+  "status": {
+    "running": "En cours",
+    "queued": "En attente",
+    "paused": "En pause",
+    "done": "Terminé",
+    "error": "Échec",
+    "cancelled": "Annulé",
+    "interrupted": "Interrompu"
+  },
+  "table": {
+    "type": "Type",
+    "task": "Tâche",
+    "machine": "Poste",
+    "status": "Statut",
+    "progress": "Progression",
+    "time": "Temps",
+    "actions": "Actions"
+  },
+  "modelLabel": "Modèle : {{model}}",
+  "pages_one": "{{count}} page",
+  "pages_other": "{{count}} pages",
+  "registres_one": "{{count}} registre",
+  "registres_other": "{{count}} registres",
+  "failures_one": "{{count}} échec",
+  "failures_other": "{{count}} échecs",
+  "queuedOwned": "En attente de démarrage…",
+  "queuedOther": "En attente sur {{machine}}",
+  "pagesProcessed_one": "{{count}} page traitée",
+  "pagesProcessed_other": "{{count}} pages traitées",
+  "elapsed": "écoulé {{dur}}",
+  "remaining": " · reste ~{{dur}}",
+  "duration": "durée {{dur}}",
+  "actions": {
+    "pausing": "Mise en pause…",
+    "pause": "Mettre en pause",
+    "resume": "Reprendre",
+    "cancel": "Annuler",
+    "runningOther": "Tâche en cours sur un autre poste",
+    "delete": "Supprimer",
+    "deleteOther": "Supprimer (tâche d'un autre poste)",
+    "viewPages": "Voir les pages",
+    "viewRegistres": "Voir les registres"
+  },
+  "preflight": {
+    "label": "Environnement détecté :",
+    "krakenOk": "Kraken détecté",
+    "krakenAbsent": "Kraken absent",
+    "krakenNotFound": "Kraken introuvable",
+    "torchOk": "PyTorch détecté",
+    "torchAbsent": "PyTorch absent",
+    "torchNotFound": "PyTorch introuvable",
+    "cudaTooltip": "Accélération GPU utilisée",
+    "cpuLabel": "CPU",
+    "cpuTooltip": "Pas de GPU CUDA : exécution sur CPU (plus lent)",
+    "workersCount_one": "{{count}} worker",
+    "workersCount_other": "{{count}} workers",
+    "threadsPerWorker_one": "{{count}} thread par worker",
+    "threadsPerWorker_other": "{{count}} threads par worker",
+    "mixedSuffix": ", précision mixte"
+  },
+  "pagesPanel": {
+    "all": "Toutes",
+    "todo": "À faire",
+    "done": "Faites",
+    "failed": "Échecs",
+    "loading": "Chargement…",
+    "noPages": "Aucune page.",
+    "range": "{{start}}–{{end}} sur {{total}}"
+  },
+  "registresPanel": {
+    "loading": "Chargement…",
+    "noRegistres": "Aucun registre.",
+    "indexed": "{{done}} / {{all}} registres indexés",
+    "current": "1 en cours",
+    "pending": "{{count}} à faire"
+  }
+}

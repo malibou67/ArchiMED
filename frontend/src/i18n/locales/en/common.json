@@ -1,0 +1,90 @@
+{
+  "nav": {
+    "search": "Search",
+    "ocr": "OCR",
+    "collections": "Collections",
+    "indexes": "Index",
+    "tasks": "Tasks",
+    "settings": "Settings"
+  },
+  "pageTitles": {
+    "search": "Search in indexes",
+    "ocr": "OCR — Text recognition",
+    "ocrModels": "OCR — Models & Segmentation",
+    "collections": "Collections",
+    "indexes": "Index management",
+    "tasks": "Tasks",
+    "settings": "Settings",
+    "registreViewer": "Registre viewer",
+    "wordPages": "Pages for a word",
+    "indexContent": "Index content",
+    "appDefault": "ArchiMED OCR"
+  },
+  "ocrTabs": {
+    "textRecognition": "Text recognition",
+    "modelManagement": "Model management"
+  },
+  "tasksIndicator": {
+    "running_one": "{{count}} task running",
+    "running_other": "{{count}} tasks running",
+    "queuedSuffix": " · {{count}} queued",
+    "queued_one": "{{count}} task queued",
+    "queued_other": "{{count}} tasks queued",
+    "none": "No task running"
+  },
+  "taskWidget": {
+    "finished": "Task finished",
+    "view": "View",
+    "count_one": "{{count}} task",
+    "count_other": "{{count}} tasks",
+    "running": "Task running",
+    "paused": "Task paused",
+    "show": "Show tasks",
+    "reduce": "Collapse",
+    "pausedChip": "Paused",
+    "resume": "Resume",
+    "queued": "{{count}} queued",
+    "viewAll": "View all tasks",
+    "failures_one": "{{count}} failure",
+    "failures_other": "{{count}} failures",
+    "typeOcr": "OCR",
+    "typeIndexation": "Indexing"
+  },
+  "loading": {
+    "stats": "Computing statistics…",
+    "default": "Loading…"
+  },
+  "dataDir": {
+    "notFoundTitle": "Data folder not found",
+    "cannotReachServer": "Unable to reach the server to check storage. Make sure ArchiMED is running.",
+    "missing": "The application's data folder was not found. The installation may be incomplete or has been moved. Reinstall ArchiMED or restore the data folder, then try again.",
+    "retry": "Retry",
+    "readOnly": "The data folder is read-only — OCR, synchronization and indexing will fail. Check the access rights on "
+  },
+  "language": {
+    "title": "Language",
+    "description": "Language of the interface. This choice is saved on this computer only.",
+    "english": "English",
+    "french": "Français"
+  },
+  "actions": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "saving": "Saving…",
+    "close": "Close"
+  },
+  "imageViewer": {
+    "loadError": "Unable to load the image.",
+    "prev": "Previous",
+    "next": "Next",
+    "legend": "← → navigate · wheel to zoom · drag to move",
+    "zoom": "Zoom",
+    "relatedPages_one": "{{count}} related page",
+    "relatedPages_other": "{{count}} related pages",
+    "downloadAnnotated": "Download with annotations",
+    "openFull": "Open full page",
+    "back": "Back",
+    "noPage": "No page to display.",
+    "download": "Download"
+  }
+}

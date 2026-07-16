@@ -1,0 +1,17 @@
+# PyTorch avec support CUDA (GPU NVIDIA).
+# Cet index est consulte EN PLUS de PyPI : pip y trouve la build "+cu128"
+# (CUDA 12.8) qui est prioritaire sur la build CPU publiee sur PyPI.
+# Sur une machine sans GPU NVIDIA, torch fonctionnera quand meme sur CPU.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+pydantic==2.5.3
+python-dotenv==1.0.0
+kraken>=4.0
+torch==2.11.0
+torchvision==0.26.0
+Pillow
+pystray
+rapidfuzz==3.14.5

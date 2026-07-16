@@ -1,0 +1,485 @@
+"""Runner OCR Kraken (segmentation + reconnaissance → PAGE XML).
+
+L'OCR est un **type de tâche** géré par le moteur générique `TaskService` (file, persistance,
+reprise). Ce module fournit le runner `run_ocr_task` (pipeline multiprocessing) + le détail
+par page (`pages_slice`/`_page_status`), et délègue la file/le cycle de vie à TaskService.
+"""
+import os
+import threading
+import dataclasses
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from services import DATA_DIR, ModelsService, CollectionsService, RegistresService
+from settings_service import SettingsService
+from system_checks import check_requirements
+from task_service import TaskService
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+
+# Sous ce nombre de pages, on reste en séquentiel (le démarrage du pool ne vaut pas le coup).
+POOL_MIN_PAGES = 3
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Précision mixte (autocast + TF32) par défaut (env). Mesuré sans effet sur ce modèle (goulot
+# = post-traitement CPU). Surchargée par le réglage UI s'il est défini.
+MIXED_PRECISION = os.getenv('OCR_MIXED_PRECISION', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# ── Réglages effectifs : UI (settings.json) > variable d'env > défaut ──────────────
+def adaptive_default_workers(cores: int) -> int:
+    """Laisse au moins la moitié des cœurs libres, plafonné à 4 (machine utilisable)."""
+    return max(1, min(4, cores // 2))
+
+
+def effective_workers() -> int:
+    cores = os.cpu_count() or 1
+    stored = SettingsService.get().get('ocr_workers')
+    if stored is not None:
+        try:
+            return max(1, min(int(stored), cores))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv('OCR_WORKERS')
+    if raw and raw.strip():
+        try:
+            return max(1, min(int(raw), cores))
+        except (TypeError, ValueError):
+            pass
+    return adaptive_default_workers(cores)
+
+
+def effective_threads() -> int:
+    stored = SettingsService.get().get('ocr_threads_per_worker')
+    if stored is not None:
+        try:
+            return max(1, int(stored))
+        except (TypeError, ValueError):
+            pass
+    return max(1, _env_int('OCR_THREADS_PER_WORKER', 1))
+
+
+def effective_mixed() -> bool:
+    stored = SettingsService.get().get('ocr_mixed_precision')
+    if stored is not None:
+        return bool(stored)
+    return MIXED_PRECISION
+
+
+def effective_pool_min_pages() -> int:
+    stored = SettingsService.get().get('ocr_pool_min_pages')
+    if stored is not None:
+        try:
+            return max(1, min(int(stored), 50))
+        except (TypeError, ValueError):
+            pass
+    return max(1, min(_env_int('OCR_POOL_MIN_PAGES', POOL_MIN_PAGES), 50))
+
+
+# ── Workers multiprocessing (fonctions au niveau module → picklables sous Windows) ──
+_W_SEG = None
+_W_OCR = None
+_W_DEVICE = 'cpu'
+_W_MIXED = False
+
+
+def _ocr_worker_init(seg_model_id: str, ocr_model_id: str, device: str, threads: int, mixed: bool) -> None:
+    """Initialise un process worker : bride les threads (anti-sur-souscription) puis charge
+    les modèles une fois. Les variables d'env de threads doivent être posées AVANT torch."""
+    import os as _os
+    for _v in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        _os.environ[_v] = str(threads)
+    import torch
+    try:
+        torch.set_num_threads(max(1, threads))
+    except Exception:
+        pass
+    if mixed and device == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    from kraken.lib import vgsl, models as kmodels
+    global _W_SEG, _W_OCR, _W_DEVICE, _W_MIXED
+    _W_SEG = vgsl.TorchVGSLModel.load_model(str(OcrService._resolve_model_path(seg_model_id)))
+    _W_OCR = kmodels.load_any(str(OcrService._resolve_model_path(ocr_model_id)), device=device)
+    _W_DEVICE = device
+    _W_MIXED = mixed
+
+
+def _ocr_worker_page(task):
+    """Traite une page dans un worker : segmentation → reconnaissance → PAGE XML écrit."""
+    idx, col, reg, img_name, ocr_model_id = task
+    label = f"{reg}/{img_name}"
+    try:
+        from PIL import Image
+        from kraken import blla, rpred, serialization
+        collections_root = Path(DATA_DIR) / "collections"
+        img_path = collections_root / col / "scans" / reg / img_name
+        if not img_path.exists():
+            raise FileNotFoundError(f"Image introuvable : {img_path}")
+        out_dir = collections_root / col / "ocr" / reg / ocr_model_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / (Path(img_name).stem + ".xml")
+        im = Image.open(img_path).convert('RGB')
+        bounds = blla.segment(im, model=_W_SEG, device=_W_DEVICE, autocast=_W_MIXED)
+        preds = list(rpred.rpred(_W_OCR, im, bounds))
+        results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
+        xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
+        out_path.write_text(xml, encoding='utf-8')
+        return (idx, col, label, True, None)
+    except Exception as e:
+        return (idx, col, label, False, str(e))
+
+
+class OcrService:
+    # Modèles chargés une seule fois et gardés chauds (réutilisés entre les jobs).
+    _model_cache: Dict[str, Any] = {}
+    _model_lock = threading.Lock()
+
+    # ── Enfilage (délégué au moteur générique) ────────────────────────
+    @staticmethod
+    def enqueue(seg_model_id: str, ocr_model_id: str, pages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Ajoute une tâche OCR à la lane 'ocr'."""
+        collections = sorted({p['collection'] for p in pages})
+        registres = sorted({p['registre'] for p in pages})
+        label = ', '.join(collections) if collections else 'OCR'
+        fields = {
+            'total': len(pages),
+            'seg_model': seg_model_id,
+            'ocr_model': ocr_model_id,
+            'collections': collections,
+            'registres': registres,
+            'pages': pages,
+        }
+        return TaskService.enqueue('ocr', label, fields)
+
+    # ── Détail par page (utilisé par /api/tasks/{id}/pages) ───────────
+    @staticmethod
+    def _page_status(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """État de chaque page. En parallèle les pages se terminent dans le désordre, donc
+        on s'appuie sur `page_states` (aligné sur `pages`) : 0=à faire, 1=faite, 2=échec,
+        3=en cours. Repli sur une déduction par ordre si `page_states` absent."""
+        pages = task.get('pages') or []
+        errors = task.get('errors') or []
+        error_by_label = {e.get('page'): e.get('error') for e in errors}
+        states = task.get('page_states')
+
+        result: List[Dict[str, Any]] = []
+        if isinstance(states, list) and len(states) == len(pages):
+            names = {0: 'pending', 1: 'done', 2: 'failed', 3: 'current'}
+            for i, p in enumerate(pages):
+                label = f"{p['registre']}/{p['page']}"
+                st = names.get(states[i], 'pending')
+                item: Dict[str, Any] = {'page': label, 'status': st}
+                if st == 'failed':
+                    item['error'] = error_by_label.get(label)
+                result.append(item)
+            return result
+
+        attempted = task.get('processed', 0) + task.get('failed', 0)
+        running = task.get('status') == 'running'
+        current = task.get('current')
+        for i, p in enumerate(pages):
+            label = f"{p['registre']}/{p['page']}"
+            if i < attempted:
+                st = 'failed' if label in error_by_label else 'done'
+            elif running and (label == current or i == attempted):
+                st = 'current'
+            else:
+                st = 'pending'
+            item = {'page': label, 'status': st}
+            if st == 'failed':
+                item['error'] = error_by_label.get(label)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def pages_slice(task: Dict[str, Any], status_filter: str = 'all', offset: int = 0, limit: int = 100) -> Dict[str, Any]:
+        """Tranche paginée de l'état des pages d'une tâche OCR."""
+        full = OcrService._page_status(task)
+        counts = {
+            'all': len(full),
+            'done': sum(1 for p in full if p['status'] == 'done'),
+            'failed': sum(1 for p in full if p['status'] == 'failed'),
+            'todo': sum(1 for p in full if p['status'] in ('pending', 'current')),
+        }
+        if status_filter == 'done':
+            items = [p for p in full if p['status'] == 'done']
+        elif status_filter == 'failed':
+            items = [p for p in full if p['status'] == 'failed']
+        elif status_filter == 'todo':
+            items = [p for p in full if p['status'] in ('pending', 'current')]
+        else:
+            items = full
+        offset = max(0, offset)
+        limit = max(1, min(limit, 500))
+        return {
+            'total': len(items),
+            'offset': offset,
+            'limit': limit,
+            'counts': counts,
+            'items': items[offset:offset + limit],
+        }
+
+    # ── État de transcription (pages faites / manquantes) ─────────────
+    @staticmethod
+    def done_stems(collection: str, registre: str, model_id: str) -> List[str]:
+        """Stems (nom sans extension) des PAGE XML déjà produits pour (collection, registre, modèle).
+        Même règle que l'écriture (Path(img).stem) : deux images qui ne diffèrent que par
+        l'extension partagent donc le même stem."""
+        d = Path(DATA_DIR) / "collections" / collection / "ocr" / registre / model_id
+        if not d.is_dir():
+            return []
+        return sorted(f.stem for f in d.iterdir() if f.suffix == '.xml')
+
+    @staticmethod
+    def missing_pages(model_id: str, scope: Optional[List[Dict[str, Optional[str]]]] = None) -> List[Dict[str, str]]:
+        """Pages (fichiers image des scans) sans transcription pour ce modèle.
+        `scope` : liste optionnelle de {'collection': ..., 'registre': optionnel} ;
+        None ou vide = toutes les collections."""
+        collections_root = Path(DATA_DIR) / "collections"
+        if not collections_root.exists():
+            return []
+
+        # collection -> set de registres demandés (None = tous les registres)
+        wanted: Optional[Dict[str, Optional[set]]] = None
+        if scope:
+            wanted = {}
+            for item in scope:
+                col = item.get('collection')
+                if not col:
+                    continue
+                reg = item.get('registre')
+                if not reg:
+                    wanted[col] = None  # toute la collection
+                elif col not in wanted:
+                    wanted[col] = {reg}
+                elif wanted[col] is not None:
+                    wanted[col].add(reg)
+
+        result: List[Dict[str, str]] = []
+        for col_dir in sorted(collections_root.iterdir()):
+            if not col_dir.is_dir() or CollectionsService._SCAN_EXCLUDE.match(col_dir.name):
+                continue
+            if wanted is not None and col_dir.name not in wanted:
+                continue
+            scans_dir = col_dir / "scans"
+            if not scans_dir.exists():
+                continue
+            regs_filter = wanted.get(col_dir.name) if wanted is not None else None
+            for reg_dir in sorted(scans_dir.iterdir()):
+                if not reg_dir.is_dir():
+                    continue
+                if regs_filter is not None and reg_dir.name not in regs_filter:
+                    continue
+                done = set(OcrService.done_stems(col_dir.name, reg_dir.name, model_id))
+                for img_name in RegistresService.list_scan_pages(col_dir.name, reg_dir.name):
+                    if Path(img_name).stem not in done:
+                        result.append({'collection': col_dir.name, 'registre': reg_dir.name, 'page': img_name})
+        return result
+
+    # ── Résolution / cache des modèles ────────────────────────────────
+    @staticmethod
+    def _resolve_model_path(model_id: str) -> Optional[Path]:
+        """Résout le fichier .mlmodel d'un modèle (dossier des modèles, repli file_path)."""
+        models_dir = ModelsService.get_models_dir()
+        candidate = models_dir / f"{model_id}.mlmodel"
+        if candidate.exists():
+            return candidate
+        model = ModelsService.get_model(model_id)
+        if model and model.get('file_path'):
+            p = Path(model['file_path'])
+            if not p.is_absolute():
+                p = Path(DATA_DIR).parent / p
+            if p.exists():
+                return p
+        return None
+
+    @staticmethod
+    def _get_seg_net(model_id: str):
+        key = f"seg:{model_id}"
+        with OcrService._model_lock:
+            if key not in OcrService._model_cache:
+                path = OcrService._resolve_model_path(model_id)
+                if path is None:
+                    raise RuntimeError(f"Fichier du modèle de segmentation introuvable : {model_id}")
+                from kraken.lib import vgsl
+                OcrService._model_cache[key] = vgsl.TorchVGSLModel.load_model(str(path))
+            return OcrService._model_cache[key]
+
+    @staticmethod
+    def _get_ocr_net(model_id: str, device: str):
+        key = f"ocr:{model_id}:{device}"
+        with OcrService._model_lock:
+            if key not in OcrService._model_cache:
+                path = OcrService._resolve_model_path(model_id)
+                if path is None:
+                    raise RuntimeError(f"Fichier du modèle OCR introuvable : {model_id}")
+                from kraken.lib import models as kmodels
+                OcrService._model_cache[key] = kmodels.load_any(str(path), device=device)
+            return OcrService._model_cache[key]
+
+    # ── Traitement ────────────────────────────────────────────────────
+    @staticmethod
+    def _process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed) -> None:
+        """Traitement séquentiel (W=1 ou petit job) : modèles gardés chauds en cache."""
+        import torch
+        from PIL import Image
+        from kraken import blla, rpred, serialization
+
+        use_amp = bool(mixed)
+        if use_amp:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        seg_net = OcrService._get_seg_net(seg_model_id)
+        ocr_net = OcrService._get_ocr_net(ocr_model_id, device)
+        states = task['page_states']
+        collections_root = Path(DATA_DIR) / "collections"
+
+        for i, page in enumerate(pages):
+            if task['cancel']:
+                task['status'] = 'cancelled'
+                break
+            col = page['collection']; reg = page['registre']; img_name = page['page']
+            label = f"{reg}/{img_name}"
+            task['current'] = label
+            states[i] = 3  # en cours
+            try:
+                img_path = collections_root / col / "scans" / reg / img_name
+                if not img_path.exists():
+                    raise FileNotFoundError(f"Image introuvable : {img_path}")
+                out_dir = collections_root / col / "ocr" / reg / ocr_model_id
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / (Path(img_name).stem + ".xml")
+
+                im = Image.open(img_path).convert('RGB')
+                bounds = blla.segment(im, model=seg_net, device=device, autocast=use_amp)
+                preds = list(rpred.rpred(ocr_net, im, bounds))
+                results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
+                xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
+                out_path.write_text(xml, encoding='utf-8')
+
+                states[i] = 1
+                touched_collections.add(col)
+                task['processed'] += 1
+            except Exception as e:
+                states[i] = 2
+                task['failed'] += 1
+                task['errors'].append({'page': label, 'error': str(e)})
+            TaskService._save_throttled(task)
+
+    @staticmethod
+    def _process_pool(task, pages, touched_collections, seg_model_id, ocr_model_id, device, workers, threads, mixed) -> None:
+        """Traitement parallèle : un pool de process traite les pages en concurrence
+        (le post-traitement CPU, goulot réel, s'étale sur les cœurs). Les pages se terminent
+        dans le désordre → on note l'état par index dans page_states."""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        states = task['page_states']
+        tasks = [(i, p['collection'], p['registre'], p['page'], ocr_model_id) for i, p in enumerate(pages)]
+
+        executor = ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_ocr_worker_init,
+            initargs=(seg_model_id, ocr_model_id, device, threads, bool(mixed)),
+        )
+        try:
+            futures = [executor.submit(_ocr_worker_page, t) for t in tasks]
+            for fut in as_completed(futures):
+                if task['cancel']:
+                    task['status'] = 'cancelled'
+                    break
+                idx, col, label, ok, err = fut.result()
+                if ok:
+                    states[idx] = 1
+                    touched_collections.add(col)
+                    task['processed'] += 1
+                else:
+                    states[idx] = 2
+                    task['failed'] += 1
+                    task['errors'].append({'page': label, 'error': err})
+                task['current'] = label
+                TaskService._save_throttled(task)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+def run_ocr_task(task: Dict[str, Any]) -> None:
+    """Runner OCR appelé par TaskService. Met à jour la tâche en place ; ne fixe pas le statut
+    final 'done'/'error' (géré par le moteur) mais peut passer 'cancelled'."""
+    pages = task.get('pages') or []
+    seg_model_id = task['seg_model']
+    ocr_model_id = task['ocr_model']
+    touched_collections: set = set()
+    try:
+        if not isinstance(task.get('page_states'), list) or len(task['page_states']) != len(pages):
+            task['page_states'] = [0] * len(pages)
+
+        # Préflight : on vérifie l'environnement au moment de l'exécution (la vérif faite
+        # côté page peut être périmée) et on journalise le résultat dans la tâche.
+        pre = check_requirements()
+        device = 'cuda' if (pre.get('cuda') or {}).get('ok') else 'cpu'
+        task['preflight'] = {
+            **pre,
+            'device': device,
+            'workers': effective_workers(),
+            'threads': effective_threads(),
+            'mixed_precision': effective_mixed() and device == 'cuda',
+            'checked_at': datetime.now().isoformat(),
+        }
+        TaskService._save(task)
+
+        missing = [label for key, label in
+                   (('torch', 'PyTorch'), ('torchvision', 'torchvision'), ('kraken', 'Kraken'))
+                   if not (pre.get(key) or {}).get('ok')]
+        if missing:
+            details = '; '.join(
+                e for e in ((pre.get(k) or {}).get('error') for k in ('torch', 'torchvision', 'kraken')) if e
+            )
+            raise RuntimeError(
+                f"Environnement OCR incomplet : {', '.join(missing)} indisponible(s). "
+                + (f"Détail : {details}" if details
+                   else "Vérifiez l'installation Python (pip install torch torchvision kraken).")
+            )
+
+        if OcrService._resolve_model_path(seg_model_id) is None:
+            raise RuntimeError(f"Fichier du modèle de segmentation introuvable : {seg_model_id}")
+        if OcrService._resolve_model_path(ocr_model_id) is None:
+            raise RuntimeError(f"Fichier du modèle OCR introuvable : {ocr_model_id}")
+
+        workers = task['preflight']['workers']
+        threads = task['preflight']['threads']
+        mixed = task['preflight']['mixed_precision']
+
+        if workers <= 1 or len(pages) < effective_pool_min_pages():
+            OcrService._process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed)
+        else:
+            try:
+                OcrService._process_pool(task, pages, touched_collections, seg_model_id, ocr_model_id, device, workers, threads, mixed)
+            except Exception as pool_err:
+                if task['cancel']:
+                    raise
+                task['processed'] = 0
+                task['failed'] = 0
+                task['errors'] = []
+                task['page_states'] = [0] * len(pages)
+                task['status'] = 'running'
+                print(f"[OCR] pool indisponible ({pool_err}); repli séquentiel.", flush=True)
+                OcrService._process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed)
+    finally:
+        for col in touched_collections:
+            try:
+                CollectionsService.sync_collection_metadata(col)
+            except Exception:
+                pass
+
+
+TaskService.register('ocr', run_ocr_task)

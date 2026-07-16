@@ -1,0 +1,18 @@
+{
+  "title": "Transcriptions",
+  "empty": "No transcription found.",
+  "error": "Error while loading",
+  "registresCount_one": "{{count}} registre",
+  "registresCount_other": "{{count}} registres",
+  "filesCount_one": "{{val}} file",
+  "filesCount_other": "{{val}} files",
+  "summaryFiles_one": "{{val}} file in total",
+  "summaryFiles_other": "{{val}} files in total",
+  "collectionsCount_one": "{{count}} collection",
+  "collectionsCount_other": "{{count}} collections",
+  "modelCount": "{{model}}: {{val}}",
+  "table": {
+    "registre": "Registre",
+    "total": "Total"
+  }
+}

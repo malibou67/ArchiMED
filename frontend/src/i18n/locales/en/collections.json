@@ -1,0 +1,201 @@
+{
+  "anomaly": {
+    "metadataUnreadableLabel": "metadata.json unreadable",
+    "metadataUnreadableDetail": "The metadata.json file exists but could not be read (invalid or corrupted JSON).",
+    "absentDiskLabel": "Missing from disk",
+    "absentDiskDetail": "This registre is listed in the metadata but its folder cannot be found in scans/.",
+    "ocrOrphan": "Orphan OCR",
+    "ocrOrphanArg": "Orphan OCR: {{arg}}",
+    "ocrOrphanDetail": "The OCR folder “{{arg}}” has no matching scans folder in scans/.",
+    "outsideScans": "Outside scans/",
+    "outsideScansArg": "Outside scans/: {{arg}}",
+    "outsideScansDetail": "The folder “{{arg}}” contains images but is outside scans/: move it into scans/ so it is taken into account.",
+    "emptyLabel": "Empty registre",
+    "emptyDetail": "No image was found in the scans/ folder of this registre.",
+    "paginationLabel": "Undetectable pagination",
+    "paginationDetail": "Could not detect a consistent numbering pattern in the file names of this registre."
+  },
+  "pagination": {
+    "missingNumbers": "Missing numbers: {{list}}",
+    "gaps_one": "{{count}} gap",
+    "gaps_other": "{{count}} gaps",
+    "duplicateNumbers": "Duplicate numbers: {{list}}",
+    "duplicates_one": "{{count}} duplicate",
+    "duplicates_other": "{{count}} duplicates"
+  },
+  "progress": {
+    "of": "{{action}} of “{{name}}”…",
+    "inProgress": "{{action}} in progress…",
+    "sync": "Synchronization",
+    "analyze": "Analysis"
+  },
+  "status": {
+    "metadataPresent": "metadata.json present",
+    "metadataMissing": "metadata.json missing",
+    "scansPresent": "scans/ present",
+    "scansMissing": "scans/ missing",
+    "ocrPresent": "ocr/ present",
+    "ocrMissing": "ocr/ missing"
+  },
+  "new": "New",
+  "syncCollection": "Synchronize this collection",
+  "registresCount_one": "{{count}} registre",
+  "registresCount_other": "{{count}} registres",
+  "regTable": {
+    "registre": "Registre",
+    "pages": "Pages",
+    "ocr": "OCR",
+    "paginationAnomalies": "Pagination / anomalies"
+  },
+  "coverage": {
+    "notTranscribedTooltip": "Not transcribed — 0 page of {{total}}",
+    "notTranscribed": "Not transcribed",
+    "zeroTooltip": "0 page of {{total}} — {{total}} pages remaining",
+    "perModel": "{{model}}: {{pct}}% ({{count}}/{{total}})",
+    "transcribedPct": "Transcribed · {{pct}}%",
+    "completeTooltip": "{{total}} of {{total}} pages — OCR complete",
+    "partialTooltip": "{{count}} of {{total}} pages — {{remaining}} remaining",
+    "modelPct": "{{model}} · {{pct}}%"
+  },
+  "errors": {
+    "loadCollections": "Error while loading the collections",
+    "editCollection": "Error while editing the collection",
+    "editRegistre": "Error while editing the registre",
+    "scan": "Error during the analysis",
+    "sync": "Error during synchronization",
+    "syncCollection": "Error while synchronizing the collection"
+  },
+  "loading": "Loading the collections…",
+  "backToCollections": "Back to collections",
+  "statsPage": {
+    "headerTitle": "Statistics — {{name}}"
+  },
+  "viewer": {
+    "loading": "Loading the registre…",
+    "headerPages_one": "{{count}} page",
+    "headerPages_other": "{{count}} pages",
+    "thumbnails": "Thumbnails",
+    "noPages": "No scanned page found for this registre."
+  },
+  "toolbar": {
+    "type": "Type",
+    "all": "All ({{count}})",
+    "searchPlaceholder": "Search for a collection or a registre…",
+    "info": "Information",
+    "scan": "Scan"
+  },
+  "empty": {
+    "title": "No collection",
+    "description": "Drop a folder in data/collections then run a scan to detect it.",
+    "action": "Scan"
+  },
+  "noMatch": "No collection matches the filter",
+  "table": {
+    "type": "Type",
+    "title": "Title",
+    "period": "Period",
+    "place": "Place",
+    "registres": "Registres",
+    "transcriptions": "Transcriptions",
+    "actions": "Actions"
+  },
+  "subTable": {
+    "registreTitle": "Registre title",
+    "period": "Period",
+    "transcriptionsPages": "Transcriptions / Pages"
+  },
+  "rowActions": {
+    "viewStats": "View statistics",
+    "syncMetadata": "Synchronize metadata (scans, transcriptions)",
+    "edit": "Edit",
+    "editRegistre": "Edit the registre",
+    "showPage": "Show the page"
+  },
+  "pageRow": {
+    "noPages": "No page found",
+    "missingPage": "{{name}} — missing page",
+    "transcribedByTooltip": "Transcribed by: {{models}}",
+    "notTranscribedTooltip": "Not transcribed",
+    "transcribed": "Transcribed",
+    "transcribedMulti": "Transcribed ·{{count}}",
+    "notTranscribed": "Not transcribed",
+    "extra": "extra",
+    "duplicate": "duplicate"
+  },
+  "editReg": {
+    "title": "Edit the registre",
+    "subtitle": "Metadata and pagination patterns of the scan files.",
+    "titleField": "Title",
+    "periodStart": "Period start",
+    "periodEnd": "Period end",
+    "pagination": "Pagination",
+    "filePattern": "File name pattern",
+    "filePatternHelper": "E.g. my-register_{num}.jpg",
+    "startPage": "Start page",
+    "endPage": "End page",
+    "extraPages": "Additional pages",
+    "extraPattern": "Additional pages pattern",
+    "extraPatternHelper": "E.g. my-register_{num}_{extra_page}.jpg"
+  },
+  "editCol": {
+    "title": "Edit the collection",
+    "subtitle": "Changes are saved in the collection's metadata.json.",
+    "type": "Type",
+    "titleField": "Title",
+    "periodStart": "Period start",
+    "periodEnd": "Period end",
+    "place": "Place",
+    "comment": "Comment"
+  },
+  "scan": {
+    "title": "Analysis of the data/collections folder",
+    "subtitle": "Read-only diagnosis: pages, OCR coverage per model, pagination and anomalies. Synchronization creates the missing collections and updates their registres.",
+    "collectionsCount_one": "{{count}} collection",
+    "collectionsCount_other": "{{count}} collections",
+    "newCount_one": "{{count}} new",
+    "newCount_other": "{{count}} new",
+    "newRegistresCount_one": "{{count}} registre not synced",
+    "newRegistresCount_other": "{{count}} registres not synced",
+    "anomaliesCount_one": "{{count}} anomaly",
+    "anomaliesCount_other": "{{count}} anomalies",
+    "allSynced": "Everything is synchronized",
+    "onlyIssuesTooltip": "Show only new collections or those with an anomaly",
+    "onlyIssuesChip": "New / anomalies",
+    "noCollectionsFilter": "No collection to display with this filter.",
+    "colHeader": "Collection",
+    "registresHeader": "Registres",
+    "syncAll": "Synchronize all"
+  },
+  "info": {
+    "title": "File organization in the data folder",
+    "subtitle": "How to place your scans and transcriptions so the application detects them, and how processing works.",
+    "whereTitle": "Where to place files",
+    "whereText": "Everything goes under <code>data/collections/</code>. One folder per <strong>collection</strong>, containing a <code>scans/</code> subfolder (and, after OCR, <code>ocr/</code>). Each <strong>registre</strong> is a folder inside <code>scans/</code>.",
+    "treeBlock": "data/collections/\n└── my-collection/                     ← one folder = one collection\n    ├── metadata.json                  ← type, title, period, place (auto on scan)\n    ├── scans/\n    │   └── my-register/               ← one folder = one registre\n    │       ├── metadata.json          ← title, period, pagination (auto on scan)\n    │       ├── my-register_1.jpg      ← _1 = page 1 (number after the last _)\n    │       ├── my-register_2.jpg      ← _2 = page 2\n    │       └── my-register_2_1.jpg    ← insert after page 2 (suffix _1)\n    └── ocr/\n        └── my-register/\n            └── my-model/              ← one subfolder per OCR model\n                └── my-register_1.xml  ← PAGE-XML, same base name as the scan",
+    "namingTitle": "File names & formats",
+    "formatsLabel": "Accepted image formats:",
+    "namingItem1": "The images of a registre follow a <code>prefix + number + extension</code> pattern, e.g. <code>my-register_1.jpg</code>, <code>my-register_2.jpg</code>… The pattern and the bounds (first / last page) are <strong>detected automatically</strong> on scan, and remain editable via “Edit the registre”.",
+    "namingItem2": "Insert pages (outside the main numbering): pattern <code>prefix + number + _ + suffix</code>, e.g. <code>my-register_2_1.jpg</code>.",
+    "namingItem3": "OCR: one subfolder per model in <code>ocr/[registre]/[model]/</code>, <code>.xml</code> files in PAGE-XML format with the <strong>same base name</strong> as the image.",
+    "namingItem4": "The <code>metadata.json</code> files are generated and completed by synchronization — no need to write them by hand.",
+    "rulesTitle": "Naming rules to follow",
+    "rule1": "The page number must be the <strong>last number</strong> in the name, right before the extension.",
+    "rule2": "Separate it from the rest of the name with an <strong>underscore <code>_</code></strong> (e.g. <code>my-register_1.jpg</code>) — this separator is what groups a page and its inserts. Do not remove it.",
+    "rule3": "All files of the same registre must share <strong>exactly the same prefix</strong>.",
+    "rule4": "Insert page: add a suffix after the number, <code>…_[number]_[suffix].jpg</code> (e.g. <code>my-register_2_1.jpg</code>).",
+    "rule5": "<strong>To avoid:</strong> any other number placed after the page number (outside the insert form) — it would distort pagination detection.",
+    "howTitle": "How the application works",
+    "how1": "Place the collection / registre folders in <code>data/collections</code>.",
+    "how2": "<strong>Scan</strong>: read-only diagnosis (pages, OCR coverage, pagination, anomalies).",
+    "how3": "<strong>Synchronize</strong>: creates the missing collections / registres and updates the <code>metadata.json</code> files.",
+    "how4": "Run <strong>OCR</strong> on a registre with a Kraken model.",
+    "how5": "<strong>Generate the index</strong> (full text), then <strong>search</strong> the corpus.",
+    "anomaliesTitle": "Anomalies reported by the scan",
+    "anomalyItem1": "<strong>Empty registre</strong> — no image in the registre folder.",
+    "anomalyItem2": "<strong>Undetectable pagination</strong> — cannot infer a pattern from the file names.",
+    "anomalyItem3": "<strong>Unreadable metadata.json</strong> — corrupted or malformed metadata file.",
+    "anomalyItem4": "<strong>Missing from disk</strong> — registre listed in the metadata but not found on disk.",
+    "anomalyItem5": "<strong>Orphan OCR</strong> — OCR folder without a matching scans folder.",
+    "anomalyItem6": "<strong>Outside scans/</strong> — images are placed outside the <code>scans/</code> subfolder."
+  }
+}

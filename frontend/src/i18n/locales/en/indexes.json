@@ -1,0 +1,104 @@
+{
+  "loading": "Loading indexes…",
+  "status": {
+    "ready": "Ready",
+    "generating": "Generating…",
+    "error": "Error",
+    "paused": "Paused",
+    "interrupted": "Interrupted",
+    "waiting": "Waiting",
+    "rebuilding": "Rebuilding…"
+  },
+  "progress": {
+    "rebuilding": "Rebuilding…",
+    "starting": "Starting…",
+    "queued": "In queue…"
+  },
+  "builder": {
+    "createTitle": "Generate an index",
+    "editTitle": "Edit the index",
+    "subtitle": "Compose the index from one or more collections, each with one or more OCR models.",
+    "nameLabel": "Index name",
+    "namePlaceholder": "Index name…",
+    "sources": "SOURCES",
+    "chooseCollection": "Choose a collection…",
+    "removeSource": "Remove this source",
+    "ocrModels": "OCR models",
+    "selectModels": "Select one or more models…",
+    "noModels": "No model available",
+    "chooseCollectionFirst": "Choose a collection first",
+    "addCollection": "Add a collection",
+    "preview": "Preview",
+    "computingPreview": "Computing the preview…",
+    "sourcesCount_one": "{{count}} source",
+    "sourcesCount_other": "{{count}} sources",
+    "registresCount_one": "{{val}} registre",
+    "registresCount_other": "{{val}} registres",
+    "pagesToIndex_one": "{{val}} page to index",
+    "pagesToIndex_other": "{{val}} pages to index",
+    "saveRebuild": "Save and rebuild",
+    "generate": "Generate"
+  },
+  "errors": {
+    "load": "Error while loading the indexes",
+    "generate": "Error during generation",
+    "rebuild": "Error during the rebuild",
+    "cancel": "Error while cancelling",
+    "pause": "Error while pausing",
+    "resume": "Error while resuming",
+    "delete": "Error while deleting"
+  },
+  "success": {
+    "updated": "Index updated — rebuild in progress, follow the progress in Tasks.",
+    "queued": "Indexing added to the queue — follow the progress in Tasks.",
+    "rebuildQueued": "Rebuild added to the queue — the index stays available until it finishes.",
+    "cancelled": "Indexing cancelled.",
+    "pausing": "Pausing — can be resumed from Tasks.",
+    "resumed": "Indexing resumed.",
+    "deleted": "Index deleted."
+  },
+  "list": {
+    "title": "Existing indexes",
+    "searchPlaceholder": "Search for an index, a collection, a model…",
+    "refreshTooltip": "Reload the list and detect new transcriptions to index",
+    "refresh": "Refresh the list",
+    "emptyTitle": "No index",
+    "emptyDesc": "No index generated — create one from one or more transcribed collections.",
+    "noMatch": "No index matches the search",
+    "wordsCount_one": "{{val}} word",
+    "wordsCount_other": "{{val}} words",
+    "registresCount_one": "{{count}} registre",
+    "registresCount_other": "{{count}} registres",
+    "occAbbr": "{{val}} occ.",
+    "newPages_one": "+{{val}} page",
+    "newPages_other": "+{{val}} pages",
+    "newRegistres_one": "+{{count}} registre",
+    "newRegistres_other": "+{{count}} registres",
+    "toIndex": "to index"
+  },
+  "table": {
+    "index": "Index",
+    "composition": "Composition",
+    "wordsProgress": "Words / progress",
+    "createdAt": "Created on",
+    "status": "Status"
+  },
+  "actions": {
+    "viewCurrent": "View the index content (current version)",
+    "view": "View the index content",
+    "resume": "Resume indexing",
+    "resumeInterrupted": "Resume the interrupted indexing",
+    "pausing": "Pausing…",
+    "pause": "Pause (can be resumed)",
+    "cancelGeneration": "Cancel generation",
+    "cancelling": "Cancelling…",
+    "edit": "Edit (name, collections, models)",
+    "update": "Update the index (new transcriptions available)",
+    "rebuild": "Rebuild the index",
+    "delete": "Delete"
+  },
+  "deleteDialog": {
+    "title": "Delete the index",
+    "confirm": "Delete the index <strong>{{name}}</strong>? This action is irreversible."
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "performance": {
+    "title": "Performance OCR",
+    "reset": "Réinitialiser les défauts",
+    "resetting": "Réinitialisation…",
+    "parallelPages": "Nombre de pages en parallèle",
+    "auto": "Automatique",
+    "manual": "Manuel",
+    "autoHint": "En automatique, on laisse au moins la moitié des cœurs libres (recommandé : {{recommended}} sur {{cpu}}).",
+    "manualHint": "En manuel, vous choisissez vous-même le nombre de pages traitées en même temps.",
+    "pagesInParallel": "Pages traitées en parallèle :",
+    "allCoresWarning": "Tous les cœurs seront utilisés — le PC risque de ramer pendant l'OCR.",
+    "coresBusy": "Environ {{effective}} cœur(s) occupé(s), ~{{free}} laissé(s) libre(s) pour utiliser le PC.",
+    "moreWorkers": " Plus de workers = plus rapide, mais plus de cœurs et de VRAM consommés.",
+    "advancedOptions": "Options avancées",
+    "mixedPrecision": "Précision mixte (autocast / TF32)",
+    "mixedPrecisionHint": "Sans effet mesuré sur les modèles actuels (le goulot est le CPU). À laisser désactivé.",
+    "threadsPerWorker": "Threads par worker",
+    "threadsHint": "À laisser à 1 : trop de threads × workers sature le CPU et ralentit tout.",
+    "poolThreshold": "Seuil de parallélisation (pages)",
+    "poolThresholdHint": "En dessous de ce nombre de pages, l'OCR reste séquentiel (le démarrage du pool ne vaut pas le coup)."
+  },
+  "system": {
+    "title": "Système",
+    "processor": "Processeur",
+    "cores_one": "{{count}} cœur",
+    "cores_other": "{{count}} cœurs",
+    "ram": "Mémoire RAM",
+    "gb": "{{value}} Go",
+    "diskFree": "Disque libre",
+    "gpu": "GPU",
+    "checking": "Vérification…",
+    "noCuda": "Pas de CUDA (CPU)",
+    "ocrDependencies": "Dépendances OCR"
+  },
+  "machine": {
+    "title": "Ce poste",
+    "description": "Identifie ce PC pour distinguer, dans la page Tâches, les OCR et indexations lancés depuis chaque poste. Ces informations sont enregistrées localement sur ce PC (jamais sur le NAS partagé).",
+    "name": "Nom du poste",
+    "operator": "Opérateur (optionnel)",
+    "technicalId": "Identifiant technique du poste : {{id}}"
+  },
+  "about": {
+    "title": "À propos",
+    "tagline": "Moteur de recherche automatisé pour documents transcrits en OCR/HTR.",
+    "version": "Version",
+    "license": "Licence",
+    "copyright": "Droits d'auteur",
+    "copyrightValue": "© 2026 Gilles Veith (Université de Strasbourg)",
+    "github": "GitHub",
+    "teamTitle": "Équipe & partenaires",
+    "team": "Direction : Christian Bonah (DHPS). Laboratoire : SAGE (UMR 7363), Faculté de médecine, Université de Strasbourg, France.",
+    "funding": "Financements : projet ArchiMED (ANR-PRCI), Agence nationale de la recherche (ANR-23-CE45-0028) et Fonds national suisse (SNSF, projet n° 219457).",
+    "citeTitle": "Comment citer",
+    "citeHint": "Si vous utilisez ArchiMED dans vos travaux, merci de le citer :",
+    "copyCitation": "Copier",
+    "citationCopied": "Citation copiée dans le presse-papier"
+  },
+  "actionBar": {
+    "applyNote": "Les changements s'appliquent au prochain OCR lancé."
+  },
+  "snack": {
+    "loadError": "Impossible de charger les réglages.",
+    "identitySaved": "Identité du poste enregistrée",
+    "identitySaveError": "Échec de l'enregistrement de l'identité.",
+    "saved": "Réglages enregistrés",
+    "saveError": "Échec de l'enregistrement.",
+    "defaultsRestored": "Valeurs par défaut restaurées",
+    "resetError": "Échec de la réinitialisation."
+  }
+}

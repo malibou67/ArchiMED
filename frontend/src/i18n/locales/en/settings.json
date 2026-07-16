@@ -1,0 +1,71 @@
+{
+  "performance": {
+    "title": "OCR performance",
+    "reset": "Reset defaults",
+    "resetting": "Resetting…",
+    "parallelPages": "Number of pages in parallel",
+    "auto": "Automatic",
+    "manual": "Manual",
+    "autoHint": "In automatic mode, at least half of the cores are kept free (recommended: {{recommended}} of {{cpu}}).",
+    "manualHint": "In manual mode, you choose how many pages are processed at the same time.",
+    "pagesInParallel": "Pages processed in parallel:",
+    "allCoresWarning": "All cores will be used — the PC may become sluggish during OCR.",
+    "coresBusy": "About {{effective}} core(s) busy, ~{{free}} left free to use the PC.",
+    "moreWorkers": " More workers = faster, but more cores and VRAM used.",
+    "advancedOptions": "Advanced options",
+    "mixedPrecision": "Mixed precision (autocast / TF32)",
+    "mixedPrecisionHint": "No measurable effect on current models (the bottleneck is the CPU). Leave it off.",
+    "threadsPerWorker": "Threads per worker",
+    "threadsHint": "Keep it at 1: too many threads × workers saturates the CPU and slows everything down.",
+    "poolThreshold": "Parallelization threshold (pages)",
+    "poolThresholdHint": "Below this number of pages, OCR stays sequential (starting the pool isn't worth it)."
+  },
+  "system": {
+    "title": "System",
+    "processor": "Processor",
+    "cores_one": "{{count}} core",
+    "cores_other": "{{count}} cores",
+    "ram": "RAM",
+    "gb": "{{value}} GB",
+    "diskFree": "Free disk",
+    "gpu": "GPU",
+    "checking": "Checking…",
+    "noCuda": "No CUDA (CPU)",
+    "ocrDependencies": "OCR dependencies"
+  },
+  "machine": {
+    "title": "This computer",
+    "description": "Identifies this PC so that, on the Tasks page, you can tell apart the OCR and indexing jobs launched from each machine. This information is stored locally on this PC (never on the shared NAS).",
+    "name": "Machine name",
+    "operator": "Operator (optional)",
+    "technicalId": "Technical machine ID: {{id}}"
+  },
+  "about": {
+    "title": "About",
+    "tagline": "An automated search engine for OCR/HTR-transcribed documents.",
+    "version": "Version",
+    "license": "License",
+    "copyright": "Copyright",
+    "copyrightValue": "© 2026 Gilles Veith (Université de Strasbourg)",
+    "github": "GitHub",
+    "teamTitle": "Team & partners",
+    "team": "Lead: Christian Bonah (DHPS). Laboratory: SAGE (UMR 7363), Faculté de médecine, Université de Strasbourg, France.",
+    "funding": "Funding: ArchiMED project (ANR-PRCI), French National Research Agency (ANR-23-CE45-0028) and Swiss National Science Foundation (SNSF, project no. 219457).",
+    "citeTitle": "How to cite",
+    "citeHint": "If you use ArchiMED in your work, please cite:",
+    "copyCitation": "Copy",
+    "citationCopied": "Citation copied to clipboard"
+  },
+  "actionBar": {
+    "applyNote": "Changes apply to the next OCR run."
+  },
+  "snack": {
+    "loadError": "Unable to load the settings.",
+    "identitySaved": "Machine identity saved",
+    "identitySaveError": "Failed to save the identity.",
+    "saved": "Settings saved",
+    "saveError": "Failed to save.",
+    "defaultsRestored": "Defaults restored",
+    "resetError": "Failed to reset."
+  }
+}

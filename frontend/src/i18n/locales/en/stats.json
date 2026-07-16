@@ -1,0 +1,116 @@
+{
+  "showLess": "Show less",
+  "showAll": "Show all ({{count}})",
+  "loadError": "Error while loading the statistics",
+  "filesTranscribed_one": "{{count}} transcribed file",
+  "filesTranscribed_other": "{{count}} transcribed files",
+  "transcriptionChip": {
+    "notTranscribed": "Not transcribed",
+    "transcribed": "Transcribed",
+    "partial": "Partial · {{pct}}",
+    "noOcr": "No OCR for this registre.",
+    "ocrLine": "OCR: {{done}} / {{total}} pages · {{pct}}"
+  },
+  "overview": {
+    "title": "Collection overview",
+    "registres": "registres",
+    "pagesScanned": "scanned pages",
+    "periodCovered": "period covered",
+    "ocrModels": "OCR models",
+    "filesTranscribed": "transcribed files"
+  },
+  "byModel": {
+    "title": "Progress by model",
+    "subtitle": "OCR coverage and available transcription files",
+    "ocrLine": "OCR: {{done}} / {{total}} pages",
+    "ocrNone": "OCR: —",
+    "noData": "No OCR data for this collection."
+  },
+  "byYear": {
+    "title": "Scanned pages per year",
+    "subtitle": "Spread over the years covered by each registre's period",
+    "seriesPages": "Pages",
+    "excluded_one": "{{count}} registre with no period set, excluded from the distribution.",
+    "excluded_other": "{{count}} registres with no period set, excluded from the distribution.",
+    "noPeriod": "No usable period in the registres."
+  },
+  "detail": {
+    "title": "Detail per registre",
+    "subtitle": "Volume and OCR progress of each registre (largest to smallest)",
+    "registre": "Registre",
+    "period": "Period",
+    "pages": "Pages",
+    "transcription": "Transcription"
+  },
+  "kpi": {
+    "uniqueWords": "unique words",
+    "occurrences": "occurrences",
+    "indexedPages": "indexed pages",
+    "registres": "registres",
+    "periodCovered": "period covered"
+  },
+  "corpus": {
+    "topWords": "Top {{count}} most frequent words",
+    "seriesOccurrences": "Occurrences",
+    "freqDist": "Frequency distribution (unique words by occurrence count)",
+    "seriesUniqueWords": "Unique words",
+    "pagesByYear": "Indexed pages per year",
+    "seriesPages": "Pages",
+    "registresByYear": "Registres per year",
+    "seriesRegistres": "Registres"
+  },
+  "emptyPages": {
+    "title": "Registres with text-less pages",
+    "subtitle": "Pages recognized by OCR but without any indexed word",
+    "registre": "Registre",
+    "indexed": "Indexed",
+    "ocr": "OCR",
+    "empty": "Empty"
+  },
+  "quality": {
+    "title": "OCR quality & coverage",
+    "subtitle": "OCR noise and index completeness indicators",
+    "shortWords": "Very short words (≤ 2 letters, likely OCR noise)",
+    "shortWordsDetail": "{{words}} words · {{occ}} occurrences",
+    "shortWordsHelp": "Words of 1 to 2 letters. Rate = number of these words ÷ total number of unique words in the vocabulary.",
+    "hapax": "Hapax (words seen only once)",
+    "hapaxDetail": "{{words}} words",
+    "hapaxHelp": "A hapax is a word whose total number of occurrences in the whole index is exactly 1. Rate = number of hapax ÷ total number of unique words.",
+    "hapaxNote": "<strong>Hapax</strong>: words appearing only once in the whole indexed corpus ({{words}} words, i.e. {{pct}}% of the vocabulary).",
+    "hapaxNote2": "A high rate of hapax or short words often indicates OCR recognition errors.",
+    "pagesWithText": "Pages with indexed text",
+    "pagesWithoutText": "Pages without text",
+    "onOcrPages": "of {{total}} pages passed to OCR",
+    "pagesNote": "<strong>Pages with indexed text</strong> = pages containing at least one recognized and indexed word. <strong>Pages without text</strong> = pages submitted to OCR but where no word was indexed (blank, illegible or non-textual pages).",
+    "coverageUnknown": "Coverage unknown — regenerate the index to enable tracking of OCR pages without text.",
+    "registresNoPeriod": "Registres with no period set (excluded from temporal statistics)"
+  },
+  "richest": {
+    "title": "Richest registres",
+    "subtitle": "Registres ranked by indexed vocabulary richness",
+    "registre": "Registre",
+    "period": "Period",
+    "pages": "Pages",
+    "occurrences": "Occurrences",
+    "uniqueWords": "Unique words"
+  },
+  "trend": {
+    "title": "Temporal evolution of terms",
+    "subtitle": "Frequency of one or more terms per year, Ngram-style",
+    "placeholder": "Terms to compare… (e.g. cancer tuberculosis)",
+    "helper": "Up to {{max}} terms, separated by spaces or commas",
+    "trace": "Plot",
+    "similarity": "Similarity",
+    "exact": "Exact",
+    "per1000": "Per 1,000 pages",
+    "rawOccurrences": "Raw occurrences",
+    "prompt": "Enter one or more terms to plot their evolution in the corpus",
+    "noData": "No temporal data available: the registres of this index have no period set.",
+    "similarityChip": "Similarity ≥ {{value}}%",
+    "error": "Error while computing the evolution",
+    "note": "Each registre is attached to the median year of its period. The axis shows a label only every 5 years.",
+    "normalizedNote": " Values normalized by the number of indexed pages for each year.",
+    "excluded_one": " {{count}} registre with no period excluded.",
+    "excluded_other": " {{count}} registres with no period excluded."
+  }
+}

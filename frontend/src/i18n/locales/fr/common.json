@@ -1,0 +1,90 @@
+{
+  "nav": {
+    "search": "Recherche",
+    "ocr": "OCR",
+    "collections": "Collections",
+    "indexes": "Index",
+    "tasks": "Tâches",
+    "settings": "Paramètres"
+  },
+  "pageTitles": {
+    "search": "Recherche dans les index",
+    "ocr": "OCR — Reconnaissance de texte",
+    "ocrModels": "OCR — Modèles & Segmentation",
+    "collections": "Collections",
+    "indexes": "Gestion des index",
+    "tasks": "Tâches",
+    "settings": "Paramètres",
+    "registreViewer": "Viewer de registre",
+    "wordPages": "Pages d'un mot",
+    "indexContent": "Contenu de l'index",
+    "appDefault": "ArchiMED OCR"
+  },
+  "ocrTabs": {
+    "textRecognition": "Reconnaissance de texte",
+    "modelManagement": "Gestion des modèles"
+  },
+  "tasksIndicator": {
+    "running_one": "{{count}} tâche en cours",
+    "running_other": "{{count}} tâches en cours",
+    "queuedSuffix": " · {{count}} en attente",
+    "queued_one": "{{count}} tâche en attente",
+    "queued_other": "{{count}} tâches en attente",
+    "none": "Aucune tâche en cours"
+  },
+  "taskWidget": {
+    "finished": "Tâche terminée",
+    "view": "Voir",
+    "count_one": "{{count}} tâche",
+    "count_other": "{{count}} tâches",
+    "running": "Tâche en cours",
+    "paused": "Tâche en pause",
+    "show": "Afficher les tâches",
+    "reduce": "Réduire",
+    "pausedChip": "En pause",
+    "resume": "Reprendre",
+    "queued": "{{count}} en attente",
+    "viewAll": "Voir toutes les tâches",
+    "failures_one": "{{count}} échec",
+    "failures_other": "{{count}} échecs",
+    "typeOcr": "OCR",
+    "typeIndexation": "Indexation"
+  },
+  "loading": {
+    "stats": "Calcul des statistiques…",
+    "default": "Chargement…"
+  },
+  "dataDir": {
+    "notFoundTitle": "Dossier de données introuvable",
+    "cannotReachServer": "Impossible de joindre le serveur pour vérifier le stockage. Assurez-vous qu'ArchiMED est bien démarré.",
+    "missing": "Le dossier de données de l'application n'a pas été trouvé. L'installation est peut-être incomplète ou a été déplacée. Réinstallez ArchiMED ou restaurez le dossier de données, puis réessayez.",
+    "retry": "Réessayer",
+    "readOnly": "Le dossier de données est en lecture seule — l'OCR, la synchronisation et l'indexation échoueront. Vérifiez les droits d'accès sur "
+  },
+  "language": {
+    "title": "Langue",
+    "description": "Langue de l'interface. Ce choix est enregistré uniquement sur ce poste.",
+    "english": "English",
+    "french": "Français"
+  },
+  "actions": {
+    "save": "Enregistrer",
+    "cancel": "Annuler",
+    "saving": "Enregistrement…",
+    "close": "Fermer"
+  },
+  "imageViewer": {
+    "loadError": "Impossible de charger l'image.",
+    "prev": "Précédent",
+    "next": "Suivant",
+    "legend": "← → naviguer · molette zoomer · glisser déplacer",
+    "zoom": "Zoom",
+    "relatedPages_one": "{{count}} page liée",
+    "relatedPages_other": "{{count}} pages liées",
+    "downloadAnnotated": "Télécharger avec annotations",
+    "openFull": "Ouvrir en pleine page",
+    "back": "Retour",
+    "noPage": "Aucune page à afficher.",
+    "download": "Télécharger"
+  }
+}

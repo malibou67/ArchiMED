@@ -1,0 +1,88 @@
+{
+  "loading": "Loading tasks…",
+  "empty": "No task — start an OCR run or an indexing to see it appear here.",
+  "machine": "Machine:",
+  "machineAll": "All",
+  "thisMachine": "this machine",
+  "otherMachine": "another machine",
+  "type": {
+    "ocr": "OCR",
+    "index": "Index"
+  },
+  "status": {
+    "running": "Running",
+    "queued": "Waiting",
+    "paused": "Paused",
+    "done": "Done",
+    "error": "Failed",
+    "cancelled": "Cancelled",
+    "interrupted": "Interrupted"
+  },
+  "table": {
+    "type": "Type",
+    "task": "Task",
+    "machine": "Machine",
+    "status": "Status",
+    "progress": "Progress",
+    "time": "Time",
+    "actions": "Actions"
+  },
+  "modelLabel": "Model: {{model}}",
+  "pages_one": "{{count}} page",
+  "pages_other": "{{count}} pages",
+  "registres_one": "{{count}} registre",
+  "registres_other": "{{count}} registres",
+  "failures_one": "{{count}} failure",
+  "failures_other": "{{count}} failures",
+  "queuedOwned": "Waiting to start…",
+  "queuedOther": "Waiting on {{machine}}",
+  "pagesProcessed_one": "{{count}} page processed",
+  "pagesProcessed_other": "{{count}} pages processed",
+  "elapsed": "elapsed {{dur}}",
+  "remaining": " · ~{{dur}} left",
+  "duration": "duration {{dur}}",
+  "actions": {
+    "pausing": "Pausing…",
+    "pause": "Pause",
+    "resume": "Resume",
+    "cancel": "Cancel",
+    "runningOther": "Task running on another machine",
+    "delete": "Delete",
+    "deleteOther": "Delete (task from another machine)",
+    "viewPages": "View the pages",
+    "viewRegistres": "View the registres"
+  },
+  "preflight": {
+    "label": "Detected environment:",
+    "krakenOk": "Kraken detected",
+    "krakenAbsent": "Kraken missing",
+    "krakenNotFound": "Kraken not found",
+    "torchOk": "PyTorch detected",
+    "torchAbsent": "PyTorch missing",
+    "torchNotFound": "PyTorch not found",
+    "cudaTooltip": "GPU acceleration used",
+    "cpuLabel": "CPU",
+    "cpuTooltip": "No CUDA GPU: running on CPU (slower)",
+    "workersCount_one": "{{count}} worker",
+    "workersCount_other": "{{count}} workers",
+    "threadsPerWorker_one": "{{count}} thread per worker",
+    "threadsPerWorker_other": "{{count}} threads per worker",
+    "mixedSuffix": ", mixed precision"
+  },
+  "pagesPanel": {
+    "all": "All",
+    "todo": "To do",
+    "done": "Done",
+    "failed": "Failed",
+    "loading": "Loading…",
+    "noPages": "No page.",
+    "range": "{{start}}–{{end}} of {{total}}"
+  },
+  "registresPanel": {
+    "loading": "Loading…",
+    "noRegistres": "No registre.",
+    "indexed": "{{done}} / {{all}} registres indexed",
+    "current": "1 in progress",
+    "pending": "{{count}} to do"
+  }
+}

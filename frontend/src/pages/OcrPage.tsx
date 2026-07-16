@@ -1,0 +1,997 @@
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  Typography,
+  Box,
+  CircularProgress,
+  Alert,
+  Checkbox,
+  List,
+  ListItemButton,
+  ListItemIcon,
+  ListItemText,
+  Collapse,
+  Chip,
+  Button,
+  Radio,
+  RadioGroup,
+  FormControlLabel,
+  Stack,
+  Tooltip,
+  TextField,
+  InputAdornment,
+  IconButton,
+  Paper,
+  ToggleButton,
+  ToggleButtonGroup,
+} from '@mui/material';
+import {
+  ExpandMore as ExpandMoreIcon,
+  ChevronRight as ChevronRightIcon,
+  Folder as FolderIcon,
+  Book as BookIcon,
+  Image as ImageIcon,
+  Cancel as CancelIcon,
+  Search as SearchIcon,
+  Clear as ClearIcon,
+  Circle as CircleIcon,
+  CheckCircle as CheckCircleIcon,
+  RadioButtonUnchecked as RadioButtonUncheckedIcon,
+  ModelTraining as ModelTrainingIcon,
+  FolderOpen as FolderOpenIcon,
+  DocumentScanner as DocumentScannerIcon,
+} from '@mui/icons-material';
+import type { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import { collectionsApi } from '../api/collections';
+import { modelsApi } from '../api/models';
+import { systemApi, SystemRequirements } from '../api/system';
+import { ocrApi, OcrPageRef } from '../api/ocr';
+import { tasksApi, Task } from '../api/tasks';
+import { useTasks } from '../context/TasksContext';
+import EnvStatusChip from '../components/ocr/EnvStatusChip';
+import OcrLaunchBar from '../components/ocr/OcrLaunchBar';
+import { usePageLoading } from '../context/LoadingContext';
+import { CollectionMetadata, ModelMetadata, RegistreSummary } from '../types';
+
+const fmtNum = (n: number) => n.toLocaleString('fr-FR');
+
+// Normalisation pour la recherche : minuscules, sans diacritiques.
+const norm = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+function makePatternRegex(pattern: string, capturing: boolean): RegExp {
+  const parts = pattern.split(/(\{num\}|\{extra_page\})/);
+  const regex = parts.map(p => {
+    if (p === '{num}') return capturing ? '(\\d+)' : '\\d+';
+    if (p === '{extra_page}') return capturing ? '(.+?)' : '.+';
+    return p.replace(/[.+*?^${}()|[\]\\]/g, '\\$&');
+  }).join('');
+  return new RegExp('^' + regex + '$');
+}
+
+function sortPages(pages: string[], mainPattern?: string, extraPattern?: string): string[] {
+  const mainRx = mainPattern ? makePatternRegex(mainPattern, true) : null;
+  const extraRx = extraPattern ? makePatternRegex(extraPattern, true) : null;
+  const info = pages.map(file => {
+    const mainM = mainRx?.exec(file);
+    if (mainM) return { file, mainNum: parseInt(mainM[1]), isExtra: false, extraId: '' };
+    const extraM = extraRx?.exec(file);
+    if (extraM) return { file, mainNum: parseInt(extraM[1]), isExtra: true, extraId: extraM[2] ?? '' };
+    return { file, mainNum: 0, isExtra: false, extraId: '' };
+  });
+  return info.sort((a, b) => {
+    if (a.mainNum !== b.mainNum) return a.mainNum - b.mainNum;
+    if (a.isExtra !== b.isExtra) return a.isExtra ? 1 : -1;
+    return a.extraId.localeCompare(b.extraId, undefined, { numeric: true });
+  }).map(i => i.file);
+}
+
+function getRegPageCount(reg: RegistreSummary): number {
+  return reg.pages_count;
+}
+
+function PanelHeader({ title }: { title: string }) {
+  return (
+    <Box sx={{
+      px: 2, py: 1.5,
+      borderBottom: 1, borderColor: 'divider',
+      flexShrink: 0,
+    }}>
+      <Typography
+        variant="overline"
+        sx={{ fontSize: '0.7rem', fontWeight: 700, letterSpacing: 1, color: 'text.secondary' }}
+      >
+        {title}
+      </Typography>
+    </Box>
+  );
+}
+
+type Blocker = { title: string; detail: string; action?: { label: string; path: string } };
+
+type Requirement = {
+  key: string;
+  ok: boolean;
+  loading: boolean;
+  icon: ReactNode;
+  title: string;
+  okDetail: string;
+  todoDetail: string;
+  action: { label: string; path: string };
+};
+
+export default function OcrPage() {
+  const { t } = useTranslation(['ocr', 'common']);
+  const navigate = useNavigate();
+  const [collections, setCollections] = useState<CollectionMetadata[]>([]);
+  const [models, setModels] = useState<ModelMetadata[]>([]);
+  const [selectedSegModel, setSelectedSegModel] = useState('');
+  const [selectedOcrModel, setSelectedOcrModel] = useState('');
+  const [collectionsLoading, setCollectionsLoading] = useState(true);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [requirements, setRequirements] = useState<SystemRequirements | null>(null);
+  const [reqLoading, setReqLoading] = useState(true);
+  const [reqFailed, setReqFailed] = useState(false);
+
+  // Loader d'étapes : reflète l'étape de chargement réellement en cours, avec compteur.
+  // La vérif d'environnement (lente : import torch/kraken) n'est volontairement PAS dans
+  // le loader — elle tourne en tâche de fond et s'affiche via EnvStatusChip / OcrLaunchBar,
+  // pour que la page apparaisse aussi vite que les autres.
+  const loadSteps = [
+    { active: modelsLoading,      label: t('loading.models') },
+    { active: collectionsLoading, label: t('loading.collections') },
+  ];
+  const stepsDone = loadSteps.filter((s) => !s.active).length;
+  const currentStep = loadSteps.find((s) => s.active);
+  usePageLoading(
+    currentStep ? `${t('loading.ocr', { step: stepsDone + 1, total: loadSteps.length })}\n${currentStep.label}` : '',
+    !!currentStep,
+  );
+
+  const [expandedCollections, setExpandedCollections] = useState<Set<string>>(new Set());
+  const [expandedRegistres, setExpandedRegistres] = useState<Set<string>>(new Set());
+  const [selectedPages, setSelectedPages] = useState<Set<string>>(new Set());
+  const [treeFilter, setTreeFilter] = useState('');
+  // Filtre à 3 états sur le statut de transcription (pour le modèle OCR choisi).
+  const [statusFilter, setStatusFilter] = useState<'all' | 'missing' | 'done'>('all');
+
+  // Stems déjà transcrits, par clé `${cKey}/${regFolder}/${modelId}` (chargés au dépliage).
+  const [doneCache, setDoneCache] = useState<Map<string, Set<string>>>(new Map());
+  const fetchingDone = useRef<Set<string>>(new Set());
+
+  // Historique des tâches OCR terminées (pour l'estimation de durée).
+  const [pastOcrTasks, setPastOcrTasks] = useState<Task[]>([]);
+
+  const { hasActivity, refresh: refreshTasks, runningTasks } = useTasks();
+  const runningOcr = runningTasks.find((t) => t.type === 'ocr') ?? null;
+  const [launching, setLaunching] = useState(false);
+  const [queuedNotice, setQueuedNotice] = useState<number | null>(null);
+
+  useEffect(() => {
+    loadCollections();
+    loadModels();
+    loadPastTasks();
+    systemApi.getRequirements()
+      .then((r) => { setRequirements(r); setReqFailed(false); })
+      .catch(() => { setRequirements(null); setReqFailed(true); })
+      .finally(() => setReqLoading(false));
+  }, []);
+
+  const loadCollections = async () => {
+    try {
+      setCollectionsLoading(true);
+      setCollections(await collectionsApi.getAll());
+    } catch (err) {
+      setError(t('errors.loadCollections'));
+      console.error(err);
+    } finally {
+      setCollectionsLoading(false);
+    }
+  };
+
+  const loadModels = async () => {
+    try {
+      setModelsLoading(true);
+      const data = await modelsApi.getAll();
+      setModels(data);
+      const seg = data.find((m) => m.type === 'segmentation');
+      const ocr = data.find((m) => m.type === 'ocr');
+      if (seg) setSelectedSegModel(seg.id);
+      if (ocr) setSelectedOcrModel(ocr.id);
+    } catch (err) {
+      setError(t('errors.loadModels'));
+      console.error(err);
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  const loadPastTasks = () => {
+    tasksApi.list()
+      .then((tasks) => setPastOcrTasks(tasks.filter((t) =>
+        t.type === 'ocr' && t.status === 'done' && t.processed > 0 && !!t.started_at && !!t.finished_at,
+      )))
+      .catch(() => {});
+  };
+
+  // Quand l'activité OCR globale s'arrête : rafraîchir compteurs, états par page et historique.
+  const prevActivity = useRef(false);
+  useEffect(() => {
+    if (prevActivity.current && !hasActivity) {
+      loadCollections();
+      setDoneCache(new Map());
+      loadPastTasks();
+    }
+    prevActivity.current = hasActivity;
+  }, [hasActivity]);
+
+  const colKey = (col: CollectionMetadata) => col.folder_name || col.type;
+
+  // Charge les stems transcrits des registres dépliés (pour le modèle OCR choisi).
+  useEffect(() => {
+    if (!selectedOcrModel) return;
+    for (const collection of collections) {
+      const cKey = colKey(collection);
+      for (const reg of collection.registres || []) {
+        const rKey = `${cKey}/${reg.folder_name}`;
+        if (!expandedRegistres.has(rKey)) continue;
+        const cacheKey = `${rKey}/${selectedOcrModel}`;
+        if (doneCache.has(cacheKey) || fetchingDone.current.has(cacheKey)) continue;
+        fetchingDone.current.add(cacheKey);
+        ocrApi.donePages(cKey, reg.folder_name, selectedOcrModel)
+          .then((stems) => setDoneCache((prev) => new Map(prev).set(cacheKey, new Set(stems))))
+          .catch(() => {})
+          .finally(() => fetchingDone.current.delete(cacheKey));
+      }
+    }
+  }, [collections, expandedRegistres, selectedOcrModel, doneCache]);
+
+  const parsePageKey = (key: string): OcrPageRef | null => {
+    const first = key.indexOf('/');
+    const second = key.indexOf('/', first + 1);
+    if (first < 0 || second < 0) return null;
+    return {
+      collection: key.substring(0, first),
+      registre: key.substring(first + 1, second),
+      page: key.substring(second + 1),
+    };
+  };
+
+  const launchOcr = async () => {
+    const pages = [...selectedPages].map(parsePageKey).filter((p): p is OcrPageRef => p !== null);
+    if (pages.length === 0 || !selectedSegModel || !selectedOcrModel) return;
+    try {
+      setLaunching(true);
+      setError(null);
+      await ocrApi.run(selectedSegModel, selectedOcrModel, pages);
+      await refreshTasks();
+      setQueuedNotice(pages.length);
+      setSelectedPages(new Set()); // on garde les modèles, on libère la sélection pour enchaîner
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || t('errors.launch'));
+      console.error(err);
+    } finally {
+      setLaunching(false);
+    }
+  };
+
+  const getPages = (reg: RegistreSummary): string[] => {
+    if (!reg.pages_pattern || reg.pages_start == null || reg.pages_end == null) return [];
+    const main: string[] = [];
+    for (let i = reg.pages_start; i <= reg.pages_end; i++)
+      main.push(reg.pages_pattern.replace('{num}', String(i)));
+    return sortPages([...main, ...(reg.extra_pages ?? [])], reg.pages_pattern, reg.extra_pagination?.pattern);
+  };
+
+  const pageKey = (colId: string, regFolder: string, page: string) => `${colId}/${regFolder}/${page}`;
+
+  // ── Statut de transcription par page / filtre ─────────────────────
+  // Stem = nom de page sans extension (clé partagée par les XML produits, cf. backend).
+  const pageStem = (page: string) => page.replace(/\.[^.]+$/, '');
+
+  // Set des stems transcrits pour (collection, registre, modèle OCR courant). Réutilise le
+  // cache des pastilles ; charge à la demande (sélection sur registre non déplié).
+  const ensureDoneSet = async (cKey: string, regFolder: string): Promise<Set<string>> => {
+    const cacheKey = `${cKey}/${regFolder}/${selectedOcrModel}`;
+    const cached = doneCache.get(cacheKey);
+    if (cached) return cached;
+    const stems = await ocrApi.donePages(cKey, regFolder, selectedOcrModel);
+    const set = new Set(stems);
+    setDoneCache((prev) => new Map(prev).set(cacheKey, set));
+    return set;
+  };
+
+  const regPagesDone = (reg: RegistreSummary) =>
+    selectedOcrModel ? (reg.ocr_status?.[selectedOcrModel]?.pages_done ?? 0) : 0;
+
+  // Vrai si le registre contient au moins une page correspondant au filtre courant.
+  const regMatchesFilter = (reg: RegistreSummary): boolean => {
+    if (statusFilter === 'all') return true;
+    const done = regPagesDone(reg);
+    if (statusFilter === 'missing') return reg.pages_count > 0 && done < reg.pages_count;
+    return done > 0; // 'done'
+  };
+
+  // Nombre de pages correspondant au filtre (dénominateur des cases à cocher).
+  const matchingTotal = (reg: RegistreSummary): number => {
+    const total = getRegPageCount(reg);
+    if (statusFilter === 'all') return total;
+    const done = regPagesDone(reg);
+    return statusFilter === 'missing' ? Math.max(0, total - done) : done;
+  };
+
+  const selectionCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const key of selectedPages) {
+      const firstSlash = key.indexOf('/');
+      const secondSlash = key.indexOf('/', firstSlash + 1);
+      if (firstSlash >= 0) {
+        const cp = key.substring(0, firstSlash + 1);
+        counts.set(cp, (counts.get(cp) || 0) + 1);
+      }
+      if (secondSlash >= 0) {
+        const rp = key.substring(0, secondSlash + 1);
+        counts.set(rp, (counts.get(rp) || 0) + 1);
+      }
+    }
+    return counts;
+  }, [selectedPages]);
+
+  const getRegCheckState = (colId: string, reg: RegistreSummary) => {
+    const total = matchingTotal(reg);
+    if (total === 0) return { checked: false, indeterminate: false };
+    const selected = selectionCounts.get(`${colId}/${reg.folder_name}/`) || 0;
+    return { checked: selected >= total, indeterminate: selected > 0 && selected < total };
+  };
+
+  const getColCheckState = (collection: CollectionMetadata) => {
+    const cKey = colKey(collection);
+    const regs = collection.registres || [];
+    const total = regs.reduce((sum, r) => sum + matchingTotal(r), 0);
+    if (total === 0) return { checked: false, indeterminate: false };
+    const selected = selectionCounts.get(`${cKey}/`) || 0;
+    return { checked: selected >= total, indeterminate: selected > 0 && selected < total };
+  };
+
+  const toggleCollection = (cKey: string) => {
+    setExpandedCollections((prev) => {
+      const next = new Set(prev);
+      next.has(cKey) ? next.delete(cKey) : next.add(cKey);
+      return next;
+    });
+  };
+
+  const toggleRegistre = (rKey: string) => {
+    setExpandedRegistres((prev) => {
+      const next = new Set(prev);
+      next.has(rKey) ? next.delete(rKey) : next.add(rKey);
+      return next;
+    });
+  };
+
+  const togglePage = (key: string) => {
+    setSelectedPages((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  };
+
+  // Pages d'un registre correspondant au filtre courant (charge le statut par page si besoin).
+  const filteredPages = async (cKey: string, reg: RegistreSummary): Promise<string[]> => {
+    const pages = getPages(reg);
+    if (statusFilter === 'all') return pages;
+    const doneSet = await ensureDoneSet(cKey, reg.folder_name);
+    return pages.filter((p) =>
+      statusFilter === 'done' ? doneSet.has(pageStem(p)) : !doneSet.has(pageStem(p)));
+  };
+
+  // Bascule un lot de clés : si toutes déjà sélectionnées → on retire, sinon on ajoute.
+  const toggleKeys = (keys: string[]) => {
+    setSelectedPages((prev) => {
+      const allSelected = keys.length > 0 && keys.every((k) => prev.has(k));
+      const next = new Set(prev);
+      keys.forEach((k) => (allSelected ? next.delete(k) : next.add(k)));
+      return next;
+    });
+  };
+
+  const toggleAllPages = async (colId: string, reg: RegistreSummary) => {
+    const keys = (await filteredPages(colId, reg)).map((p) => pageKey(colId, reg.folder_name, p));
+    toggleKeys(keys);
+  };
+
+  const toggleAllCollection = async (collection: CollectionMetadata) => {
+    const cKey = colKey(collection);
+    const perReg = await Promise.all(
+      (collection.registres || []).map(async (r) =>
+        (await filteredPages(cKey, r)).map((p) => pageKey(cKey, r.folder_name, p))),
+    );
+    toggleKeys(perReg.flat());
+  };
+
+  // ── Filtre de l'arbre (la sélection et les checkboxes restent sur les données complètes) ──
+  const filterActive = treeFilter.trim().length > 0;
+  const visibleTree = useMemo(() => {
+    // 1) Filtre texte sur collections / registres.
+    let tree: { collection: CollectionMetadata; regs: RegistreSummary[] }[];
+    if (!filterActive) {
+      tree = collections.map((c) => ({ collection: c, regs: c.registres || [] }));
+    } else {
+      const q = norm(treeFilter.trim());
+      tree = [];
+      for (const c of collections) {
+        const regs = c.registres || [];
+        if (norm(`${c.titre} ${c.folder_name ?? ''}`).includes(q)) {
+          tree.push({ collection: c, regs });
+          continue;
+        }
+        const matched = regs.filter((r) => norm(`${r.titre} ${r.folder_name}`).includes(q));
+        if (matched.length > 0) tree.push({ collection: c, regs: matched });
+      }
+    }
+    // 2) Filtre de statut : on retire les registres sans page correspondante, puis les
+    //    collections devenues vides. Sous 'all' (ou sans modèle) : aucun masquage.
+    if (statusFilter === 'all' || !selectedOcrModel) return tree;
+    const out: { collection: CollectionMetadata; regs: RegistreSummary[] }[] = [];
+    for (const { collection, regs } of tree) {
+      const kept = regs.filter(regMatchesFilter);
+      if (kept.length > 0) out.push({ collection, regs: kept });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collections, treeFilter, filterActive, statusFilter, selectedOcrModel]);
+
+  // ── Éléments bloquants : environnement (vérif asynchrone) et configuration ──
+  const envBlockers: Blocker[] = [];
+  if (!reqLoading) {
+    if (reqFailed || !requirements) {
+      envBlockers.push({
+        title: t('env.checkFailedTitle'),
+        detail: t('env.checkFailedDetail'),
+      });
+    } else {
+      if (!(requirements.torch?.ok ?? false)) {
+        envBlockers.push({
+          title: t('env.torchTitle'),
+          detail: t('env.torchDetail'),
+        });
+      }
+      if (!(requirements.torchvision?.ok ?? false)) {
+        envBlockers.push({
+          title: t('env.torchvisionTitle'),
+          detail: requirements.torchvision?.error || t('env.torchvisionDetail'),
+        });
+      }
+      if (!(requirements.kraken?.ok ?? false)) {
+        envBlockers.push({
+          title: t('env.krakenTitle'),
+          detail: requirements.kraken?.error || t('env.krakenDetail'),
+        });
+      }
+    }
+  }
+
+  const segModelCount = models.filter((m) => m.type === 'segmentation').length;
+  const ocrModelCount = models.filter((m) => m.type === 'ocr').length;
+
+  // Prérequis de configuration affichés en checklist : chacun porte son état (ok)
+  // une fois le chargement terminé. Les prérequis non satisfaits servent de blockers.
+  const setupRequirements: Requirement[] = [
+    {
+      key: 'seg',
+      ok: segModelCount > 0,
+      loading: modelsLoading,
+      icon: <ModelTrainingIcon />,
+      title: t('setup.segTitle'),
+      okDetail: t('setup.segAvailable', { count: segModelCount }),
+      todoDetail: t('setup.segTodo'),
+      action: { label: t('setup.addModels'), path: '/ocr/models' },
+    },
+    {
+      key: 'ocr',
+      ok: ocrModelCount > 0,
+      loading: modelsLoading,
+      icon: <DocumentScannerIcon />,
+      title: t('setup.ocrTitle'),
+      okDetail: t('setup.ocrAvailable', { count: ocrModelCount }),
+      todoDetail: t('setup.ocrTodo'),
+      action: { label: t('setup.addModels'), path: '/ocr/models' },
+    },
+    {
+      key: 'col',
+      ok: collections.length > 0,
+      loading: collectionsLoading,
+      icon: <FolderOpenIcon />,
+      title: t('setup.colTitle'),
+      okDetail: t('setup.colAvailable', { count: collections.length }),
+      todoDetail: t('setup.colTodo'),
+      action: { label: t('setup.manageCollections'), path: '/collections' },
+    },
+  ];
+
+  // Blockers de configuration = prérequis chargés mais non satisfaits.
+  const setupBlockers: Blocker[] = setupRequirements
+    .filter((r) => !r.loading && !r.ok)
+    .map((r) => ({ title: r.title, detail: r.todoDetail, action: r.action }));
+
+  const blockers = [...envBlockers, ...setupBlockers];
+
+  // Rendu d'une alerte de blocker (partagé entre la bannière d'environnement et
+  // l'état vide de configuration qui remplace les deux colonnes).
+  const renderBlockerAlert = (b: Blocker, i: number) => (
+    <Alert
+      key={i}
+      severity="error"
+      icon={<CancelIcon fontSize="small" />}
+      variant="outlined"
+      sx={{ py: 0 }}
+      action={b.action ? (
+        <Button
+          color="error"
+          size="small"
+          variant="outlined"
+          onClick={() => navigate(b.action!.path)}
+          sx={{ alignSelf: 'center', whiteSpace: 'nowrap' }}
+        >
+          {b.action.label}
+        </Button>
+      ) : undefined}
+    >
+      <Typography variant="body2" fontWeight={600}>{b.title}</Typography>
+      <Typography variant="caption" color="text.secondary">{b.detail}</Typography>
+    </Alert>
+  );
+
+  const canLaunch = !launching && !reqLoading && blockers.length === 0
+    && !!selectedSegModel && !!selectedOcrModel && selectedPages.size > 0;
+  let disabledReason: string | null = null;
+  if (reqLoading) disabledReason = t('disabled.checking');
+  else if (envBlockers.length > 0) disabledReason = t('disabled.envIncomplete');
+  else if (setupBlockers.length > 0) disabledReason = t('disabled.configIncomplete');
+  else if (!selectedSegModel || !selectedOcrModel) disabledReason = t('disabled.chooseModels');
+  else if (selectedPages.size === 0) disabledReason = t('disabled.selectPage');
+
+  // ── Estimation de durée (débit des dernières tâches OCR terminées) ──
+  const estimateSeconds = useMemo(() => {
+    if (selectedPages.size === 0 || pastOcrTasks.length === 0) return null;
+    const device = requirements?.cuda?.ok ? 'cuda' : 'cpu';
+    let sample = pastOcrTasks.filter((t) => t.preflight?.device === device);
+    if (sample.length === 0) sample = pastOcrTasks;
+    sample = sample.slice(0, 10); // les plus récentes (la liste est triée récentes d'abord)
+    let pages = 0;
+    let secs = 0;
+    for (const t of sample) {
+      const dur = (new Date(t.finished_at!).getTime() - new Date(t.started_at!).getTime()) / 1000;
+      if (dur > 0) { pages += t.processed; secs += dur; }
+    }
+    if (pages === 0 || secs === 0) return null;
+    return selectedPages.size / (pages / secs);
+  }, [selectedPages.size, pastOcrTasks, requirements]);
+
+  const modelRadioGroup = (type: 'segmentation' | 'ocr', value: string, onChange: (v: string) => void) => {
+    const filtered = models.filter((m) => m.type === type);
+    if (modelsLoading) {
+      return (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, p: 2 }}>
+          <CircularProgress size={16} />
+          <Typography variant="body2" color="text.secondary">{t('common:loading.default')}</Typography>
+        </Box>
+      );
+    }
+    if (filtered.length === 0) {
+      return (
+        <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+          {t('models.none')}
+        </Typography>
+      );
+    }
+    return (
+      <RadioGroup value={value} onChange={(e) => onChange(e.target.value)}>
+        {filtered.map((model) => (
+          <FormControlLabel
+            key={model.id}
+            value={model.id}
+            sx={{ mx: 0, px: 1.5, py: 0.5, borderRadius: 1, '&:hover': { bgcolor: 'action.hover' } }}
+            control={<Radio size="small" />}
+            label={
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 500 }}>{model.name}</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {[
+                    model.version && `v${model.version}`,
+                    model.accuracy && `${(model.accuracy * 100).toFixed(1)}%`,
+                  ].filter(Boolean).join(' — ') || model.description || model.id}
+                </Typography>
+              </Box>
+            }
+          />
+        ))}
+      </RadioGroup>
+    );
+  };
+
+  return (
+    // Remplit la hauteur allouée par OcrTabsLayout (qui gère le calc vs la fenêtre)
+    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+
+      {/* ─── Alertes ─── */}
+      {error && (
+        <Alert severity="error" sx={{ mb: 1, flexShrink: 0 }} onClose={() => setError(null)}>
+          {error}
+        </Alert>
+      )}
+      {/* ─── Environnement OCR incomplet : bannière, la page reste utilisable ─── */}
+      {envBlockers.length > 0 && (
+        <Stack spacing={1} sx={{ mb: 1, flexShrink: 0 }}>
+          {envBlockers.map((b, i) => renderBlockerAlert(b, i))}
+        </Stack>
+      )}
+
+      {/* ─── Contenu principal ───
+          Si la configuration empêche toute sélection (aucune collection ou aucun
+          modèle), on remplace les deux colonnes vides par une checklist centrée. */}
+      {setupBlockers.length > 0 ? (
+        <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'auto', p: 3 }}>
+          <Stack spacing={3} alignItems="center" sx={{ width: '100%', maxWidth: 600 }}>
+            <Stack spacing={1} alignItems="center" sx={{ textAlign: 'center' }}>
+              <Box
+                sx={{
+                  width: 72, height: 72, borderRadius: '50%',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  bgcolor: 'action.selected', color: 'primary.main',
+                  '& > svg': { fontSize: 38 },
+                }}
+              >
+                <DocumentScannerIcon />
+              </Box>
+              <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                {t('ready.title')}
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 440 }}>
+                {t('ready.subtitle')}
+              </Typography>
+            </Stack>
+
+            <Paper variant="outlined" sx={{ width: '100%', borderRadius: 2, overflow: 'hidden' }}>
+              {setupRequirements.map((r, i) => (
+                <Box
+                  key={r.key}
+                  sx={{
+                    display: 'flex', alignItems: 'center', gap: 2, px: 2.5, py: 2,
+                    borderTop: i > 0 ? 1 : 0, borderColor: 'divider',
+                    bgcolor: r.ok ? 'transparent' : 'action.hover',
+                  }}
+                >
+                  <Box sx={{ display: 'flex', color: r.ok ? 'success.main' : 'text.disabled', '& > svg': { fontSize: 28 } }}>
+                    {r.ok ? <CheckCircleIcon /> : <RadioButtonUncheckedIcon />}
+                  </Box>
+                  <Box sx={{ display: 'flex', color: 'text.secondary', '& > svg': { fontSize: 22 } }}>
+                    {r.icon}
+                  </Box>
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>{r.title}</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {r.ok ? r.okDetail : r.todoDetail}
+                    </Typography>
+                  </Box>
+                  {r.ok ? (
+                    <Chip size="small" label="OK" color="success" variant="outlined" sx={{ fontWeight: 600 }} />
+                  ) : (
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disableElevation
+                      onClick={() => navigate(r.action.path)}
+                      sx={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                    >
+                      {r.action.label}
+                    </Button>
+                  )}
+                </Box>
+              ))}
+            </Paper>
+          </Stack>
+        </Box>
+      ) : (
+      <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+
+        {/* Colonne gauche : sélection des pages */}
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderRight: 1, borderColor: 'divider' }}>
+          <PanelHeader title={t('panels.pageSelection')} />
+
+          {/* Barre d'outils : recherche + filtre par statut de transcription */}
+          <Box sx={{ px: 1.5, py: 1, borderBottom: 1, borderColor: 'divider', display: 'flex', gap: 1, flexShrink: 0, flexWrap: 'wrap' }}>
+            <TextField
+              size="small"
+              sx={{ flex: 1, minWidth: 200 }}
+              placeholder={t('filterPlaceholder')}
+              value={treeFilter}
+              onChange={(e) => setTreeFilter(e.target.value)}
+              slotProps={{
+                input: {
+                  startAdornment: (
+                    <InputAdornment position="start">
+                      <SearchIcon fontSize="small" />
+                    </InputAdornment>
+                  ),
+                  endAdornment: treeFilter ? (
+                    <InputAdornment position="end">
+                      <IconButton size="small" onClick={() => setTreeFilter('')} edge="end">
+                        <ClearIcon fontSize="small" />
+                      </IconButton>
+                    </InputAdornment>
+                  ) : undefined,
+                },
+              }}
+            />
+            <Tooltip
+              title={selectedOcrModel
+                ? t('filterTooltip.enabled')
+                : t('filterTooltip.disabled')}
+              arrow
+            >
+              <ToggleButtonGroup
+                size="small"
+                exclusive
+                value={statusFilter}
+                onChange={(_e, v) => { if (v) setStatusFilter(v); }}
+                sx={{ height: 40 }}
+              >
+                <ToggleButton value="all" sx={{ whiteSpace: 'nowrap', textTransform: 'none' }}>
+                  {t('statusFilter.all')}
+                </ToggleButton>
+                <ToggleButton value="missing" disabled={!selectedOcrModel} sx={{ whiteSpace: 'nowrap', textTransform: 'none' }}>
+                  {t('statusFilter.missing')}
+                </ToggleButton>
+                <ToggleButton value="done" disabled={!selectedOcrModel} sx={{ whiteSpace: 'nowrap', textTransform: 'none' }}>
+                  {t('statusFilter.done')}
+                </ToggleButton>
+              </ToggleButtonGroup>
+            </Tooltip>
+          </Box>
+
+          <Box sx={{ flex: 1, overflow: 'auto' }}>
+            {collectionsLoading ? (
+              <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, gap: 1.5 }}>
+                <CircularProgress size={20} />
+                <Typography variant="body2" color="text.secondary">{t('loading.collections')}</Typography>
+              </Box>
+            ) : collections.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+                {t('tree.noCollections')}
+              </Typography>
+            ) : visibleTree.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+                {filterActive
+                  ? t('tree.noResults', { query: treeFilter.trim() })
+                  : statusFilter === 'missing'
+                    ? t('tree.noMissing')
+                    : t('tree.noDone')}
+              </Typography>
+            ) : (
+              <List disablePadding>
+                {visibleTree.map(({ collection, regs }) => {
+                  const cKey = colKey(collection);
+                  const isExpanded = filterActive || expandedCollections.has(cKey);
+                  const allRegs = collection.registres || [];
+                  const colCheck = getColCheckState(collection);
+
+                  return (
+                    <Box key={collection.id}>
+                      <ListItemButton onClick={() => toggleCollection(cKey)} sx={{ py: 1 }}>
+                        <ListItemIcon sx={{ minWidth: 36 }}>
+                          <Checkbox
+                            edge="start"
+                            checked={colCheck.checked}
+                            indeterminate={colCheck.indeterminate}
+                            onClick={(e) => { e.stopPropagation(); toggleAllCollection(collection); }}
+                            size="small"
+                          />
+                        </ListItemIcon>
+                        <ListItemIcon sx={{ minWidth: 28 }}>
+                          <FolderIcon fontSize="small" color="primary" />
+                        </ListItemIcon>
+                        <ListItemText
+                          primary={collection.titre}
+                          secondary={`${collection.type} — ${t('registres', { count: allRegs.length })} — ${t('pages', { count: allRegs.reduce((sum, r) => sum + r.pages_count, 0) })}`}
+                        />
+                        {(() => {
+                          if (!selectedOcrModel) return null;
+                          const done = allRegs.reduce((s, r) => s + (r.ocr_status?.[selectedOcrModel]?.pages_done ?? 0), 0);
+                          const total = allRegs.reduce((s, r) => s + r.pages_count, 0);
+                          if (total === 0) return null;
+                          const complete = done >= total;
+                          return (
+                            <Tooltip title={complete ? t('tree.ocrComplete') : t('tree.pagesRemaining', { count: total - done })} arrow>
+                              <Chip
+                                label={`${fmtNum(done)} / ${fmtNum(total)}`}
+                                color={complete ? 'success' : 'warning'}
+                                variant="outlined"
+                                size="small"
+                                sx={{ mr: 1, cursor: 'default' }}
+                                onClick={(e) => e.stopPropagation()}
+                              />
+                            </Tooltip>
+                          );
+                        })()}
+                        {isExpanded ? <ExpandMoreIcon /> : <ChevronRightIcon />}
+                      </ListItemButton>
+
+                      <Collapse in={isExpanded} unmountOnExit>
+                        {regs.length === 0 ? (
+                          <Typography variant="body2" color="text.secondary" sx={{ pl: 9, py: 1 }}>
+                            {t('tree.noRegistres')}
+                          </Typography>
+                        ) : (
+                          <List disablePadding>
+                            {regs.map((reg) => {
+                              const rKey = `${cKey}/${reg.folder_name}`;
+                              const isRegExpanded = expandedRegistres.has(rKey);
+                              const regCheck = getRegCheckState(cKey, reg);
+
+                              return (
+                                <Box key={reg.id} sx={{ pl: 3 }}>
+                                  <ListItemButton onClick={() => toggleRegistre(rKey)} sx={{ py: 0.5 }}>
+                                    <ListItemIcon sx={{ minWidth: 36 }}>
+                                      <Checkbox
+                                        edge="start"
+                                        checked={regCheck.checked}
+                                        indeterminate={regCheck.indeterminate}
+                                        onClick={(e) => { e.stopPropagation(); toggleAllPages(cKey, reg); }}
+                                        size="small"
+                                      />
+                                    </ListItemIcon>
+                                    <ListItemIcon sx={{ minWidth: 28 }}>
+                                      <BookIcon fontSize="small" color="action" />
+                                    </ListItemIcon>
+                                    <ListItemText primary={reg.titre} secondary={t('pages', { count: reg.pages_count })} />
+                                    {(() => {
+                                      if (!selectedOcrModel) return null;
+                                      const done = reg.ocr_status?.[selectedOcrModel]?.pages_done ?? 0;
+                                      const total = reg.pages_count;
+                                      const complete = done >= total;
+                                      const tooltip = done === 0
+                                        ? t('tree.noTranscription')
+                                        : complete
+                                          ? t('tree.ocrComplete')
+                                          : t('tree.pagesRemaining', { count: total - done });
+                                      return (
+                                        <Tooltip title={tooltip} arrow>
+                                          <Chip
+                                            size="small"
+                                            label={`${done}/${total}`}
+                                            color={done === 0 ? 'default' : complete ? 'success' : 'warning'}
+                                            variant="outlined"
+                                            sx={{ mr: 0.5, cursor: 'default' }}
+                                            onClick={(e) => e.stopPropagation()}
+                                          />
+                                        </Tooltip>
+                                      );
+                                    })()}
+                                    {isRegExpanded ? <ExpandMoreIcon fontSize="small" /> : <ChevronRightIcon fontSize="small" />}
+                                  </ListItemButton>
+
+                                  <Collapse in={isRegExpanded} unmountOnExit>
+                                    {isRegExpanded && (() => {
+                                      const allPages = getPages(reg);
+                                      const doneSet = doneCache.get(`${rKey}/${selectedOcrModel}`);
+                                      // Filtre par statut : nécessite le statut par page (doneSet).
+                                      if (statusFilter !== 'all' && !doneSet) {
+                                        return (
+                                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, pl: 9, py: 0.5 }}>
+                                            <CircularProgress size={12} />
+                                            <Typography variant="body2" color="text.secondary">{t('tree.loadingStates')}</Typography>
+                                          </Box>
+                                        );
+                                      }
+                                      const pages = statusFilter === 'all' || !doneSet
+                                        ? allPages
+                                        : allPages.filter((p) => statusFilter === 'done'
+                                            ? doneSet.has(pageStem(p))
+                                            : !doneSet.has(pageStem(p)));
+                                      return pages.length === 0 ? (
+                                        <Typography variant="body2" color="text.secondary" sx={{ pl: 9, py: 0.5 }}>
+                                          {statusFilter === 'done' ? t('tree.noPageDone') : statusFilter === 'missing' ? t('tree.noPageMissing') : t('tree.noPage')}
+                                        </Typography>
+                                      ) : (
+                                        <List disablePadding>
+                                          {pages.map((page) => {
+                                            const pKey = pageKey(cKey, reg.folder_name, page);
+                                            const isDone = doneSet?.has(pageStem(page));
+                                            return (
+                                              <ListItemButton key={page} sx={{ pl: 6, py: 0.25 }} dense onClick={() => togglePage(pKey)}>
+                                                <ListItemIcon sx={{ minWidth: 36 }}>
+                                                  <Checkbox edge="start" checked={selectedPages.has(pKey)} size="small" />
+                                                </ListItemIcon>
+                                                <ListItemIcon sx={{ minWidth: 28 }}>
+                                                  <ImageIcon fontSize="small" sx={{ color: 'text.disabled' }} />
+                                                </ListItemIcon>
+                                                <ListItemText
+                                                  primary={page}
+                                                  slotProps={{ primary: { variant: 'body2' } }}
+                                                />
+                                                {doneSet && (
+                                                  <Tooltip title={isDone ? t('page.transcribedWith') : t('page.notTranscribed')} arrow>
+                                                    <CircleIcon sx={{ fontSize: 10, mr: 1, color: isDone ? 'success.main' : 'action.disabled' }} />
+                                                  </Tooltip>
+                                                )}
+                                              </ListItemButton>
+                                            );
+                                          })}
+                                        </List>
+                                      );
+                                    })()}
+                                  </Collapse>
+                                </Box>
+                              );
+                            })}
+                          </List>
+                        )}
+                      </Collapse>
+                    </Box>
+                  );
+                })}
+              </List>
+            )}
+          </Box>
+        </Box>
+
+        {/* Colonne droite : modèles */}
+        <Box sx={{ width: 360, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+
+          {/* Segmentation */}
+          <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderBottom: 1, borderColor: 'divider' }}>
+            <PanelHeader title={t('panels.segModel')} />
+            <Box sx={{ flex: 1, overflow: 'auto', px: 1, py: 1 }}>
+              {modelRadioGroup('segmentation', selectedSegModel, setSelectedSegModel)}
+            </Box>
+          </Box>
+
+          {/* OCR */}
+          <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <PanelHeader title={t('panels.ocrModel')} />
+            <Box sx={{ flex: 1, overflow: 'auto', px: 1, py: 1 }}>
+              {modelRadioGroup('ocr', selectedOcrModel, setSelectedOcrModel)}
+            </Box>
+          </Box>
+
+        </Box>
+      </Box>
+      )}
+
+      {/* ─── Confirmation d'ajout à la file ─── */}
+      {queuedNotice !== null && (
+        <Alert
+          severity="success"
+          sx={{ mt: 1, flexShrink: 0 }}
+          onClose={() => setQueuedNotice(null)}
+          action={
+            <Button color="inherit" size="small" onClick={() => navigate('/tasks')}>
+              {t('viewTasks')}
+            </Button>
+          }
+        >
+          {t('queued', { count: queuedNotice })}
+        </Alert>
+      )}
+
+      {/* ─── Barre de lancement ─── */}
+      <OcrLaunchBar
+        selectedCount={selectedPages.size}
+        segModelName={models.find((m) => m.id === selectedSegModel)?.name ?? null}
+        ocrModelName={models.find((m) => m.id === selectedOcrModel)?.name ?? null}
+        estimateSeconds={estimateSeconds}
+        runningOcr={runningOcr}
+        launching={launching}
+        canLaunch={canLaunch}
+        disabledReason={disabledReason}
+        envChip={<EnvStatusChip requirements={requirements} loading={reqLoading} failed={reqFailed} />}
+        onLaunch={launchOcr}
+        onClearSelection={() => setSelectedPages(new Set())}
+      />
+
+    </Box>
+  );
+}

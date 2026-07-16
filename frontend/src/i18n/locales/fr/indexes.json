@@ -1,0 +1,104 @@
+{
+  "loading": "Chargement des index…",
+  "status": {
+    "ready": "Prêt",
+    "generating": "Génération…",
+    "error": "Erreur",
+    "paused": "En pause",
+    "interrupted": "Interrompu",
+    "waiting": "En attente",
+    "rebuilding": "Reconstruction…"
+  },
+  "progress": {
+    "rebuilding": "Reconstruction…",
+    "starting": "Démarrage…",
+    "queued": "En file d'attente…"
+  },
+  "builder": {
+    "createTitle": "Générer un index",
+    "editTitle": "Modifier l'index",
+    "subtitle": "Composez l'index à partir d'une ou plusieurs collections, chacune avec un ou plusieurs modèles OCR.",
+    "nameLabel": "Nom de l'index",
+    "namePlaceholder": "Nom de l'index…",
+    "sources": "SOURCES",
+    "chooseCollection": "Choisir une collection…",
+    "removeSource": "Retirer cette source",
+    "ocrModels": "Modèles OCR",
+    "selectModels": "Sélectionner un ou plusieurs modèles…",
+    "noModels": "Aucun modèle disponible",
+    "chooseCollectionFirst": "Choisir d'abord une collection",
+    "addCollection": "Ajouter une collection",
+    "preview": "Aperçu",
+    "computingPreview": "Calcul de l'aperçu…",
+    "sourcesCount_one": "{{count}} source",
+    "sourcesCount_other": "{{count}} sources",
+    "registresCount_one": "{{val}} registre",
+    "registresCount_other": "{{val}} registres",
+    "pagesToIndex_one": "{{val}} page à indexer",
+    "pagesToIndex_other": "{{val}} pages à indexer",
+    "saveRebuild": "Enregistrer et reconstruire",
+    "generate": "Générer"
+  },
+  "errors": {
+    "load": "Erreur lors du chargement des index",
+    "generate": "Erreur lors de la génération",
+    "rebuild": "Erreur lors de la reconstruction",
+    "cancel": "Erreur lors de l'annulation",
+    "pause": "Erreur lors de la mise en pause",
+    "resume": "Erreur lors de la reprise",
+    "delete": "Erreur lors de la suppression"
+  },
+  "success": {
+    "updated": "Index mis à jour — reconstruction en cours, suivez la progression dans Tâches.",
+    "queued": "Indexation ajoutée à la file — suivez la progression dans Tâches.",
+    "rebuildQueued": "Reconstruction ajoutée à la file — l'index reste consultable jusqu'à la fin.",
+    "cancelled": "Indexation annulée.",
+    "pausing": "Mise en pause en cours — reprise possible depuis Tâches.",
+    "resumed": "Indexation reprise.",
+    "deleted": "Index supprimé."
+  },
+  "list": {
+    "title": "Index existants",
+    "searchPlaceholder": "Rechercher un index, une collection, un modèle…",
+    "refreshTooltip": "Recharger la liste et détecter les nouvelles transcriptions à indexer",
+    "refresh": "Actualiser la liste",
+    "emptyTitle": "Aucun index",
+    "emptyDesc": "Aucun index généré — créez-en un à partir d'une ou plusieurs collections transcrites.",
+    "noMatch": "Aucun index ne correspond à la recherche",
+    "wordsCount_one": "{{val}} mot",
+    "wordsCount_other": "{{val}} mots",
+    "registresCount_one": "{{count}} registre",
+    "registresCount_other": "{{count}} registres",
+    "occAbbr": "{{val}} occ.",
+    "newPages_one": "+{{val}} page",
+    "newPages_other": "+{{val}} pages",
+    "newRegistres_one": "+{{count}} registre",
+    "newRegistres_other": "+{{count}} registres",
+    "toIndex": "à indexer"
+  },
+  "table": {
+    "index": "Index",
+    "composition": "Composition",
+    "wordsProgress": "Mots / progression",
+    "createdAt": "Créé le",
+    "status": "Statut"
+  },
+  "actions": {
+    "viewCurrent": "Voir le contenu de l'index (version actuelle)",
+    "view": "Voir le contenu de l'index",
+    "resume": "Reprendre l'indexation",
+    "resumeInterrupted": "Reprendre l'indexation interrompue",
+    "pausing": "Mise en pause en cours…",
+    "pause": "Mettre en pause (reprise possible)",
+    "cancelGeneration": "Annuler la génération",
+    "cancelling": "Annulation en cours…",
+    "edit": "Modifier (nom, collections, modèles)",
+    "update": "Mettre à jour l'index (nouvelles transcriptions disponibles)",
+    "rebuild": "Reconstruire l'index",
+    "delete": "Supprimer"
+  },
+  "deleteDialog": {
+    "title": "Supprimer l'index",
+    "confirm": "Supprimer l'index <strong>{{name}}</strong> ? Cette action est irréversible."
+  }
+}

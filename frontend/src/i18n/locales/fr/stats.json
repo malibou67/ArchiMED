@@ -1,0 +1,116 @@
+{
+  "showLess": "Afficher moins",
+  "showAll": "Afficher tout ({{count}})",
+  "loadError": "Erreur lors du chargement des statistiques",
+  "filesTranscribed_one": "{{count}} fichier transcrit",
+  "filesTranscribed_other": "{{count}} fichiers transcrits",
+  "transcriptionChip": {
+    "notTranscribed": "Non transcrit",
+    "transcribed": "Transcrit",
+    "partial": "Partiel · {{pct}}",
+    "noOcr": "Aucun OCR pour ce registre.",
+    "ocrLine": "OCR : {{done}} / {{total}} pages · {{pct}}"
+  },
+  "overview": {
+    "title": "Vue d'ensemble de la collection",
+    "registres": "registres",
+    "pagesScanned": "pages scannées",
+    "periodCovered": "période couverte",
+    "ocrModels": "modèles OCR",
+    "filesTranscribed": "fichiers transcrits"
+  },
+  "byModel": {
+    "title": "Avancement par modèle",
+    "subtitle": "Couverture OCR et fichiers de transcription disponibles",
+    "ocrLine": "OCR : {{done}} / {{total}} pages",
+    "ocrNone": "OCR : —",
+    "noData": "Aucune donnée OCR pour cette collection."
+  },
+  "byYear": {
+    "title": "Pages scannées par année",
+    "subtitle": "Réparties sur les années couvertes par la période de chaque registre",
+    "seriesPages": "Pages",
+    "excluded_one": "{{count}} registre sans période renseignée, exclu de la répartition.",
+    "excluded_other": "{{count}} registres sans période renseignée, exclus de la répartition.",
+    "noPeriod": "Aucune période exploitable dans les registres."
+  },
+  "detail": {
+    "title": "Détail par registre",
+    "subtitle": "Volume et avancement OCR de chaque registre (du plus volumineux au plus petit)",
+    "registre": "Registre",
+    "period": "Période",
+    "pages": "Pages",
+    "transcription": "Transcription"
+  },
+  "kpi": {
+    "uniqueWords": "mots uniques",
+    "occurrences": "occurrences",
+    "indexedPages": "pages indexées",
+    "registres": "registres",
+    "periodCovered": "période couverte"
+  },
+  "corpus": {
+    "topWords": "Top {{count}} des mots les plus fréquents",
+    "seriesOccurrences": "Occurrences",
+    "freqDist": "Distribution des fréquences (mots uniques par nombre d'occurrences)",
+    "seriesUniqueWords": "Mots uniques",
+    "pagesByYear": "Pages indexées par année",
+    "seriesPages": "Pages",
+    "registresByYear": "Registres par année",
+    "seriesRegistres": "Registres"
+  },
+  "emptyPages": {
+    "title": "Registres avec des pages sans texte",
+    "subtitle": "Pages reconnues par l'OCR mais sans aucun mot indexé",
+    "registre": "Registre",
+    "indexed": "Indexées",
+    "ocr": "OCR",
+    "empty": "Vides"
+  },
+  "quality": {
+    "title": "Qualité OCR & couverture",
+    "subtitle": "Indicateurs de bruit OCR et de complétude de l'index",
+    "shortWords": "Mots très courts (≤ 2 lettres, bruit OCR probable)",
+    "shortWordsDetail": "{{words}} mots · {{occ}} occurrences",
+    "shortWordsHelp": "Mots de 1 à 2 lettres. Taux = nombre de ces mots ÷ nombre total de mots uniques du vocabulaire.",
+    "hapax": "Hapax (mots vus une seule fois)",
+    "hapaxDetail": "{{words}} mots",
+    "hapaxHelp": "Un hapax est un mot dont le nombre total d'occurrences dans tout l'index vaut exactement 1. Taux = nombre d'hapax ÷ nombre total de mots uniques.",
+    "hapaxNote": "<strong>Hapax</strong> : mots n'apparaissant qu'une seule fois dans l'ensemble du corpus indexé ({{words}} mots, soit {{pct}} % du vocabulaire).",
+    "hapaxNote2": "Un taux élevé d'hapax ou de mots courts signale souvent des erreurs de reconnaissance OCR.",
+    "pagesWithText": "Pages avec texte indexé",
+    "pagesWithoutText": "Pages sans texte",
+    "onOcrPages": "sur {{total}} pages passées à l'OCR",
+    "pagesNote": "<strong>Pages avec texte indexé</strong> = pages contenant au moins un mot reconnu et indexé. <strong>Pages sans texte</strong> = pages soumises à l'OCR mais dont aucun mot n'a été indexé (pages blanches, illisibles ou non textuelles).",
+    "coverageUnknown": "Couverture inconnue — régénérez l'index pour activer le suivi des pages OCR sans texte.",
+    "registresNoPeriod": "Registres sans période renseignée (exclus des statistiques temporelles)"
+  },
+  "richest": {
+    "title": "Registres les plus riches",
+    "subtitle": "Registres classés par richesse de vocabulaire indexé",
+    "registre": "Registre",
+    "period": "Période",
+    "pages": "Pages",
+    "occurrences": "Occurrences",
+    "uniqueWords": "Mots uniques"
+  },
+  "trend": {
+    "title": "Évolution temporelle de termes",
+    "subtitle": "Fréquence d'un ou plusieurs termes par année, à la manière d'un Ngram",
+    "placeholder": "Termes à comparer… (ex : cancer tuberculose)",
+    "helper": "Jusqu'à {{max}} termes, séparés par des espaces ou virgules",
+    "trace": "Tracer",
+    "similarity": "Ressemblance",
+    "exact": "Exacte",
+    "per1000": "Pour 1 000 pages",
+    "rawOccurrences": "Occurrences brutes",
+    "prompt": "Saisissez un ou plusieurs termes pour tracer leur évolution dans le corpus",
+    "noData": "Aucune donnée temporelle disponible : les registres de cet index n'ont pas de période renseignée.",
+    "similarityChip": "Ressemblance ≥ {{value}}%",
+    "error": "Erreur lors du calcul de l'évolution",
+    "note": "Chaque registre est rattaché à l'année médiane de sa période. L'axe n'affiche une étiquette que tous les 5 ans.",
+    "normalizedNote": " Valeurs normalisées par le nombre de pages indexées de chaque année.",
+    "excluded_one": " {{count}} registre sans période exclu.",
+    "excluded_other": " {{count}} registres sans période exclus."
+  }
+}

@@ -1,0 +1,59 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+*.egg-info/
+.Python
+
+# ─── Environnement ────────────────────────────────────────
+backend/.env
+.env
+
+# ─── Frontend build (généré par vite build) ───────────────
+backend/static/
+
+# ─── Node ─────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+
+# ─── PyInstaller / build ──────────────────────────────────
+dist/
+build/
+build.ps1
+*.spec
+*.spec.bak
+
+# ─── Data : contenu ignoré, structure conservée via README ─
+data/collections/*
+!data/collections/README.md
+
+data/models/*
+!data/models/README.md
+
+data/indexes/*
+!data/indexes/README.md
+
+# tasks = état runtime du moteur de tâches — jamais versionné
+data/tasks/
+
+# ─── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ─── IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Scripts utilitaires hors-app ─────────────────────────
+old_scripts/
+
+# ─── Claude Code ──────────────────────────────────────────
+.claude/
