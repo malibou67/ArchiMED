@@ -13,8 +13,6 @@
     "coresBusy": "About {{effective}} core(s) busy, ~{{free}} left free to use the PC.",
     "moreWorkers": " More workers = faster, but more cores and VRAM used.",
     "advancedOptions": "Advanced options",
-    "mixedPrecision": "Mixed precision (autocast / TF32)",
-    "mixedPrecisionHint": "No measurable effect on current models (the bottleneck is the CPU). Leave it off.",
     "threadsPerWorker": "Threads per worker",
     "threadsHint": "Keep it at 1: too many threads × workers saturates the CPU and slows everything down.",
     "poolThreshold": "Parallelization threshold (pages)",

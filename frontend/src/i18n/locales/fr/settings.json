@@ -13,8 +13,6 @@
     "coresBusy": "Environ {{effective}} cœur(s) occupé(s), ~{{free}} laissé(s) libre(s) pour utiliser le PC.",
     "moreWorkers": " Plus de workers = plus rapide, mais plus de cœurs et de VRAM consommés.",
     "advancedOptions": "Options avancées",
-    "mixedPrecision": "Précision mixte (autocast / TF32)",
-    "mixedPrecisionHint": "Sans effet mesuré sur les modèles actuels (le goulot est le CPU). À laisser désactivé.",
     "threadsPerWorker": "Threads par worker",
     "threadsHint": "À laisser à 1 : trop de threads × workers sature le CPU et ralentit tout.",
     "poolThreshold": "Seuil de parallélisation (pages)",

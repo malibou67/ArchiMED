@@ -4,8 +4,6 @@ import {
   Paper,
   Typography,
   Slider,
-  Switch,
-  FormControlLabel,
   TextField,
   Button,
   Collapse,
@@ -95,7 +93,6 @@ export default function SettingsPage() {
 
   const [auto, setAuto] = useState(true);
   const [workers, setWorkers] = useState(4);
-  const [mixed, setMixed] = useState(false);
   const [threads, setThreads] = useState(1);
   const [poolMin, setPoolMin] = useState(3);
   const [advanced, setAdvanced] = useState(false);
@@ -116,7 +113,6 @@ export default function SettingsPage() {
     setData(d);
     setAuto(d.stored.ocr_workers == null);
     setWorkers(d.stored.ocr_workers ?? d.system.recommended_workers);
-    setMixed(d.effective.ocr_mixed_precision);
     setThreads(d.effective.ocr_threads_per_worker);
     setPoolMin(d.effective.ocr_pool_min_pages);
   };
@@ -160,7 +156,6 @@ export default function SettingsPage() {
 
   const dirty = !!data && (
     (auto ? data.stored.ocr_workers != null : workers !== data.effective.ocr_workers)
-    || mixed !== data.effective.ocr_mixed_precision
     || threads !== data.effective.ocr_threads_per_worker
     || poolMin !== data.effective.ocr_pool_min_pages
   );
@@ -171,7 +166,6 @@ export default function SettingsPage() {
       setError(null);
       const res = await settingsApi.update({
         ocr_workers: auto ? null : workers,
-        ocr_mixed_precision: mixed,
         ocr_threads_per_worker: threads,
         ocr_pool_min_pages: poolMin,
       });
@@ -317,15 +311,6 @@ export default function SettingsPage() {
               <Collapse in={advanced} unmountOnExit>
                 <Divider sx={{ my: 1.5 }} />
                 <Stack spacing={2}>
-                  <Box>
-                    <FormControlLabel
-                      control={<Switch checked={mixed} onChange={(e) => setMixed(e.target.checked)} />}
-                      label={t('performance.mixedPrecision')}
-                    />
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                      {t('performance.mixedPrecisionHint')}
-                    </Typography>
-                  </Box>
                   <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
                     <Box sx={{ flex: 1 }}>
                       <TextField
