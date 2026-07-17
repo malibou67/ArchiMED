@@ -9,9 +9,9 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 pydantic==2.5.3
 python-dotenv==1.0.0
-kraken>=4.0
+kraken==7.0.1
 torch==2.11.0
 torchvision==0.26.0
-Pillow
-pystray
+Pillow==12.2.0
+pystray==0.19.5
 rapidfuzz==3.14.5
