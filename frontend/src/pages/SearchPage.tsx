@@ -96,6 +96,7 @@ export default function SearchPage() {
   const [selectedWords, setSelectedWords] = useState<Set<string>>(new Set());
   const [fuzzyThreshold, setFuzzyThreshold] = useState(100);
   const [exportAnchor, setExportAnchor] = useState<null | HTMLElement>(null);
+  const [preparingZip, setPreparingZip] = useState(false);  // overlay pendant la préparation du ZIP
   const REG_PER_PAGE = 10;
 
   // Pages liées (famille : page principale + extras) pour la visionneuse de recherche.
@@ -289,6 +290,43 @@ export default function SearchPage() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(a.href);
+  };
+
+  // Attend le cookie posé par le backend au démarrage du flux ZIP (= fin de la préparation
+  // serveur), avec un filet de sécurité `timeoutMs` pour ne jamais laisser l'overlay bloqué.
+  const waitForZipStart = (token: string, timeoutMs: number): Promise<void> =>
+    new Promise(resolve => {
+      const start = Date.now();
+      const id = window.setInterval(() => {
+        const ready = document.cookie.split('; ').some(c => c === `archimed_zip_ready=${token}`);
+        if (ready || Date.now() - start > timeoutMs) {
+          window.clearInterval(id);
+          if (ready) document.cookie = 'archimed_zip_ready=; Max-Age=0; path=/';
+          resolve();
+        }
+      }, 400);
+    });
+
+  // Export ZIP piloté en JS (plutôt qu'un simple <a href>) afin d'afficher un loader pendant la
+  // préparation serveur. Le téléchargement reste streamé sur disque (ancre native déclenchée
+  // ici) : aucune limite de taille, l'archive ne transite pas par la mémoire du navigateur.
+  const handleExportZip = () => {
+    if (!searchResult) return;
+    setExportAnchor(null);
+    // randomUUID n'existe qu'en contexte sécurisé (localhost ok) ; repli sinon.
+    const token = window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const url = indexesApi.getResultsExportUrl(selectedIndex, 'zip', {
+      q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to,
+      fuzzy_threshold: searchResult.fuzzy_threshold, download_token: token,
+    });
+    setPreparingZip(true);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    waitForZipStart(token, 15 * 60_000).finally(() => setPreparingZip(false));
   };
 
 
@@ -585,12 +623,7 @@ export default function SearchPage() {
                             <Typography variant="caption" color="text.secondary">{t('exportMenu.csvDesc')}</Typography>
                           </Box>
                         </MenuItem>
-                        <MenuItem
-                          component="a"
-                          href={indexesApi.getResultsExportUrl(selectedIndex, 'zip', { q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to, fuzzy_threshold: searchResult.fuzzy_threshold })}
-                          download
-                          onClick={() => setExportAnchor(null)}
-                        >
+                        <MenuItem onClick={handleExportZip}>
                           <Box>
                             <Typography variant="body2">{t('exportMenu.zipTitle')}</Typography>
                             <Typography variant="caption" color="text.secondary">{t('exportMenu.zipDesc')}</Typography>
@@ -797,6 +830,11 @@ export default function SearchPage() {
       <Backdrop open={!!loadingPage} sx={{ zIndex: theme => theme.zIndex.modal - 1, color: '#fff', flexDirection: 'column', gap: 2 }}>
         <CircularProgress color="inherit" />
         <Typography variant="body2" sx={{ color: '#fff', opacity: 0.9 }}>{t('loadingImage')}</Typography>
+      </Backdrop>
+
+      <Backdrop open={preparingZip} sx={{ zIndex: theme => theme.zIndex.modal + 1, color: '#fff', flexDirection: 'column', gap: 2 }}>
+        <CircularProgress color="inherit" />
+        <Typography variant="body2" sx={{ color: '#fff', opacity: 0.9 }}>{t('preparingArchive')}</Typography>
       </Backdrop>
 
       {viewerOpen && viewerList.length > 0 && (

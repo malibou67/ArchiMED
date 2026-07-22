@@ -145,6 +145,39 @@ def _guess_extra_pagination(extra_pages: List[str], main_pattern: str) -> Option
     return None
 
 
+def _pattern_to_regex(pattern: str) -> "re.Pattern":
+    """Convertit un motif de pagination (`prefix{num}sep{extra_page}ext`) en regex capturante :
+    `{num}`→(\\d+), `{extra_page}`→(.+?), le reste échappé. Calqué sur makePatternRegex (frontend)."""
+    out: List[str] = []
+    for part in re.split(r'(\{num\}|\{extra_page\})', pattern):
+        if part == '{num}':
+            out.append(r'(\d+)')
+        elif part == '{extra_page}':
+            out.append(r'(.+?)')
+        else:
+            out.append(re.escape(part))
+    return re.compile('^' + ''.join(out) + '$')
+
+
+def _page_key(name: str, main_pattern: Optional[str], extra_pattern: Optional[str]) -> Optional[str]:
+    """Clé de regroupement d'une page = son numéro principal. Avec motifs : capture `{num}` du
+    motif principal, sinon du motif extra. Sans motif : repli `<base>_<num>` (l'extra suit par
+    `-` ou `_`). Calqué sur pageFamilyFromList (frontend), pour reconstituer côté serveur la
+    même famille (page principale + extras) que la visionneuse."""
+    if main_pattern or extra_pattern:
+        if main_pattern:
+            m = _pattern_to_regex(main_pattern).match(name)
+            if m:
+                return m.group(1)
+        if extra_pattern:
+            e = _pattern_to_regex(extra_pattern).match(name)
+            if e:
+                return e.group(1)
+        return None
+    m = re.match(r'^(.+?)_(\d+)(?:[-_].+)?(?:\.[^.]+)?$', name)
+    return f"{m.group(1)}_{m.group(2)}" if m else None
+
+
 def _parse_model_accuracy(raw: Any) -> Optional[float]:
     """Précision d'un user_metadata Kraken : scalaire, liste de scalaires, ou liste de
     paires [étape, précision] (kraken ≥ 4) — on garde le meilleur checkpoint."""
@@ -1976,6 +2009,54 @@ class IndexesService:
                 "chemin": chemin,
             })
         return rows
+
+    @staticmethod
+    def resolve_result_zip_files(
+        index_id: str, q: str,
+        year_from: Optional[int] = None, year_to: Optional[int] = None,
+        fuzzy_threshold: Optional[int] = None,
+    ) -> Optional[List[tuple]]:
+        """Fichiers (registre, Path) à inclure dans le ZIP d'une recherche : les pages résultats
+        ET leurs extra pages (même registre, même numéro principal), pour coller à ce qu'affiche
+        la visionneuse. Retourne None si l'index est absent."""
+        result = IndexesService.search_words(
+            index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+        )
+        if result is None:
+            return None
+        pages = result.get("pages", [])
+        resolved = IndexesService._resolve_pages_files(index_id, [p["page_name"] for p in pages])
+
+        # Cache par registre : (dossier scans/<registre>, {fichier -> famille principale+extras}).
+        reg_cache: Dict[tuple, tuple] = {}
+        out: List[tuple] = []
+        seen: set = set()
+        for _name, (path, registre) in resolved.items():
+            if not path or not registre:
+                continue
+            collection_id = path.parents[2].name  # …/<collection_id>/scans/<registre>/<fichier>
+            ck = (collection_id, registre)
+            if ck not in reg_cache:
+                reg = RegistresService.get_registre(collection_id, registre) or {}
+                main_pattern = reg.get('pages_pattern')
+                extra_pattern = (reg.get('extra_pagination') or {}).get('pattern')
+                files = RegistresService.list_scan_pages(collection_id, registre)
+                groups: Dict[str, List[str]] = {}
+                keyed: Dict[str, Optional[str]] = {}
+                for f in files:
+                    k = _page_key(f, main_pattern, extra_pattern)
+                    keyed[f] = k
+                    if k is not None:
+                        groups.setdefault(k, []).append(f)
+                fam_index = {f: (groups[k] if k is not None else [f]) for f, k in keyed.items()}
+                reg_cache[ck] = (path.parent, fam_index)
+            scans_reg_dir, fam_index = reg_cache[ck]
+            for fn in fam_index.get(path.name, [path.name]):
+                fp = scans_reg_dir / fn
+                if fp not in seen:
+                    seen.add(fp)
+                    out.append((registre, fp))
+        return out
 
     @staticmethod
     def stream_pages_zip(files: List[tuple]):

@@ -192,20 +192,29 @@ def export_pages_zip(
     year_from: Optional[int] = Query(None),
     year_to: Optional[int] = Query(None),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
+    download_token: Optional[str] = Query(None, description="Jeton renvoyé en cookie au démarrage du flux (loader front)"),
 ):
-    """Exporte les images brutes (sans annotation) des pages résultats en ZIP streamé."""
-    rows = IndexesService.resolve_result_pages(
+    """Exporte les images brutes (sans annotation) des pages résultats — et de leurs extra
+    pages — en ZIP streamé."""
+    files = IndexesService.resolve_result_zip_files(
         index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
     )
-    if rows is None:
+    if files is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
 
-    files = [(r["registre"], r["path"]) for r in rows if r["path"]]
-    return StreamingResponse(
+    response = StreamingResponse(
         IndexesService.stream_pages_zip(files),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{index_id}_pages.zip"'},
     )
+    # Les en-têtes (dont Set-Cookie) partent une fois la préparation terminée, juste avant le
+    # premier octet : le front s'en sert pour masquer le loader « Préparation de l'archive ».
+    if download_token:
+        response.set_cookie(
+            "archimed_zip_ready", download_token,
+            max_age=120, httponly=False, samesite="lax", path="/",
+        )
+    return response
 
 
 @router.get("/{index_id}/words/export")

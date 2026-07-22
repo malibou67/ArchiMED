@@ -146,13 +146,14 @@ export const indexesApi = {
   getResultsExportUrl: (
     indexId: string,
     kind: 'csv' | 'zip',
-    params: { q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number },
+    params: { q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number; download_token?: string },
   ): string => {
     const qs = new URLSearchParams();
     qs.set('q', params.q);
     if (params.year_from != null) qs.set('year_from', String(params.year_from));
     if (params.year_to != null) qs.set('year_to', String(params.year_to));
     if (params.fuzzy_threshold != null && params.fuzzy_threshold < 100) qs.set('fuzzy_threshold', String(params.fuzzy_threshold));
+    if (params.download_token) qs.set('download_token', params.download_token);
     const file = kind === 'csv' ? 'export-results.csv' : 'export-pages.zip';
     return `/api/indexes/${indexId}/${file}?${qs.toString()}`;
   },
