@@ -169,11 +169,14 @@ export type ScanReport = {
   anomalies_count: number;
 }
 
-// Événement de progression émis par le flux d'analyse (une collection traitée).
+// Événement de progression émis par le flux d'analyse (une collection traitée) ;
+// reg_current/reg_total suivent l'avancement des registres de la collection en cours.
 export type ScanProgress = {
   current: number;
   total: number;
   name: string;
+  reg_current?: number;
+  reg_total?: number;
 }
 
 export type IndexStats = {

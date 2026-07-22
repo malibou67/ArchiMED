@@ -443,7 +443,21 @@ class CollectionsService:
 
     @staticmethod
     def sync_collection_metadata(collection_id: str) -> Optional[Dict[str, Any]]:
-        """Reconstruit la liste des registres dans le metadata.json d'une collection.
+        """Wrapper non-streaming de sync_collection_metadata_iter : draine l'itérateur et
+        renvoie le metadata reconstruit (ou None si le dossier n'est pas une collection)."""
+        result = None
+        for event in CollectionsService.sync_collection_metadata_iter(collection_id):
+            if event.get('type') == 'result':
+                result = event['metadata']
+        return result
+
+    @staticmethod
+    def sync_collection_metadata_iter(collection_id: str):
+        """Variante en flux de sync_collection_metadata : reconstruit la liste des
+        registres dans le metadata.json d'une collection, en émettant un événement de
+        progression par registre ({'type': 'registre', 'reg_current', 'reg_total'}) puis
+        un événement final ({'type': 'result', 'metadata': {...}} ; rien n'est yieldé si
+        le dossier n'est pas une collection).
 
         Si le dossier n'a pas encore de metadata.json (collection déposée à la main dans
         data/collections), un squelette minimal est créé — c'est le point d'entrée voulu :
@@ -481,9 +495,10 @@ class CollectionsService:
         scan_reg_names = set()  # registres réellement présents dans scans/
 
         if scans_dir.exists():
-            for item in sorted(scans_dir.iterdir(), key=lambda x: x.name):
-                if not item.is_dir():
-                    continue
+            reg_dirs = [d for d in sorted(scans_dir.iterdir(), key=lambda x: x.name) if d.is_dir()]
+            reg_total = len(reg_dirs)
+            for j, item in enumerate(reg_dirs, 1):
+                yield {"type": "registre", "reg_current": j, "reg_total": reg_total}
                 scan_reg_names.add(item.name)
 
                 reg_metadata_file = item / "metadata.json"
@@ -632,7 +647,7 @@ class CollectionsService:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
 
         metadata['folder_name'] = collection_dir.name
-        return metadata
+        yield {"type": "result", "metadata": metadata}
 
     # Dossiers à ignorer lors du scan (cachés, Python, système)
     _SCAN_EXCLUDE = re.compile(r'^(\.|__)')
@@ -702,9 +717,10 @@ class CollectionsService:
             scan_reg_names = set()
             regs = []
             if scans_dir.exists():
-                for reg_dir in sorted(scans_dir.iterdir()):
-                    if not reg_dir.is_dir():
-                        continue
+                reg_dirs = [d for d in sorted(scans_dir.iterdir()) if d.is_dir()]
+                reg_total = len(reg_dirs)
+                for j, reg_dir in enumerate(reg_dirs, 1):
+                    yield {"type": "registre", "reg_current": j, "reg_total": reg_total}
                     scan_reg_names.add(reg_dir.name)
                     reg_known = reg_dir.name in known_regs
                     if not reg_known:
@@ -819,9 +835,13 @@ class CollectionsService:
         results: List[Dict[str, Any]] = []
         for idx, col_dir in enumerate(col_dirs, 1):
             yield {"type": "progress", "current": idx, "total": total, "name": col_dir.name}
-            result = CollectionsService.sync_collection_metadata(col_dir.name)
-            if result:
-                results.append(result)
+            # Relaie les événements 'registre' de la collection et capture son 'result'.
+            for event in CollectionsService.sync_collection_metadata_iter(col_dir.name):
+                if event.get('type') == 'result':
+                    if event['metadata']:
+                        results.append(event['metadata'])
+                else:
+                    yield event
 
         yield {"type": "done", "results": results}
 

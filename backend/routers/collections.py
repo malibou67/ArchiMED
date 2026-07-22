@@ -129,3 +129,17 @@ def sync_collection(collection_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/{collection_id}/sync/stream")
+def sync_collection_stream(collection_id: str):
+    """Même synchronisation que /{collection_id}/sync, mais en flux NDJSON : une ligne
+    JSON de progression par registre ({"type":"registre","reg_current","reg_total"})
+    puis une ligne finale ({"type":"result","metadata":{...}})."""
+    def gen():
+        try:
+            for event in CollectionsService.sync_collection_metadata_iter(collection_id):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as e:
+            yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")

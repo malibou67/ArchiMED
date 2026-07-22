@@ -60,6 +60,25 @@ export const collectionsApi = {
     return response.data;
   },
 
+  // Même synchronisation que sync(), mais en flux NDJSON : onProgress est appelé à
+  // chaque registre traité (avec le compteur reg_current/reg_total), et la promesse
+  // résout sur le metadata final. Le back n'émet pas d'événement collection ici, donc
+  // on amorce le nom depuis l'id.
+  syncStream: async (id: string, onProgress: (p: ScanProgress) => void): Promise<CollectionMetadata | null> => {
+    let cur: ScanProgress = { current: 1, total: 1, name: id };
+    let result: CollectionMetadata | null = null;
+    onProgress(cur);
+    await readNdjson(`/api/collections/${id}/sync/stream`, { method: 'POST' }, (event) => {
+      if (event.type === 'registre') {
+        cur = { ...cur, reg_current: event.reg_current, reg_total: event.reg_total };
+        onProgress(cur);
+      } else if (event.type === 'result') {
+        result = event.metadata;
+      }
+    });
+    return result;
+  },
+
   scan: async (): Promise<ScanReport> => {
     // Scan complet du NAS : peut dépasser le filet global → timeout désactivé.
     const response = await api.get('/api/collections/scan', { timeout: 0 });
@@ -70,9 +89,14 @@ export const collectionsApi = {
   // collection traitée, et la promesse résout sur le rapport final.
   scanStream: async (onProgress: (p: ScanProgress) => void): Promise<ScanReport> => {
     let report: ScanReport | null = null;
+    let cur: ScanProgress | null = null;
     await readNdjson('/api/collections/scan/stream', {}, (event) => {
       if (event.type === 'progress') {
-        onProgress({ current: event.current, total: event.total, name: event.name });
+        cur = { current: event.current, total: event.total, name: event.name };
+        onProgress(cur);
+      } else if (event.type === 'registre' && cur) {
+        cur = { ...cur, reg_current: event.reg_current, reg_total: event.reg_total };
+        onProgress(cur);
       } else if (event.type === 'report') {
         report = event.report;
       }
@@ -91,9 +115,14 @@ export const collectionsApi = {
   // chaque collection synchronisée, et la promesse résout sur la liste finale.
   syncAllStream: async (onProgress: (p: ScanProgress) => void): Promise<CollectionMetadata[]> => {
     let results: CollectionMetadata[] | null = null;
+    let cur: ScanProgress | null = null;
     await readNdjson('/api/collections/sync-all/stream', { method: 'POST' }, (event) => {
       if (event.type === 'progress') {
-        onProgress({ current: event.current, total: event.total, name: event.name });
+        cur = { current: event.current, total: event.total, name: event.name };
+        onProgress(cur);
+      } else if (event.type === 'registre' && cur) {
+        cur = { ...cur, reg_current: event.reg_current, reg_total: event.reg_total };
+        onProgress(cur);
       } else if (event.type === 'done') {
         results = event.results;
       }

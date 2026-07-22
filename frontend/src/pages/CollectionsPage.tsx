@@ -171,6 +171,19 @@ function ProgressPanel({ progress, action }: { progress: ScanProgress | null; ac
       ) : (
         <LinearProgress />
       )}
+      {progress && progress.reg_total != null && progress.reg_total > 0 && (
+        <Box sx={{ mt: 2 }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', mb: 1, gap: 2 }}>
+            <Typography variant="body2" color="text.secondary" noWrap>
+              {t('progress.registres')}
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+              {progress.reg_current ?? 0} / {progress.reg_total}
+            </Typography>
+          </Box>
+          <LinearProgress variant="determinate" value={Math.round(((progress.reg_current ?? 0) / progress.reg_total) * 100)} />
+        </Box>
+      )}
     </Box>
   );
 }
@@ -637,10 +650,14 @@ export default function CollectionsPage() {
   };
 
   // Synchronise une seule collection depuis le rapport de scan, puis rafraîchit le rapport.
+  // Passe par le flux NDJSON : le ProgressPanel affiche l'avancement par registre (état
+  // syncing/syncProgress partagé avec « Synchroniser tout »).
   const handleSyncFromScan = async (folderName: string) => {
+    setSyncing(true);
+    setSyncProgress({ current: 1, total: 1, name: folderName });
     setScanSyncingFolder(folderName);
     try {
-      await collectionsApi.sync(folderName);
+      await collectionsApi.syncStream(folderName, setSyncProgress);
       await loadCollections();
       const report = await collectionsApi.scan();
       setScanReport(report);
@@ -648,6 +665,8 @@ export default function CollectionsPage() {
       setError(t('errors.syncCollection'));
       console.error(err);
     } finally {
+      setSyncing(false);
+      setSyncProgress(null);
       setScanSyncingFolder(null);
     }
   };

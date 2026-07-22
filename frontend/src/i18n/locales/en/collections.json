@@ -27,7 +27,8 @@
     "of": "{{action}} of “{{name}}”…",
     "inProgress": "{{action}} in progress…",
     "sync": "Synchronization",
-    "analyze": "Analysis"
+    "analyze": "Analysis",
+    "registres": "Registers"
   },
   "status": {
     "metadataPresent": "metadata.json present",
