@@ -172,9 +172,10 @@ If you use ArchiMED in your work, please cite:
 
 ## Team & partners
 
-- **Lead**: Christian Bonah (DHPS)
-- **Laboratory / institution**: SAGE (UMR 7363), Faculté de médecine,
-  Université de Strasbourg, France
+- **Christian Bonah** (DHPS) — *Lead*
+  - SAGE (UMR 7363), Faculté de médecine, Université de Strasbourg, France
+- **Christine Keyser** — *Lead*
+  - BABEL Laboratory, CNRS UMR 8045, Paris, France
 
 ## Funding
 
