@@ -70,7 +70,10 @@
     "workersCount_other": "{{count}} workers",
     "threadsPerWorker_one": "{{count}} thread par worker",
     "threadsPerWorker_other": "{{count}} threads par worker",
-    "mixedSuffix": ", précision mixte"
+    "mixedSuffix": ", précision mixte",
+    "sequentialFallback": "Séquentiel (repli)",
+    "sequentialFallbackTooltip_one": "Le pool de {{count}} worker n'a pas pu démarrer : traitement page par page sur un seul cœur",
+    "sequentialFallbackTooltip_other": "Le pool de {{count}} workers n'a pas pu démarrer : traitement page par page sur un seul cœur"
   },
   "pagesPanel": {
     "all": "Toutes",

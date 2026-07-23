@@ -70,7 +70,10 @@
     "workersCount_other": "{{count}} workers",
     "threadsPerWorker_one": "{{count}} thread per worker",
     "threadsPerWorker_other": "{{count}} threads per worker",
-    "mixedSuffix": ", mixed precision"
+    "mixedSuffix": ", mixed precision",
+    "sequentialFallback": "Sequential (fallback)",
+    "sequentialFallbackTooltip_one": "The {{count}}-worker pool failed to start: pages processed one by one on a single core",
+    "sequentialFallbackTooltip_other": "The {{count}}-worker pool failed to start: pages processed one by one on a single core"
   },
   "pagesPanel": {
     "all": "All",

@@ -1,9 +1,23 @@
+import multiprocessing
+import os
+import sys
+
+# PyInstaller : les process du pool OCR sont relancés via ArchiMED.exe et réexécutent donc
+# ce script. freeze_support() doit être appelé AVANT tout le reste — il détourne le fils
+# vers le code worker multiprocessing et ne rend jamais la main. Sans lui, le fils
+# redémarre l'application entière (log tronqué, onglet navigateur, sortie immédiate) et le
+# pool casse → repli séquentiel, un seul cœur utilisé dans le build.
+# Hors gel (dev), l'appel est un no-op.
+if getattr(sys, 'frozen', False) and sys.stdout is None:
+    # Build sans console : stdout/stderr valent None ; un print d'une bibliothèque dans un
+    # worker planterait le process avant même l'initialiseur du pool.
+    sys.stdout = sys.stderr = open(os.devnull, 'w')
+multiprocessing.freeze_support()
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
-import os
-import sys
 
 # Charger le .env AVANT d'importer les routers : ocr_service lit OCR_WORKERS /
 # OCR_MIXED_PRECISION au moment de l'import.

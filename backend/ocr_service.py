@@ -529,9 +529,11 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
         mixed = task['preflight']['mixed_precision']
 
         if workers <= 1 or len(todo) < effective_pool_min_pages():
+            task['preflight']['mode'] = 'sequential'
             OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
                                        device, mixed, on_page_done)
         else:
+            task['preflight']['mode'] = 'parallel'
             try:
                 OcrService._process_pool(task, todo, touched_collections, seg_model_id, ocr_model_id,
                                          device, workers, threads, mixed, on_page_done)
@@ -543,6 +545,11 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
                 task['status'] = 'running'
                 todo = _plan_todo(task, pages)
                 on_page_done = _registre_reporter(task, todo)
+                # Tracé dans le préflight : la dégradation est visible dans l'UI, sinon la
+                # tâche affiche W>1 alors qu'elle tourne sur un seul cœur.
+                task['preflight']['mode'] = 'sequential'
+                task['preflight']['pool_fallback'] = str(pool_err)[:300]
+                TaskService._save(task)
                 print(f"[OCR] pool indisponible ({pool_err}); repli séquentiel.", flush=True)
                 OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
                                            device, mixed, on_page_done)

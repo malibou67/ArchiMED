@@ -11,6 +11,10 @@ export interface TaskPreflight extends SystemRequirements {
   threads: number;
   mixed_precision: boolean;
   checked_at: string;
+  // Mode réellement utilisé : 'sequential' peut être un choix (1 worker, petit job) ou un
+  // repli subi — dans ce cas `pool_fallback` porte la cause.
+  mode?: 'parallel' | 'sequential';
+  pool_fallback?: string;
 }
 
 export interface Task {

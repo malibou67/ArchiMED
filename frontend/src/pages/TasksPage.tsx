@@ -115,11 +115,19 @@ function PreflightChips({ preflight }: { preflight: TaskPreflight }) {
   chips.push(preflight.device === 'cuda'
     ? { label: `CUDA — ${preflight.cuda?.device ?? 'GPU'}`, color: 'success', tooltip: tr('preflight.cudaTooltip') }
     : { label: tr('preflight.cpuLabel'), color: 'warning', tooltip: tr('preflight.cpuTooltip') });
-  chips.push({
-    label: `W${preflight.workers} · T${preflight.threads}`,
-    color: 'default',
-    tooltip: `${tr('preflight.workersCount', { count: preflight.workers })}, ${tr('preflight.threadsPerWorker', { count: preflight.threads })}${preflight.mixed_precision ? tr('preflight.mixedSuffix') : ''}`,
-  });
+  // Pool de process indisponible → la tâche a tourné sur un seul cœur : afficher le repli
+  // plutôt que les workers demandés, qui n'ont pas servi.
+  chips.push(preflight.pool_fallback
+    ? {
+        label: tr('preflight.sequentialFallback'),
+        color: 'warning',
+        tooltip: `${tr('preflight.sequentialFallbackTooltip', { count: preflight.workers })} — ${preflight.pool_fallback}`,
+      }
+    : {
+        label: `W${preflight.workers} · T${preflight.threads}`,
+        color: 'default',
+        tooltip: `${tr('preflight.workersCount', { count: preflight.workers })}, ${tr('preflight.threadsPerWorker', { count: preflight.threads })}${preflight.mixed_precision ? tr('preflight.mixedSuffix') : ''}`,
+      });
 
   return (
     <Stack direction="row" spacing={1} sx={{ mb: 1.5, flexWrap: 'wrap', gap: 0.5, alignItems: 'center' }}>
