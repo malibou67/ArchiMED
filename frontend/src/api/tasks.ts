@@ -31,6 +31,9 @@ export interface Task {
   // Spécifique OCR
   collections?: string[];
   registres?: string[];
+  // « collection/registre » des registres entièrement traités, publiés au fil de l'eau
+  // (les métadonnées de la collection sont à jour pour eux, sans attendre la fin de la tâche).
+  registres_done?: string[];
   seg_model?: string;
   ocr_model?: string;
   preflight?: TaskPreflight;
@@ -46,6 +49,18 @@ export interface Task {
   machine_label?: string;
   operator?: string;
   owned?: boolean;   // true si la tâche a été lancée sur CE poste
+}
+
+// Réponse des endpoints de contrôle (annuler / mettre en pause / reprendre).
+// `requested` : la tâche appartient à un autre poste, la commande lui a été transmise et
+// prendra effet à son prochain relevé — l'état ne change donc pas immédiatement.
+export interface TaskControlResult {
+  cancelled?: boolean;
+  paused?: boolean;
+  resumed?: boolean;
+  requested: boolean;
+  machine_label: string | null;
+  task: Task | null;
 }
 
 export interface TasksSummary {
@@ -102,17 +117,17 @@ export const tasksApi = {
     return response.data;
   },
 
-  cancel: async (taskId: string): Promise<{ cancelled: boolean; task: Task }> => {
+  cancel: async (taskId: string): Promise<TaskControlResult> => {
     const response = await api.post(`/api/tasks/${taskId}/cancel`);
     return response.data;
   },
 
-  pause: async (taskId: string): Promise<{ paused: boolean; task: Task }> => {
+  pause: async (taskId: string): Promise<TaskControlResult> => {
     const response = await api.post(`/api/tasks/${taskId}/pause`);
     return response.data;
   },
 
-  resume: async (taskId: string): Promise<{ resumed: boolean; task: Task }> => {
+  resume: async (taskId: string): Promise<TaskControlResult> => {
     const response = await api.post(`/api/tasks/${taskId}/resume`);
     return response.data;
   },

@@ -112,7 +112,10 @@
     "launchCount_other": "Lancer l'OCR — {{count}} pages",
     "estimateTooltip": "Estimation basée sur les derniers OCR terminés — variable selon CPU/GPU et la taille des images",
     "runningTooltip": "Une tâche OCR est en cours — voir les tâches",
-    "clearSelection": "Tout désélectionner"
+    "clearSelection": "Tout désélectionner",
+    "pause": "Mettre la transcription en pause",
+    "pausing": "Mise en pause… (fin de la page en cours)",
+    "resume": "Reprendre la transcription"
   },
   "modelsPage": {
     "addModel": "Ajouter un modèle",

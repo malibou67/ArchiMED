@@ -283,6 +283,8 @@ export default function TasksPage() {
   usePageLoading(tr('loading'), loading);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [pausingIds, setPausingIds] = useState<Set<string>>(new Set());
+  // Commandes transmises à un autre poste : l'effet arrive à son prochain relevé (~5 s).
+  const [requestedIds, setRequestedIds] = useState<Map<string, string>>(new Map());
   const [now, setNow] = useState(Date.now());
   const [machineFilter, setMachineFilter] = useState<string | null>(null);
 
@@ -313,6 +315,15 @@ export default function TasksPage() {
     });
   }, [tasks]);
 
+  // « Demande envoyée » jusqu'à ce que le poste destinataire l'ait appliquée (statut changé).
+  useEffect(() => {
+    const stillRunning = new Set(tasks.filter(isRunning).map((t) => t.id));
+    setRequestedIds((prev) => {
+      const next = new Map([...prev].filter(([id]) => stillRunning.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [tasks]);
+
   const toggleExpand = (id: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -320,9 +331,20 @@ export default function TasksPage() {
       return next;
     });
 
-  const handleCancel = async (id: string) => { await cancel(id); await refresh(); };
-  const handlePause = async (id: string) => { setPausingIds((p) => new Set(p).add(id)); await pause(id); await refresh(); };
-  const handleResume = async (id: string) => { await resume(id); await refresh(); };
+  // Une commande visant un autre poste revient `requested` : on l'affiche en attente au lieu de
+  // laisser croire que rien ne s'est passé.
+  const noteRequest = (id: string, result: { requested: boolean; machine_label: string | null }) => {
+    if (!result.requested) return;
+    setRequestedIds((p) => new Map(p).set(id, result.machine_label || tr('otherMachine')));
+  };
+
+  const handleCancel = async (id: string) => { noteRequest(id, await cancel(id)); await refresh(); };
+  const handlePause = async (id: string) => {
+    setPausingIds((p) => new Set(p).add(id));
+    noteRequest(id, await pause(id));
+    await refresh();
+  };
+  const handleResume = async (id: string) => { noteRequest(id, await resume(id)); await refresh(); };
   const handleDelete = async (id: string) => { await remove(id); await refresh(); };
 
   if (loading) return null;  // overlay global (usePageLoading) pendant le chargement initial
@@ -384,6 +406,8 @@ export default function TasksPage() {
             const isOpen = expanded.has(t.id);
             const pausing = pausingIds.has(t.id);
             const owned = isOwned(t);
+            const requested = requestedIds.get(t.id);
+            const machineName = t.machine_label || tr('otherMachine');
 
             return (
               <Fragment key={t.id}>
@@ -479,24 +503,32 @@ export default function TasksPage() {
                   {/* Actions */}
                   <TableCell align="right">
                     <Stack direction="row" spacing={0.25} justifyContent="flex-end">
-                      {/* Contrôle d'une tâche EN COURS : réservé au poste qui l'a lancée. */}
-                      {owned && isRunning(t) && t.type === 'index' && (
+                      {/* Commande transmise à un autre poste : en attente de son relevé (~5 s). */}
+                      {requested && (
+                        <Tooltip title={tr('actions.requestSent', { machine: requested })}>
+                          <span><IconButton size="small" disabled><CircularProgress size={16} /></IconButton></span>
+                        </Tooltip>
+                      )}
+                      {/* Pause : OCR et indexation repartent l'une comme l'autre de leur checkpoint.
+                          Sur une tâche d'un autre poste, la commande lui est transmise. */}
+                      {!requested && isRunning(t) && (
                         pausing ? (
                           <Tooltip title={tr('actions.pausing')}><span><IconButton size="small" disabled><CircularProgress size={16} /></IconButton></span></Tooltip>
                         ) : (
-                          <Tooltip title={tr('actions.pause')}><IconButton size="small" color="primary" onClick={() => handlePause(t.id)}><PauseIcon fontSize="small" /></IconButton></Tooltip>
+                          <Tooltip title={owned ? tr('actions.pause') : tr('actions.pauseOther', { machine: machineName })}>
+                            <IconButton size="small" color="primary" onClick={() => handlePause(t.id)}><PauseIcon fontSize="small" /></IconButton>
+                          </Tooltip>
                         )
                       )}
-                      {owned && isPaused(t) && (
-                        <Tooltip title={tr('actions.resume')}><IconButton size="small" color="primary" onClick={() => handleResume(t.id)}><PlayArrowIcon fontSize="small" /></IconButton></Tooltip>
+                      {!requested && isPaused(t) && (
+                        <Tooltip title={owned ? tr('actions.resume') : tr('actions.resumeOther', { machine: machineName })}>
+                          <IconButton size="small" color="primary" onClick={() => handleResume(t.id)}><PlayArrowIcon fontSize="small" /></IconButton>
+                        </Tooltip>
                       )}
-                      {/* Annulation : tâche de ce poste (en cours / en attente / en pause). */}
-                      {owned && (isRunning(t) || isQueued(t) || isPaused(t)) && (
-                        <Tooltip title={tr('actions.cancel')}><IconButton size="small" color="error" onClick={() => handleCancel(t.id)}><CancelIcon fontSize="small" /></IconButton></Tooltip>
-                      )}
-                      {/* Tâche en cours d'un AUTRE poste : aucun contrôle possible. */}
-                      {!owned && isRunning(t) && (
-                        <Tooltip title={tr('actions.runningOther')}><span><IconButton size="small" disabled><CancelIcon fontSize="small" /></IconButton></span></Tooltip>
+                      {!requested && (isRunning(t) || isQueued(t) || isPaused(t)) && (
+                        <Tooltip title={owned ? tr('actions.cancel') : tr('actions.cancelOther', { machine: machineName })}>
+                          <IconButton size="small" color="error" onClick={() => handleCancel(t.id)}><CancelIcon fontSize="small" /></IconButton>
+                        </Tooltip>
                       )}
                       {/* Suppression : tâche terminée (n'importe quel poste) ou orpheline en attente/pause d'un autre poste. */}
                       {(isFinished(t) || (!owned && (isQueued(t) || isPaused(t)))) && (

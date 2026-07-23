@@ -1,6 +1,7 @@
 import { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Box, Button, LinearProgress, Tooltip, Typography } from '@mui/material';
+import { Box, Button, CircularProgress, IconButton, LinearProgress, Tooltip, Typography } from '@mui/material';
+import { Pause as PauseIcon, PlayArrow as PlayArrowIcon } from '@mui/icons-material';
 import { useTranslation } from 'react-i18next';
 import { Task } from '../../api/tasks';
 
@@ -19,20 +20,26 @@ interface OcrLaunchBarProps {
   segModelName: string | null;
   ocrModelName: string | null;
   estimateSeconds: number | null;
-  runningOcr: Task | null;
+  /** Tâche OCR en cours **ou en pause** de ce poste (progression + contrôle inline). */
+  activeOcr: Task | null;
+  /** Pause demandée, pas encore effective (elle ne prend effet qu'entre deux pages). */
+  pausingOcr: boolean;
   launching: boolean;
   canLaunch: boolean;
   disabledReason: string | null;
   envChip?: ReactNode;
   onLaunch: () => void;
   onClearSelection: () => void;
+  onPauseOcr: () => void;
+  onResumeOcr: () => void;
 }
 
 /** Barre de lancement : récapitulatif de la sélection, estimation de durée,
- * progression inline de la tâche OCR en cours, bouton « Lancer ». */
+ * progression inline de la tâche OCR en cours (avec pause / reprise), bouton « Lancer ». */
 export default function OcrLaunchBar({
   selectedCount, segModelName, ocrModelName, estimateSeconds,
-  runningOcr, launching, canLaunch, disabledReason, envChip, onLaunch, onClearSelection,
+  activeOcr, pausingOcr, launching, canLaunch, disabledReason, envChip,
+  onLaunch, onClearSelection, onPauseOcr, onResumeOcr,
 }: OcrLaunchBarProps) {
   const { t } = useTranslation('ocr');
   const navigate = useNavigate();
@@ -72,25 +79,48 @@ export default function OcrLaunchBar({
         </Typography>
       </Tooltip>
 
-      {runningOcr && (
-        <Tooltip title={t('launchBar.runningTooltip')} arrow>
-          <Box
-            onClick={() => navigate('/tasks')}
-            sx={{ display: 'flex', alignItems: 'center', gap: 1, cursor: 'pointer' }}
-          >
-            <LinearProgress
-              variant={runningOcr.total > 0 ? 'determinate' : 'indeterminate'}
-              value={runningOcr.total > 0
-                ? Math.min(100, ((runningOcr.processed + runningOcr.failed) / runningOcr.total) * 100)
-                : undefined}
-              sx={{ width: 160, height: 6, borderRadius: 3 }}
-            />
-            <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
-              {fmtNum(runningOcr.processed + runningOcr.failed)} / {fmtNum(runningOcr.total)}
-            </Typography>
+      {activeOcr && (() => {
+        const paused = activeOcr.status === 'paused';
+        return (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <Tooltip title={t('launchBar.runningTooltip')} arrow>
+              <Box
+                onClick={() => navigate('/tasks')}
+                sx={{ display: 'flex', alignItems: 'center', gap: 1, cursor: 'pointer' }}
+              >
+                <LinearProgress
+                  variant={paused || activeOcr.total > 0 ? 'determinate' : 'indeterminate'}
+                  value={activeOcr.total > 0
+                    ? Math.min(100, ((activeOcr.processed + activeOcr.failed) / activeOcr.total) * 100)
+                    : undefined}
+                  color={paused ? 'warning' : 'primary'}
+                  sx={{ width: 160, height: 6, borderRadius: 3 }}
+                />
+                <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
+                  {fmtNum(activeOcr.processed + activeOcr.failed)} / {fmtNum(activeOcr.total)}
+                </Typography>
+              </Box>
+            </Tooltip>
+            {paused ? (
+              <Tooltip title={t('launchBar.resume')} arrow>
+                <IconButton size="small" color="primary" onClick={onResumeOcr}>
+                  <PlayArrowIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            ) : pausingOcr ? (
+              <Tooltip title={t('launchBar.pausing')} arrow>
+                <span><IconButton size="small" disabled><CircularProgress size={14} /></IconButton></span>
+              </Tooltip>
+            ) : (
+              <Tooltip title={t('launchBar.pause')} arrow>
+                <IconButton size="small" color="primary" onClick={onPauseOcr}>
+                  <PauseIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            )}
           </Box>
-        </Tooltip>
-      )}
+        );
+      })()}
 
       {selectedCount > 0 && (
         <Button variant="outlined" size="small" onClick={onClearSelection}>

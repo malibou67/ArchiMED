@@ -163,10 +163,26 @@ export default function OcrPage() {
   // Historique des tâches OCR terminées (pour l'estimation de durée).
   const [pastOcrTasks, setPastOcrTasks] = useState<Task[]>([]);
 
-  const { hasActivity, refresh: refreshTasks, runningTasks } = useTasks();
-  const runningOcr = runningTasks.find((t) => t.type === 'ocr') ?? null;
+  const { hasActivity, refresh: refreshTasks, runningTasks, pausedTasks, pause, resume } = useTasks();
+  // Tâche OCR contrôlable depuis cette page : celle de ce poste, en cours ou en pause.
+  const activeOcr = [...runningTasks, ...pausedTasks].find((t) => t.type === 'ocr' && t.owned !== false) ?? null;
   const [launching, setLaunching] = useState(false);
+  const [pausingOcr, setPausingOcr] = useState(false);
   const [queuedNotice, setQueuedNotice] = useState<number | null>(null);
+
+  // La pause est coopérative : elle ne prend effet qu'à la fin de la page en cours.
+  const pauseOcr = async () => {
+    if (!activeOcr) return;
+    setPausingOcr(true);
+    try { await pause(activeOcr.id); } finally { await refreshTasks(); }
+  };
+
+  const resumeOcr = async () => {
+    if (!activeOcr) return;
+    setPausingOcr(false);
+    await resume(activeOcr.id);
+    await refreshTasks();
+  };
 
   useEffect(() => {
     loadCollections();
@@ -225,6 +241,24 @@ export default function OcrPage() {
     }
     prevActivity.current = hasActivity;
   }, [hasActivity]);
+
+  // « Mise en pause… » ne concerne qu'une tâche encore en cours (sinon l'état resterait collé
+  // et polluerait la prochaine transcription).
+  useEffect(() => {
+    if (activeOcr?.status !== 'running') setPausingOcr(false);
+  }, [activeOcr?.status]);
+
+  // Le runner publie chaque registre dès qu'il est terminé (metadata déjà à jour côté backend) :
+  // on recharge les compteurs sans attendre la fin de la tâche.
+  const doneRegistresCount = activeOcr?.registres_done?.length ?? 0;
+  const prevDoneRegistres = useRef(0);
+  useEffect(() => {
+    if (doneRegistresCount > prevDoneRegistres.current) {
+      loadCollections();
+      setDoneCache(new Map());
+    }
+    prevDoneRegistres.current = doneRegistresCount;
+  }, [doneRegistresCount]);
 
   const colKey = (col: CollectionMetadata) => col.folder_name || col.type;
 
@@ -983,13 +1017,16 @@ export default function OcrPage() {
         segModelName={models.find((m) => m.id === selectedSegModel)?.name ?? null}
         ocrModelName={models.find((m) => m.id === selectedOcrModel)?.name ?? null}
         estimateSeconds={estimateSeconds}
-        runningOcr={runningOcr}
+        activeOcr={activeOcr}
+        pausingOcr={pausingOcr}
         launching={launching}
         canLaunch={canLaunch}
         disabledReason={disabledReason}
         envChip={<EnvStatusChip requirements={requirements} loading={reqLoading} failed={reqFailed} />}
         onLaunch={launchOcr}
         onClearSelection={() => setSelectedPages(new Set())}
+        onPauseOcr={pauseOcr}
+        onResumeOcr={resumeOcr}
       />
 
     </Box>

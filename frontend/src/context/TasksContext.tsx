@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react';
-import { tasksApi, TasksSummary, Task } from '../api/tasks';
+import { tasksApi, TasksSummary, Task, TaskControlResult } from '../api/tasks';
 
 interface TasksValue {
   summary: TasksSummary | null;
@@ -13,9 +13,11 @@ interface TasksValue {
   widgetOpen: boolean;
   openWidget: () => void;
   closeWidget: () => void;
-  cancel: (taskId: string) => Promise<void>;
-  pause: (taskId: string) => Promise<void>;
-  resume: (taskId: string) => Promise<void>;
+  // Renvoient le résultat : `requested` signale une commande transmise à un autre poste,
+  // dont l'effet n'est pas immédiat (cf. TaskControlResult).
+  cancel: (taskId: string) => Promise<TaskControlResult>;
+  pause: (taskId: string) => Promise<TaskControlResult>;
+  resume: (taskId: string) => Promise<TaskControlResult>;
   remove: (taskId: string) => Promise<void>;
   refresh: () => Promise<void>;
 }
@@ -49,18 +51,21 @@ export function TasksProvider({ children }: { children: ReactNode }) {
   }, [summary?.has_activity, fetchSummary]);
 
   const cancel = useCallback(async (taskId: string) => {
-    await tasksApi.cancel(taskId);
+    const result = await tasksApi.cancel(taskId);
     await fetchSummary();
+    return result;
   }, [fetchSummary]);
 
   const pause = useCallback(async (taskId: string) => {
-    await tasksApi.pause(taskId);
+    const result = await tasksApi.pause(taskId);
     await fetchSummary();
+    return result;
   }, [fetchSummary]);
 
   const resume = useCallback(async (taskId: string) => {
-    await tasksApi.resume(taskId);
+    const result = await tasksApi.resume(taskId);
     await fetchSummary();
+    return result;
   }, [fetchSummary]);
 
   const remove = useCallback(async (taskId: string) => {

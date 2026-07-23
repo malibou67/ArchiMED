@@ -51,7 +51,7 @@ ArchiMED/
 │   ├── services.py         # Core CRUD services (models, collections, registers, indexes, transcriptions)
 │   ├── ocr_service.py      # Kraken OCR pipeline + 'ocr' task runner
 │   ├── index_runner.py     # Index build + 'index' task runner
-│   ├── task_service.py     # Generic task engine (queue, persistence, pause/cancel)
+│   ├── task_service.py     # Generic task engine (queue, persistence, pause/cancel, multi-PC)
 │   ├── stats_service.py    # Collection and index statistics
 │   ├── settings_service.py # settings.json read/write
 │   ├── machine_identity.py # Per-machine identity (multi-PC deployment)
@@ -97,6 +97,11 @@ data/
 │   └── idx_20260115103000_hospital-index/
 │       ├── metadata.json           # id, name, sources, status, stats, build progress
 │       └── index.json              # words → pages + bounding-box coordinates
+├── tasks/
+│   ├── <task_id>.json              # Task state (queue, progress, checkpoint)
+│   └── control/
+│       └── <task_id>.json          # Command posted by another PC (cancel / pause / resume)
+├── locks/                          # Scope locks held by a running task (multi-PC)
 └── settings.json                   # OCR settings (UI overrides)
 ```
 
@@ -109,12 +114,25 @@ data/
 Long-running work — OCR runs and index builds — goes through a single generic task engine
 (`task_service.py`, `TaskService`) rather than FastAPI `BackgroundTasks`:
 
-- A **persistent queue**: task state is written to disk so that tasks survive a restart and
-  are **resumed on startup** (`load_on_startup()` in `main.py`'s startup hook).
+- A **persistent queue**: task state is written to disk (atomically — see below) so that tasks
+  survive a restart and are **resumed on startup** (`load_on_startup()` in `main.py`'s startup hook).
 - **Pause / resume / cancel** support, exposed through the `/api/tasks` router and the
-  frontend Tasks page + global task widget.
+  frontend Tasks page + global task widget. Both runners resume from a checkpoint rather than
+  starting over: index builds use `checkpoint.json`, OCR runs use the `page_states` array persisted
+  with the task (`0` to do, `1` done, `2` failed, `3` in flight) plus the PAGE-XML already on disk.
 - **Pluggable runners**: `ocr_service` registers the `'ocr'` runner and `index_runner`
   registers the `'index'` runner (imported for their side effects in `main.py`).
+- A **supervisor thread** (one per process) refreshes the heartbeat of this machine's running
+  tasks every few seconds and applies remote commands. The heartbeat cannot ride on the runner's
+  own progress writes: a single OCR page on CPU — or the preflight that imports torch and loads
+  models off the NAS — can easily exceed the staleness threshold, which would let another machine
+  declare the task dead and steal its scope lock.
+
+An OCR run also publishes each register as soon as its last page has been attempted: the
+register's `ocr_status` is refreshed in the collection metadata
+(`CollectionsService.refresh_registre_ocr_status`, a targeted update — not the full
+`sync_collection_metadata`) and its name is appended to the task's `registres_done`, which the OCR
+page watches to reload its counters mid-run.
 
 ## Multi-PC deployment
 
@@ -124,6 +142,22 @@ launched from several PCs. Each PC runs its **own** backend, but they all read a
 `machine_id` derived from the Windows computer name (`COMPUTERNAME`). Only the readable label
 and operator name are stored locally per PC (see the note above); nothing machine-specific is
 written to the shared `data/`.
+
+Since every machine both reads and writes that folder, three rules keep them consistent:
+
+- **Atomic writes.** Task files (`data/tasks/<id>.json`) and collection metadata are written to a
+  temporary file then `os.replace`d. Writing in place would expose a truncated JSON to the other
+  machines polling it — and a decode error makes a perfectly live scope lock look stale, hence
+  reusable.
+- **Liveness by heartbeat.** A `running` task whose heartbeat is older than `HEARTBEAT_STALE`
+  (60 s) is considered dead: its scope is released and its lock in `data/locks/` can be reclaimed.
+  The supervisor thread keeps that heartbeat fresh independently of the runner's pace, so a slow
+  page never causes two machines to OCR the same register.
+- **Commands, not direct writes.** A machine never writes into the task file of a *running* task it
+  does not own — the owner would overwrite it at its next heartbeat. It drops a command in
+  `data/tasks/control/<task_id>.json` (`cancel` / `pause` / `resume`) instead, which the owner picks
+  up and applies. Tasks left behind by a machine that is off (queued, paused, interrupted) are still
+  finalised directly, so an orphan never blocks anyone.
 
 ## Configuration
 

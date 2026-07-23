@@ -1,10 +1,22 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from task_service import TaskService
+from task_service import TaskService, REQUESTED, APPLIED
 from ocr_service import OcrService
 from services import IndexesService
 
 router = APIRouter()
+
+
+def _control_response(task_id: str, key: str, outcome: str) -> dict:
+    """Réponse commune des endpoints de contrôle. `requested` signale une commande transmise au
+    poste propriétaire (multi-PC) : l'effet n'est pas immédiat, la UI attend le changement d'état."""
+    task = TaskService.get(task_id)
+    return {
+        key: outcome == APPLIED,
+        "requested": outcome == REQUESTED,
+        "machine_label": (task or {}).get('machine_label'),
+        "task": TaskService._public(task, full=True) if task else None,
+    }
 
 
 @router.get("/summary")
@@ -29,29 +41,23 @@ def get_task(task_id: str):
 
 @router.post("/{task_id}/cancel")
 def cancel_task(task_id: str):
-    task = TaskService.get(task_id)
-    if task is None:
+    if TaskService.get(task_id) is None:
         raise HTTPException(status_code=404, detail="Tâche introuvable.")
-    cancelled = TaskService.cancel(task_id)
-    return {"cancelled": cancelled, "task": TaskService._public(TaskService.get(task_id), full=True)}
+    return _control_response(task_id, "cancelled", TaskService.cancel(task_id))
 
 
 @router.post("/{task_id}/pause")
 def pause_task(task_id: str):
-    task = TaskService.get(task_id)
-    if task is None:
+    if TaskService.get(task_id) is None:
         raise HTTPException(status_code=404, detail="Tâche introuvable.")
-    paused = TaskService.pause(task_id)
-    return {"paused": paused, "task": TaskService._public(TaskService.get(task_id), full=True)}
+    return _control_response(task_id, "paused", TaskService.pause(task_id))
 
 
 @router.post("/{task_id}/resume")
 def resume_task(task_id: str):
-    task = TaskService.get(task_id)
-    if task is None:
+    if TaskService.get(task_id) is None:
         raise HTTPException(status_code=404, detail="Tâche introuvable.")
-    resumed = TaskService.resume(task_id)
-    return {"resumed": resumed, "task": TaskService._public(TaskService.get(task_id), full=True)}
+    return _control_response(task_id, "resumed", TaskService.resume(task_id))
 
 
 @router.delete("/{task_id}")

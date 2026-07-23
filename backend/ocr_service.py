@@ -9,7 +9,7 @@ import threading
 import dataclasses
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
 
 from services import DATA_DIR, ModelsService, CollectionsService, RegistresService
 from settings_service import SettingsService
@@ -328,8 +328,22 @@ class OcrService:
 
     # ── Traitement ────────────────────────────────────────────────────
     @staticmethod
-    def _process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed) -> None:
-        """Traitement séquentiel (W=1 ou petit job) : modèles gardés chauds en cache."""
+    def _stop_requested(task) -> bool:
+        """Arrêt coopératif demandé ? Positionne le statut final et retourne True.
+        L'annulation prime sur la pause (elle est définitive)."""
+        if task['cancel']:
+            task['status'] = 'cancelled'
+            return True
+        if task.get('pause'):
+            task['status'] = 'paused'   # page_states sert de checkpoint pour la reprise
+            return True
+        return False
+
+    @staticmethod
+    def _process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id, device, mixed,
+                        on_page_done) -> None:
+        """Traitement séquentiel (W=1 ou petit job) : modèles gardés chauds en cache.
+        `todo` est une liste de couples (index dans task['pages'], page)."""
         import torch
         from PIL import Image
         from kraken import blla, rpred, serialization
@@ -344,10 +358,9 @@ class OcrService:
         states = task['page_states']
         collections_root = Path(DATA_DIR) / "collections"
 
-        for i, page in enumerate(pages):
-            if task['cancel']:
-                task['status'] = 'cancelled'
-                break
+        for i, page in todo:
+            if OcrService._stop_requested(task):
+                break   # states[i] vaut encore 0 : la page reste à faire pour la reprise
             col = page['collection']; reg = page['registre']; img_name = page['page']
             label = f"{reg}/{img_name}"
             task['current'] = label
@@ -374,17 +387,20 @@ class OcrService:
                 states[i] = 2
                 task['failed'] += 1
                 task['errors'].append({'page': label, 'error': str(e)})
+            on_page_done(col, reg)
             TaskService._save_throttled(task)
 
     @staticmethod
-    def _process_pool(task, pages, touched_collections, seg_model_id, ocr_model_id, device, workers, threads, mixed) -> None:
+    def _process_pool(task, todo, touched_collections, seg_model_id, ocr_model_id, device, workers,
+                      threads, mixed, on_page_done) -> None:
         """Traitement parallèle : un pool de process traite les pages en concurrence
         (le post-traitement CPU, goulot réel, s'étale sur les cœurs). Les pages se terminent
         dans le désordre → on note l'état par index dans page_states."""
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         states = task['page_states']
-        tasks = [(i, p['collection'], p['registre'], p['page'], ocr_model_id) for i, p in enumerate(pages)]
+        by_index = {i: p for i, p in todo}
+        tasks = [(i, p['collection'], p['registre'], p['page'], ocr_model_id) for i, p in todo]
 
         executor = ProcessPoolExecutor(
             max_workers=workers,
@@ -394,8 +410,7 @@ class OcrService:
         try:
             futures = [executor.submit(_ocr_worker_page, t) for t in tasks]
             for fut in as_completed(futures):
-                if task['cancel']:
-                    task['status'] = 'cancelled'
+                if OcrService._stop_requested(task):
                     break
                 idx, col, label, ok, err = fut.result()
                 if ok:
@@ -407,21 +422,75 @@ class OcrService:
                     task['failed'] += 1
                     task['errors'].append({'page': label, 'error': err})
                 task['current'] = label
+                on_page_done(col, by_index[idx]['registre'])
                 TaskService._save_throttled(task)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _plan_todo(task: Dict[str, Any], pages: List[Dict[str, str]]) -> List:
+    """Prépare une exécution (première ou reprise après pause/interruption) et retourne les pages
+    restant à traiter, sous forme de couples (index dans `pages`, page).
+
+    `page_states` (0=à faire, 1=faite, 2=échec, 3=en cours) est persisté avec la tâche : il tient
+    lieu de checkpoint, les PAGE-XML déjà produits n'ont pas à être refaits. Les pages restées
+    « en cours » (process tué au milieu) repassent à faire, et les compteurs sont **recalculés**
+    depuis les états plutôt qu'accumulés — sinon une reprise double-compterait."""
+    states = task.get('page_states')
+    if not isinstance(states, list) or len(states) != len(pages):
+        states = [0] * len(pages)
+    else:
+        states = [0 if s == 3 else s for s in states]
+    task['page_states'] = states
+    task['processed'] = sum(1 for s in states if s == 1)
+    task['failed'] = sum(1 for s in states if s == 2)
+    return [(i, p) for i, p in enumerate(pages) if states[i] == 0]
+
+
+def _registre_reporter(task: Dict[str, Any], todo: List) -> Callable[[str, str], None]:
+    """Callback `on_page_done(collection, registre)` qui publie l'état d'un registre dès que
+    **toutes** ses pages de cette exécution ont été tentées, au lieu d'attendre la fin de la tâche.
+
+    Rafraîchit son `ocr_status` dans le metadata.json de la collection (mise à jour ciblée, pas la
+    resynchronisation complète) et l'ajoute à `registres_done`, que le frontend surveille pour
+    recharger les compteurs."""
+    remaining: Dict[tuple, int] = {}
+    for _, p in todo:
+        key = (p['collection'], p['registre'])
+        remaining[key] = remaining.get(key, 0) + 1
+    done: List[str] = task.setdefault('registres_done', [])
+
+    def on_page_done(collection: str, registre: str) -> None:
+        key = (collection, registre)
+        left = remaining.get(key)
+        if left is None:
+            return
+        left -= 1
+        remaining[key] = left
+        if left > 0:
+            return
+        remaining.pop(key, None)
+        try:
+            CollectionsService.refresh_registre_ocr_status(collection, registre)
+        except Exception:
+            pass
+        label = f"{collection}/{registre}"
+        if label not in done:
+            done.append(label)
+
+    return on_page_done
+
+
 def run_ocr_task(task: Dict[str, Any]) -> None:
     """Runner OCR appelé par TaskService. Met à jour la tâche en place ; ne fixe pas le statut
-    final 'done'/'error' (géré par le moteur) mais peut passer 'cancelled'."""
+    final 'done'/'error' (géré par le moteur) mais peut passer 'cancelled' ou 'paused'."""
     pages = task.get('pages') or []
     seg_model_id = task['seg_model']
     ocr_model_id = task['ocr_model']
     touched_collections: set = set()
     try:
-        if not isinstance(task.get('page_states'), list) or len(task['page_states']) != len(pages):
-            task['page_states'] = [0] * len(pages)
+        todo = _plan_todo(task, pages)
+        on_page_done = _registre_reporter(task, todo)
 
         # Préflight : on vérifie l'environnement au moment de l'exécution (la vérif faite
         # côté page peut être périmée) et on journalise le résultat dans la tâche.
@@ -459,21 +528,24 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
         threads = task['preflight']['threads']
         mixed = task['preflight']['mixed_precision']
 
-        if workers <= 1 or len(pages) < effective_pool_min_pages():
-            OcrService._process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed)
+        if workers <= 1 or len(todo) < effective_pool_min_pages():
+            OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
+                                       device, mixed, on_page_done)
         else:
             try:
-                OcrService._process_pool(task, pages, touched_collections, seg_model_id, ocr_model_id, device, workers, threads, mixed)
+                OcrService._process_pool(task, todo, touched_collections, seg_model_id, ocr_model_id,
+                                         device, workers, threads, mixed, on_page_done)
             except Exception as pool_err:
                 if task['cancel']:
                     raise
-                task['processed'] = 0
-                task['failed'] = 0
-                task['errors'] = []
-                task['page_states'] = [0] * len(pages)
+                # Repli séquentiel : on repart de l'état réellement atteint par le pool (pages
+                # déjà écrites conservées), pas de zéro — sinon une reprise referait tout.
                 task['status'] = 'running'
+                todo = _plan_todo(task, pages)
+                on_page_done = _registre_reporter(task, todo)
                 print(f"[OCR] pool indisponible ({pool_err}); repli séquentiel.", flush=True)
-                OcrService._process_inline(task, pages, touched_collections, seg_model_id, ocr_model_id, device, mixed)
+                OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
+                                           device, mixed, on_page_done)
     finally:
         for col in touched_collections:
             try:

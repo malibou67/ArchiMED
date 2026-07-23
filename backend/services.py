@@ -442,6 +442,54 @@ class CollectionsService:
         return metadata
 
     @staticmethod
+    def refresh_registre_ocr_status(collection_id: str, registre_folder: str) -> bool:
+        """Recalcule l'`ocr_status` d'un **seul** registre dans le metadata.json de sa collection.
+
+        Version ciblée de `sync_collection_metadata`, qui reconstruit tout (pagination, anomalies,
+        tous les registres) et coûte trop cher pour être appelée en cours d'OCR. Ici on se contente
+        de recompter les XML : le runner OCR peut donc publier l'avancement registre par registre
+        au lieu d'attendre la fin de la tâche.
+
+        Écriture atomique : le fichier est relu en boucle par les autres postes du NAS.
+        Retourne False (sans lever) si la collection ou le registre est introuvable."""
+        collection_dir = CollectionsService.get_collections_dir() / collection_id
+        metadata_file = collection_dir / "metadata.json"
+        if not metadata_file.exists():
+            return False
+        try:
+            with open(metadata_file, 'r', encoding='utf-8-sig') as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        entry = next((r for r in metadata.get('registres') or []
+                      if r.get('folder_name') == registre_folder), None)
+        if entry is None:
+            return False
+
+        pages_total = entry.get('pages_count')
+        if not pages_total:
+            pages_total = len(RegistresService.list_scan_pages(collection_id, registre_folder))
+        status = _count_ocr_xml(collection_dir / "ocr" / registre_folder, pages_total)
+        if status:
+            entry['ocr_status'] = status
+        else:
+            entry.pop('ocr_status', None)
+
+        tmp = metadata_file.with_name(metadata_file.name + '.tmp')
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, metadata_file)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        return True
+
+    @staticmethod
     def sync_collection_metadata(collection_id: str) -> Optional[Dict[str, Any]]:
         """Wrapper non-streaming de sync_collection_metadata_iter : draine l'itérateur et
         renvoie le metadata reconstruit (ou None si le dossier n'est pas une collection)."""

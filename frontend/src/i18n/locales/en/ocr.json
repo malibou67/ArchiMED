@@ -112,7 +112,10 @@
     "launchCount_other": "Start OCR — {{count}} pages",
     "estimateTooltip": "Estimate based on the latest completed OCR runs — varies with CPU/GPU and image size",
     "runningTooltip": "An OCR task is running — view tasks",
-    "clearSelection": "Deselect all"
+    "clearSelection": "Deselect all",
+    "pause": "Pause the transcription",
+    "pausing": "Pausing… (finishing the current page)",
+    "resume": "Resume the transcription"
   },
   "modelsPage": {
     "addModel": "Add a model",

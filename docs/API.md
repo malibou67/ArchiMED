@@ -76,9 +76,15 @@ The background task engine (OCR and index builds). See [ARCHITECTURE.md](ARCHITE
 - `GET /api/tasks` — All tasks (running, pending, history)
 - `GET /api/tasks/{task_id}` — Full detail of one task
 - `POST /api/tasks/{task_id}/cancel` — Cancel a task
-- `POST /api/tasks/{task_id}/pause` — Pause a task
-- `POST /api/tasks/{task_id}/resume` — Resume a task
+- `POST /api/tasks/{task_id}/pause` — Pause a task (OCR and index builds alike; resumes from its checkpoint)
+- `POST /api/tasks/{task_id}/resume` — Resume a paused or interrupted task
 - `DELETE /api/tasks/{task_id}` — Remove a task (`409` if it is still running)
+
+> The three control endpoints answer `{ "<action>": bool, "requested": bool, "machine_label": str|null, "task": {…} }`.
+> `requested: true` means the task belongs to **another machine**: the command was posted to it and
+> takes effect at its next poll (a few seconds), so the returned state is still the old one.
+> See [Multi-PC deployment](ARCHITECTURE.md#multi-pc-deployment).
+
 - `GET /api/tasks/{task_id}/pages` — Per-page detail (OCR tasks)
 - `GET /api/tasks/{task_id}/registres` — Per-register state (index tasks)
 

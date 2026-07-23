@@ -15,9 +15,17 @@ partagent le même dossier `data/`. Chaque tâche est estampillée avec un `mach
   - **conflits** : deux postes ne peuvent pas produire la même sortie (OCR sur le même
     (collection, registre, modèle) ou index sur le même (collection, modèle)) → blocage à
     la création (`find_conflict`) + verrou atomique à l'exécution, auto-réparant via un
-    `heartbeat` (un poste coupé ne bloque pas durablement les autres).
+    `heartbeat` (un poste coupé ne bloque pas durablement les autres) ;
+  - **contrôle à distance** : un poste ne peut pas écrire dans le fichier d'une tâche `running`
+    d'un autre poste (le propriétaire l'écrase à son heartbeat suivant). Il dépose donc une
+    commande dans `data/tasks/control/<id>.json`, que le propriétaire applique (cf. `_supervisor`).
+
+Un **thread superviseur** unique par process (`_start_supervisor`) rafraîchit le heartbeat des
+tâches en cours de ce poste — indépendamment de la granularité du runner, qui peut mettre plusieurs
+minutes entre deux pages — et draine la boîte aux lettres de commandes.
 """
 import json
+import os
 import re
 import threading
 import time
@@ -34,6 +42,18 @@ HISTORY_CAP = 100
 # Au-delà de ce délai sans heartbeat, une tâche `running` est considérée morte (process
 # tué / NAS coupé) : son verrou devient récupérable par un autre poste.
 HEARTBEAT_STALE = 60.0
+# Période de réveil du superviseur (heartbeat + commandes distantes). Très en deçà de
+# HEARTBEAT_STALE pour garder une marge confortable sur un NAS lent.
+SUPERVISOR_INTERVAL = 5.0
+
+# Commandes acceptées dans la boîte aux lettres inter-postes.
+CONTROL_ACTIONS = ('cancel', 'pause', 'resume')
+
+# Résultats de `cancel`/`pause`/`resume` : appliqué ici, transmis au poste propriétaire,
+# ou impossible dans l'état courant.
+APPLIED = 'applied'
+REQUESTED = 'requested'
+REFUSED = 'refused'
 
 # Clés volatiles / lourdes exclues des réponses API.
 _HIDDEN = ('pages', 'page_states', 'index_registres', 'payload', 'cancel', 'last_write', 'heartbeat')
@@ -59,6 +79,10 @@ class TaskService:
 
     # Verrous de scope détenus par ce process, par task_id (non persistés).
     _held_locks: Dict[str, List[Path]] = {}
+
+    # Sérialise les écritures de fichiers de tâche (thread runner + superviseur).
+    _io_lock = threading.Lock()
+    _supervisor_started = False
 
     # Cache court de la lecture disque (vue fusionnée) pour ne pas marteler le NAS.
     _merged_cache: Optional[Dict[str, Dict[str, Any]]] = None
@@ -86,12 +110,26 @@ class TaskService:
 
     @staticmethod
     def _save(task: Dict[str, Any]) -> None:
+        """Écriture **atomique** (tmp + os.replace) du fichier de tâche.
+
+        Le fichier est relu en boucle par les autres postes (`_merged_tasks`, `_lock_is_stale`) :
+        une écriture en place exposerait un JSON tronqué, et un `JSONDecodeError` fait passer un
+        verrou bien vivant pour obsolète — donc volable. Même motif que
+        `IndexesService._save_index_meta`. Le tmp est nommé par thread pour que le superviseur et
+        le runner ne se marchent pas dessus."""
         data = {k: v for k, v in task.items() if k not in ('cancel', 'last_write')}
-        try:
-            with open(TaskService._file(task['id']), 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False)
-        except OSError:
-            pass
+        path = TaskService._file(task['id'])
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with TaskService._io_lock:
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @staticmethod
     def _save_throttled(task: Dict[str, Any]) -> None:
@@ -370,6 +408,111 @@ class TaskService:
                 except OSError:
                     pass
 
+    # ── Boîte aux lettres de commandes (contrôle inter-postes) ────────
+    @staticmethod
+    def _control_dir() -> Path:
+        d = TaskService._dir() / "control"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _control_file(task_id: str) -> Path:
+        return TaskService._control_dir() / f"{task_id}.json"
+
+    @staticmethod
+    def _request_control(task_id: str, action: str) -> bool:
+        """Dépose une commande à destination du poste propriétaire d'une tâche.
+        On n'écrit **jamais** dans le fichier d'une tâche en cours d'un autre poste : il est
+        réécrit chaque seconde par son propriétaire, qui écraserait notre modification."""
+        if action not in CONTROL_ACTIONS:
+            return False
+        ident = machine_identity.get_identity()
+        payload = {'action': action, 'from': ident['machine_label'],
+                   'from_id': ident['machine_id'], 'at': datetime.now().isoformat()}
+        path = TaskService._control_file(task_id)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    @staticmethod
+    def _drain_control() -> None:
+        """Applique les commandes qui nous sont destinées, puis retire leur marqueur.
+
+        Couvre tous les statuts : `running` (cancel/pause coopératifs via les drapeaux lus par le
+        runner) mais aussi `queued`/`paused`/`interrupted`, qui n'ont pas de thread d'exécution."""
+        for f in TaskService._control_dir().glob("*.json"):
+            task_id = f.stem
+            try:
+                with open(f, 'r', encoding='utf-8-sig') as fh:
+                    cmd = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            action = cmd.get('action')
+            with TaskService._lock:
+                task = TaskService._tasks.get(task_id)
+                mine = task is not None and TaskService._is_owned(task)
+            # Marqueur sans destinataire ici (autre poste, tâche supprimée) : on le laisse à
+            # son propriétaire. Il sera purgé avec la tâche (`_unlink_task`).
+            if not mine:
+                continue
+            # `cancel`/`pause`/`resume` valident eux-mêmes le statut : une commande devenue
+            # caduque (tâche déjà terminée) est simplement sans effet.
+            try:
+                if action == 'cancel':
+                    TaskService.cancel(task_id)
+                elif action == 'pause':
+                    TaskService.pause(task_id)
+                elif action == 'resume':
+                    TaskService.resume(task_id)
+            except Exception:
+                pass
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ── Superviseur (heartbeat + commandes distantes) ─────────────────
+    @staticmethod
+    def _supervisor() -> None:
+        """Boucle de fond : preuve de vie des tâches en cours de CE poste + commandes reçues.
+
+        Le heartbeat ne peut pas dépendre de `_save_throttled` : celui-ci n'est appelé qu'entre
+        deux pages OCR (parfois > 60 s sur CPU) et jamais pendant le préflight (import torch,
+        chargement des modèles depuis le NAS). Sans ce thread, les autres postes déclarent la
+        tâche morte, libèrent son scope et volent son verrou → même OCR lancé deux fois."""
+        while True:
+            time.sleep(SUPERVISOR_INTERVAL)
+            try:
+                with TaskService._lock:
+                    running = [t for t in TaskService._tasks.values()
+                               if t.get('status') == 'running' and TaskService._is_owned(t)]
+                for task in running:
+                    task['heartbeat'] = datetime.now().isoformat()
+                    task['last_write'] = time.time()
+                    TaskService._save(task)
+                if running:
+                    TaskService._invalidate_merged()
+                TaskService._drain_control()
+            except Exception:
+                pass  # un superviseur ne doit jamais mourir
+
+    @staticmethod
+    def _start_supervisor() -> None:
+        with TaskService._lock:
+            if TaskService._supervisor_started:
+                return
+            TaskService._supervisor_started = True
+        threading.Thread(target=TaskService._supervisor, daemon=True).start()
+
     # ── Cycle de vie ──────────────────────────────────────────────────
     @staticmethod
     def enqueue(task_type: str, label: str, fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -482,14 +625,16 @@ class TaskService:
             TaskService._dispatch(ttype)
 
     @staticmethod
-    def cancel(task_id: str) -> bool:
+    def cancel(task_id: str) -> str:
+        """APPLIED si l'annulation est prise en charge ici, REQUESTED si elle est transmise au
+        poste propriétaire, REFUSED si l'état ne le permet pas."""
         TaskService._ensure_loaded()
         with TaskService._lock:
             task = TaskService._tasks.get(task_id)
             if task is not None and TaskService._is_owned(task):
                 if task['status'] == 'running':
                     task['cancel'] = True          # le runner s'arrêtera proprement
-                    return True
+                    return APPLIED
                 # 'interrupted' est terminal mais reste annulable : on le finalise comme une tâche
                 # en file/pause (retrait de file no-op + nettoyage index partiel via le hook).
                 if task['status'] in ('queued', 'paused', 'interrupted'):
@@ -497,19 +642,72 @@ class TaskService:
                     if q and task_id in q:
                         q.remove(task_id)
                     TaskService._finalize_cancel(task)
-                    return True
-                return False
-        # Tâche d'un autre poste : annulation d'orpheline non-active uniquement.
+                    return APPLIED
+                return REFUSED
+
+        # Tâche d'un autre poste.
         disk = TaskService._load_disk(task_id)
-        if not disk or disk.get('status') not in ('queued', 'paused'):
-            return False
+        if not disk or disk.get('status') in ('done', 'error', 'cancelled'):
+            return REFUSED
+        # Le propriétaire doit appliquer l'annulation lui-même : lui seul peut arrêter son runner,
+        # et sa copie mémoire ferait autorité sur ce qu'on écrirait ici.
+        TaskService._request_control(task_id, 'cancel')
+        if disk.get('status') == 'running':
+            return REQUESTED
+        # Non active (queued / paused / interrupted) : on finalise aussi directement, pour qu'une
+        # orpheline d'un poste éteint — qui ne lira jamais la commande — soit tout de même nettoyée.
         TaskService._finalize_cancel(disk)
+        return APPLIED
+
+    @staticmethod
+    def pause(task_id: str) -> str:
+        """Met en pause une tâche en cours : directement si elle est à nous, via une commande
+        déposée pour le poste propriétaire sinon."""
+        TaskService._ensure_loaded()
         with TaskService._lock:
-            mem = TaskService._tasks.get(task_id)
-            if mem is not None:
-                mem['status'] = 'cancelled'
-                mem['finished_at'] = disk['finished_at']
-        return True
+            task = TaskService._tasks.get(task_id)
+            if task is not None and TaskService._is_owned(task):
+                if task['status'] == 'running':
+                    task['pause'] = True
+                    return APPLIED
+                return REFUSED
+        disk = TaskService._load_disk(task_id)
+        if not disk or disk.get('status') != 'running':
+            return REFUSED
+        return REQUESTED if TaskService._request_control(task_id, 'pause') else REFUSED
+
+    @staticmethod
+    def resume(task_id: str) -> str:
+        """Reprend une tâche en pause ou interrompue. Les deux repartent de leur dernier
+        checkpoint (au dernier registre / à la dernière page terminée) : la pause l'écrit à
+        l'arrêt, l'interruption s'appuie sur l'état persisté pendant le traitement.
+
+        Une tâche d'un autre poste ne peut être reprise que par lui (c'est sa file et son
+        thread d'exécution) : on lui transmet la demande."""
+        TaskService._ensure_loaded()
+        with TaskService._lock:
+            task = TaskService._tasks.get(task_id)
+            if task is not None and TaskService._is_owned(task):
+                if task['status'] not in ('paused', 'interrupted'):
+                    return REFUSED
+                task['pause'] = False
+                task['status'] = 'queued'
+                task['finished_at'] = None   # 'interrupted' est terminal : on le réactive
+                task['error'] = None
+                TaskService._queue.setdefault(task['type'], []).append(task_id)
+                TaskService._save(task)
+                TaskService._invalidate_merged()
+                ttype = task['type']
+                dispatch = True
+            else:
+                dispatch = False
+        if dispatch:
+            TaskService._dispatch(ttype)
+            return APPLIED
+        disk = TaskService._load_disk(task_id)
+        if not disk or disk.get('status') not in ('paused', 'interrupted'):
+            return REFUSED
+        return REQUESTED if TaskService._request_control(task_id, 'resume') else REFUSED
 
     @staticmethod
     def _finalize_cancel(task: Dict[str, Any]) -> None:
@@ -525,40 +723,6 @@ class TaskService:
                 hook(task)
             except Exception:
                 pass
-
-    @staticmethod
-    def pause(task_id: str) -> bool:
-        """Met en pause une tâche en cours de CE poste (le runner s'arrête proprement)."""
-        TaskService._ensure_loaded()
-        with TaskService._lock:
-            task = TaskService._tasks.get(task_id)
-            if task and TaskService._is_owned(task) and task['status'] == 'running':
-                task['pause'] = True
-                return True
-        return False
-
-    @staticmethod
-    def resume(task_id: str) -> bool:
-        """Reprend une tâche en pause ou interrompue de CE poste : la remet en file. Les deux
-        repartent de leur dernier checkpoint (au dernier registre terminé) : la pause l'écrit à
-        l'arrêt, l'interruption s'appuie sur le checkpoint périodique écrit pendant la génération."""
-        TaskService._ensure_loaded()
-        with TaskService._lock:
-            task = TaskService._tasks.get(task_id)
-            if not task or not TaskService._is_owned(task):
-                return False
-            if task['status'] not in ('paused', 'interrupted'):
-                return False
-            task['pause'] = False
-            task['status'] = 'queued'
-            task['finished_at'] = None   # 'interrupted' est terminal : on le réactive
-            task['error'] = None
-            TaskService._queue.setdefault(task['type'], []).append(task_id)
-            TaskService._save(task)
-            TaskService._invalidate_merged()
-            ttype = task['type']
-        TaskService._dispatch(ttype)
-        return True
 
     @staticmethod
     def delete(task_id: str) -> bool:
@@ -592,10 +756,13 @@ class TaskService:
 
     @staticmethod
     def _unlink_task(task_id: str) -> None:
-        try:
-            TaskService._file(task_id).unlink(missing_ok=True)
-        except OSError:
-            pass
+        """Supprime le fichier de la tâche et la commande éventuellement en attente pour elle
+        (sinon un marqueur orphelin survivrait à la tâche qu'il visait)."""
+        for path in (TaskService._file(task_id), TaskService._control_file(task_id)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _prune_history() -> None:
@@ -675,3 +842,5 @@ class TaskService:
 
         for ttype in list(TaskService._queue.keys()):
             TaskService._dispatch(ttype)
+
+        TaskService._start_supervisor()
