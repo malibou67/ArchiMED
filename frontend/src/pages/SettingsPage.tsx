@@ -47,6 +47,11 @@ const CITATION_BIBTEX = `@software{archimed_2026,
   url     = {https://github.com/malibou67/ArchiMED}
 }`;
 
+const TEAM_MEMBERS = [
+  { name: 'about.teamMember1', role: 'about.teamMember1Role', lab: 'about.teamMember1Lab' },
+  { name: 'about.teamMember2', role: 'about.teamMember2Role', lab: 'about.teamMember2Lab' },
+];
+
 function SectionSkeleton({ lines }: { lines: number }) {
   return (
     <Paper variant="outlined" sx={{ p: 2, height: '100%' }}>
@@ -474,9 +479,16 @@ export default function SettingsPage() {
         <Typography variant="caption" color="text.secondary" fontWeight={600} sx={{ display: 'block' }}>
           {t('about.teamTitle')}
         </Typography>
-        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-          {t('about.team')}
-        </Typography>
+        {TEAM_MEMBERS.map(({ name, role, lab }) => (
+          <Box key={name} sx={{ mt: 0.5 }}>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+              {t(name)} — {t(role)}
+            </Typography>
+            <Typography variant="caption" color="text.disabled" sx={{ display: 'block', pl: 1 }}>
+              {t(lab)}
+            </Typography>
+          </Box>
+        ))}
         <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
           {t('about.funding')}
         </Typography>
