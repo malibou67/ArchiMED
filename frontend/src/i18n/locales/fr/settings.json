@@ -8,6 +8,7 @@
     "manual": "Manuel",
     "autoHint": "En automatique, on laisse au moins la moitié des cœurs libres (recommandé : {{recommended}} sur {{cpu}}).",
     "manualHint": "En manuel, vous choisissez vous-même le nombre de pages traitées en même temps.",
+    "gpuCapHint": "Limité à {{cap}} pages simultanées sur ce poste : chaque page en cours occupe de la mémoire GPU (VRAM {{vram}} Go). Au-delà, la carte déborde en mémoire système et tout ralentit fortement. Les {{cpu}} cœurs ne sont pleinement utilisables que sans GPU. Des scans plus grands abaissent encore ce plafond.",
     "pagesInParallel": "Pages traitées en parallèle :",
     "allCoresWarning": "Tous les cœurs seront utilisés — le PC risque de ramer pendant l'OCR.",
     "coresBusy": "Environ {{effective}} cœur(s) occupé(s), ~{{free}} laissé(s) libre(s) pour utiliser le PC.",

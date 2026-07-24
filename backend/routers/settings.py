@@ -6,6 +6,7 @@ from typing import Optional
 
 from services import DATA_DIR
 from settings_service import SettingsService
+from system_checks import check_requirements
 import ocr_service
 
 router = APIRouter()
@@ -60,6 +61,12 @@ def _disk_free_gb() -> Optional[float]:
 
 def _payload() -> dict:
     cores = os.cpu_count() or 1
+    # Sur GPU c'est la VRAM qui borne le parallélisme, pas les cœurs : le plafond annoncé
+    # est celui de CE poste (le réglage stocké, lui, est partagé entre machines).
+    cuda = (check_requirements(use_cache=True).get('cuda') or {})
+    gpu_cap = ocr_service.gpu_max_workers(cuda.get('vram_gb')) if cuda.get('ok') else None
+    max_workers = min(cores, gpu_cap) if gpu_cap else cores
+    recommended = ocr_service.adaptive_default_workers(cores)
     return {
         "stored": SettingsService.get(),
         "effective": {
@@ -70,8 +77,10 @@ def _payload() -> dict:
         },
         "system": {
             "cpu_count": cores,
-            "max_workers": cores,
-            "recommended_workers": ocr_service.adaptive_default_workers(cores),
+            "max_workers": max_workers,
+            "gpu_max_workers": gpu_cap,
+            "gpu_vram_gb": cuda.get('vram_gb') if cuda.get('ok') else None,
+            "recommended_workers": min(recommended, gpu_cap) if gpu_cap else recommended,
             "ram_total_gb": _total_ram_gb(),
             "disk_free_gb": _disk_free_gb(),
         },

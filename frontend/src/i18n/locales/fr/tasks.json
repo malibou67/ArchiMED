@@ -71,6 +71,7 @@
     "threadsPerWorker_one": "{{count}} thread par worker",
     "threadsPerWorker_other": "{{count}} threads par worker",
     "mixedSuffix": ", précision mixte",
+    "workersCapped": "{{requested}} pages simultanées demandées, ramenées à {{applied}} : la VRAM de ce poste ({{vram}} Go) ne peut pas en tenir davantage",
     "sequentialFallback": "Séquentiel (repli)",
     "sequentialFallbackTooltip_one": "Le pool de {{count}} worker n'a pas pu démarrer : traitement page par page sur un seul cœur",
     "sequentialFallbackTooltip_other": "Le pool de {{count}} workers n'a pas pu démarrer : traitement page par page sur un seul cœur"

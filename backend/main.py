@@ -137,6 +137,13 @@ if __name__ == "__main__":
 
     def _on_quit(icon, item):
         icon.stop()
+        # os._exit saute les handlers atexit : sans ce nettoyage, les workers d'un OCR en
+        # cours survivent à la fermeture et continuent d'occuper le GPU.
+        try:
+            import ocr_service
+            ocr_service.kill_active_pools()
+        except Exception:
+            pass
         os._exit(0)
 
     tray = pystray.Icon(

@@ -4,6 +4,7 @@ L'OCR est un **type de tâche** géré par le moteur générique `TaskService` (
 reprise). Ce module fournit le runner `run_ocr_task` (pipeline multiprocessing) + le détail
 par page (`pages_slice`/`_page_status`), et délègue la file/le cycle de vie à TaskService.
 """
+import atexit
 import os
 import threading
 import dataclasses
@@ -29,15 +30,53 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # Précision mixte (autocast + TF32) par défaut (env). Mesuré sans effet sur ce modèle (goulot
 # = post-traitement CPU). Surchargée par le réglage UI s'il est défini.
 MIXED_PRECISION = os.getenv('OCR_MIXED_PRECISION', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Budget VRAM par worker CUDA (Go) et marge réservée (bureau + pics de segmentation).
+#
+# Ce ne sont ni les poids (22 Mo) ni le contexte CUDA (20 Mo) qui coûtent, mais les
+# activations de la segmentation, proportionnelles à la surface de l'image : 1,7 Go par
+# worker mesuré sur des scans de 25 Mpx (RTX 3060 12 Go). Un worker de trop et le pilote
+# NVIDIA déborde en mémoire système — le GPU reste à 100 % mais le débit est divisé par 10.
+#
+# Benchmark sur 12 pages de 25 Mpx (12 s/page en séquentiel) :
+#   W=4 → 4,63 s/page (×2,8), 8,0 Go   W=6 → 4,18 s/page (×3,1), 11,3 Go
+#   W=8 → effondrement : 48 s/page, VRAM saturée
+# Au-delà de ~4 workers la latence par page monte (12,2 → 16,9 s) : le gain sature alors
+# que le risque de saturation grandit. Le défaut vise donc ~80 % de la VRAM, pas 100 %.
+# Des scans plus grands consomment davantage : baisser le budget si besoin.
+GPU_VRAM_PER_WORKER_GB = 2.0
+GPU_VRAM_RESERVE_GB = 1.5
 
 
 # ── Réglages effectifs : UI (settings.json) > variable d'env > défaut ──────────────
 def adaptive_default_workers(cores: int) -> int:
     """Laisse au moins la moitié des cœurs libres, plafonné à 4 (machine utilisable)."""
     return max(1, min(4, cores // 2))
+
+
+def gpu_max_workers(vram_gb: Optional[float]) -> int:
+    """Workers CUDA tenables dans la VRAM de la carte. 1 si la VRAM est inconnue (prudence).
+
+    Sur GPU c'est la VRAM, pas le nombre de cœurs, qui borne le parallélisme : chaque worker
+    a son propre contexte CUDA et sa copie des modèles. Le plafond est donc calculé **à
+    l'exécution, sur chaque poste** — `settings.json` est partagé entre des machines aux GPU
+    différents (cf. multi-PC dans task_service)."""
+    if not vram_gb:
+        return 1
+    per_worker = max(0.5, _env_float('OCR_GPU_VRAM_PER_WORKER_GB', GPU_VRAM_PER_WORKER_GB))
+    reserve = max(0.0, _env_float('OCR_GPU_VRAM_RESERVE_GB', GPU_VRAM_RESERVE_GB))
+    return max(1, int((vram_gb - reserve) // per_worker))
 
 
 def effective_workers() -> int:
@@ -82,6 +121,41 @@ def effective_pool_min_pages() -> int:
         except (TypeError, ValueError):
             pass
     return max(1, min(_env_int('OCR_POOL_MIN_PAGES', POOL_MIN_PAGES), 50))
+
+
+# ── Arrêt des pools ───────────────────────────────────────────────────────────────
+# `ProcessPoolExecutor.shutdown()` ne sait pas interrompre une page déjà commencée : il
+# laisse chaque worker finir la sienne (plusieurs minutes quand le GPU est chargé), et un
+# `os._exit()` — ce que fait « Quitter » dans la barre système — les rend carrément
+# orphelins : ils continuent à occuper GPU et RAM longtemps après. On garde donc la main sur
+# les pools vivants pour pouvoir les tuer à l'annulation, à la pause et à la fermeture.
+_ACTIVE_POOLS: set = set()
+_POOLS_LOCK = threading.Lock()
+
+
+def _kill_pool(executor) -> int:
+    """Tue les process d'un pool et retourne le nombre tué. Les pages en cours sont
+    abandonnées : leur état reste 0 (à faire), la reprise les refera — et l'écriture des
+    PAGE-XML étant atomique, aucun fichier tronqué ne peut passer pour une page faite."""
+    killed = 0
+    for proc in list(getattr(executor, '_processes', {}).values()):
+        try:
+            if proc.is_alive():
+                proc.kill()
+                killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def kill_active_pools() -> int:
+    """Tue tous les pools OCR encore vivants de ce process (fermeture de l'application)."""
+    with _POOLS_LOCK:
+        pools = list(_ACTIVE_POOLS)
+    return sum(_kill_pool(ex) for ex in pools)
+
+
+atexit.register(kill_active_pools)
 
 
 # ── Workers multiprocessing (fonctions au niveau module → picklables sous Windows) ──
@@ -132,7 +206,11 @@ def _ocr_worker_page(task):
         preds = list(rpred.rpred(_W_OCR, im, bounds))
         results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
         xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
-        out_path.write_text(xml, encoding='utf-8')
+        # Écriture atomique : un worker tué en pleine écriture (annulation) laisserait sinon
+        # un XML tronqué, que `done_stems` compterait comme une page transcrite.
+        tmp_path = out_path.with_name(out_path.name + '.tmp')
+        tmp_path.write_text(xml, encoding='utf-8')
+        os.replace(tmp_path, out_path)
         return (idx, col, label, True, None)
     except Exception as e:
         return (idx, col, label, False, str(e))
@@ -396,7 +474,7 @@ class OcrService:
         """Traitement parallèle : un pool de process traite les pages en concurrence
         (le post-traitement CPU, goulot réel, s'étale sur les cœurs). Les pages se terminent
         dans le désordre → on note l'état par index dans page_states."""
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
 
         states = task['page_states']
         by_index = {i: p for i, p in todo}
@@ -407,25 +485,44 @@ class OcrService:
             initializer=_ocr_worker_init,
             initargs=(seg_model_id, ocr_model_id, device, threads, bool(mixed)),
         )
+        with _POOLS_LOCK:
+            _ACTIVE_POOLS.add(executor)
         try:
-            futures = [executor.submit(_ocr_worker_page, t) for t in tasks]
-            for fut in as_completed(futures):
+            pending = {executor.submit(_ocr_worker_page, t) for t in tasks}
+            # Attente par tranches d'une seconde plutôt que `as_completed` : sinon la demande
+            # d'arrêt n'est vue qu'au retour d'une page, soit une minute ou plus par gros scan.
+            while pending:
                 if OcrService._stop_requested(task):
                     break
-                idx, col, label, ok, err = fut.result()
-                if ok:
-                    states[idx] = 1
-                    touched_collections.add(col)
-                    task['processed'] += 1
-                else:
-                    states[idx] = 2
-                    task['failed'] += 1
-                    task['errors'].append({'page': label, 'error': err})
-                task['current'] = label
-                on_page_done(col, by_index[idx]['registre'])
-                TaskService._save_throttled(task)
+                done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    idx, col, label, ok, err = fut.result()
+                    if ok:
+                        states[idx] = 1
+                        touched_collections.add(col)
+                        task['processed'] += 1
+                    else:
+                        states[idx] = 2
+                        task['failed'] += 1
+                        task['errors'].append({'page': label, 'error': err})
+                    task['current'] = label
+                    on_page_done(col, by_index[idx]['registre'])
+                if done:
+                    TaskService._save_throttled(task)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # `shutdown` annule les pages en file mais laisse les workers finir celle qu'ils
+            # ont commencée : sur un arrêt demandé on tue, sinon « Annuler » laisse le GPU
+            # occupé pendant des minutes (et la tâche suivante démarre par-dessus).
+            if OcrService._stop_requested(task):
+                killed = _kill_pool(executor)
+                if killed:
+                    print(f"[OCR] arrêt demandé : {killed} worker(s) interrompu(s).", flush=True)
+            with _POOLS_LOCK:
+                _ACTIVE_POOLS.discard(executor)
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass  # pool déjà tué : rien à attendre
 
 
 def _plan_todo(task: Dict[str, Any], pages: List[Dict[str, str]]) -> List:
@@ -496,14 +593,27 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
         # côté page peut être périmée) et on journalise le résultat dans la tâche.
         pre = check_requirements()
         device = 'cuda' if (pre.get('cuda') or {}).get('ok') else 'cpu'
+        requested = effective_workers()
+        workers = requested
+        cap_reason = None
+        if device == 'cuda':
+            # Le réglage est partagé entre postes : c'est ici, sur la machine qui exécute,
+            # qu'on le ramène à ce que sa carte peut tenir.
+            cap = gpu_max_workers((pre.get('cuda') or {}).get('vram_gb'))
+            if requested > cap:
+                workers = cap
+                cap_reason = 'gpu_vram'
         task['preflight'] = {
             **pre,
             'device': device,
-            'workers': effective_workers(),
+            'workers': workers,
             'threads': effective_threads(),
             'mixed_precision': effective_mixed() and device == 'cuda',
             'checked_at': datetime.now().isoformat(),
         }
+        if cap_reason:
+            task['preflight']['workers_requested'] = requested
+            task['preflight']['workers_cap_reason'] = cap_reason
         TaskService._save(task)
 
         missing = [label for key, label in

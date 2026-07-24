@@ -117,17 +117,32 @@ function PreflightChips({ preflight }: { preflight: TaskPreflight }) {
     : { label: tr('preflight.cpuLabel'), color: 'warning', tooltip: tr('preflight.cpuTooltip') });
   // Pool de process indisponible → la tâche a tourné sur un seul cœur : afficher le repli
   // plutôt que les workers demandés, qui n'ont pas servi.
-  chips.push(preflight.pool_fallback
-    ? {
-        label: tr('preflight.sequentialFallback'),
-        color: 'warning',
-        tooltip: `${tr('preflight.sequentialFallbackTooltip', { count: preflight.workers })} — ${preflight.pool_fallback}`,
-      }
-    : {
-        label: `W${preflight.workers} · T${preflight.threads}`,
-        color: 'default',
-        tooltip: `${tr('preflight.workersCount', { count: preflight.workers })}, ${tr('preflight.threadsPerWorker', { count: preflight.threads })}${preflight.mixed_precision ? tr('preflight.mixedSuffix') : ''}`,
-      });
+  const workersTooltip = `${tr('preflight.workersCount', { count: preflight.workers })}, ${tr('preflight.threadsPerWorker', { count: preflight.threads })}${preflight.mixed_precision ? tr('preflight.mixedSuffix') : ''}`;
+  if (preflight.pool_fallback) {
+    chips.push({
+      label: tr('preflight.sequentialFallback'),
+      color: 'warning',
+      tooltip: `${tr('preflight.sequentialFallbackTooltip', { count: preflight.workers })} — ${preflight.pool_fallback}`,
+    });
+  } else if (preflight.workers_cap_reason === 'gpu_vram') {
+    // Réglage ramené à ce que la VRAM de ce poste peut tenir : le dire, sinon l'écart
+    // entre le réglage et l'exécution est invisible.
+    chips.push({
+      label: `W${preflight.workers} · T${preflight.threads}`,
+      color: 'warning',
+      tooltip: `${tr('preflight.workersCapped', {
+        requested: preflight.workers_requested ?? preflight.workers,
+        applied: preflight.workers,
+        vram: preflight.cuda?.vram_gb ?? '?',
+      })} — ${workersTooltip}`,
+    });
+  } else {
+    chips.push({
+      label: `W${preflight.workers} · T${preflight.threads}`,
+      color: 'default',
+      tooltip: workersTooltip,
+    });
+  }
 
   return (
     <Stack direction="row" spacing={1} sx={{ mb: 1.5, flexWrap: 'wrap', gap: 0.5, alignItems: 'center' }}>

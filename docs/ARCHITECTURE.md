@@ -183,6 +183,30 @@ from the Settings page (stored in `data/settings.json`) or via environment varia
 - `OCR_THREADS_PER_WORKER` — torch threads per worker (default `1`)
 - `OCR_MIXED_PRECISION` — enable mixed precision (default off)
 - `OCR_POOL_MIN_PAGES` — minimum pages before using a worker pool (default `3`)
+- `OCR_GPU_VRAM_PER_WORKER_GB` — VRAM budget per CUDA worker (default `2`)
+- `OCR_GPU_VRAM_RESERVE_GB` — VRAM left to the desktop and to segmentation peaks (default `1.5`)
+
+**On GPU, VRAM caps the parallelism, not the core count.** The cost is neither the weights
+(22 MB) nor the CUDA context (20 MB) but the segmentation activations, proportional to image
+area: **1.7 GB per worker measured on 25 Mpx scans**. Once the card is full the NVIDIA driver
+spills into system memory — the GPU still reports 100 % while throughput drops tenfold.
+
+Benchmark, 12 pages of 25 Mpx on a 12 GB RTX 3060:
+
+| Workers | Throughput | Speed-up | Page latency | Peak VRAM |
+|---|---|---|---|---|
+| 1 | 12.94 s/page | ×1.00 | 12.2 s | 2.8 GB |
+| 4 | 4.63 s/page | ×2.79 | 14.3 s | 8.0 GB |
+| 6 | 4.18 s/page | ×3.09 | 16.9 s | 11.3 GB |
+| 8 | 48 s/page | collapse | 92 s | 12.0 GB (saturated) |
+
+Gains flatten past ~4 workers (page latency rises) while the risk of saturation grows, so the
+default targets ~80 % of VRAM: `run_ocr_task` caps the requested workers to
+`(vram_gb - reserve) // per_worker` — 5 on that card. Lower `OCR_GPU_VRAM_PER_WORKER_GB` to
+push the cap up on bigger cards or smaller scans. The cap is applied **at run time on each
+machine**, never when saving the setting, because `data/settings.json` is shared across
+machines with different GPUs. A capped run records `workers_requested` / `workers_cap_reason`
+in its preflight, shown on the Tasks page.
 
 ### Frontend (`.env`)
 ```

@@ -16,7 +16,10 @@ export interface SettingsStored {
 
 export interface SettingsSystem {
   cpu_count: number;
+  // Plafond applicable sur CE poste : min(cœurs, plafond VRAM du GPU s'il y en a un).
   max_workers: number;
+  gpu_max_workers: number | null;
+  gpu_vram_gb: number | null;
   recommended_workers: number;
   ram_total_gb: number | null;
   disk_free_gb: number | null;

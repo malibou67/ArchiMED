@@ -8,6 +8,7 @@
     "manual": "Manual",
     "autoHint": "In automatic mode, at least half of the cores are kept free (recommended: {{recommended}} of {{cpu}}).",
     "manualHint": "In manual mode, you choose how many pages are processed at the same time.",
+    "gpuCapHint": "Capped at {{cap}} concurrent pages on this machine: every page in flight holds GPU memory ({{vram}} GB VRAM). Beyond that the card spills into system memory and everything slows down badly. The {{cpu}} cores are only fully usable without a GPU. Larger scans lower this cap further.",
     "pagesInParallel": "Pages processed in parallel:",
     "allCoresWarning": "All cores will be used — the PC may become sluggish during OCR.",
     "coresBusy": "About {{effective}} core(s) busy, ~{{free}} left free to use the PC.",

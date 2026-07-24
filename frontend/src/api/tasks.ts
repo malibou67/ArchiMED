@@ -15,6 +15,10 @@ export interface TaskPreflight extends SystemRequirements {
   // repli subi — dans ce cas `pool_fallback` porte la cause.
   mode?: 'parallel' | 'sequential';
   pool_fallback?: string;
+  // Renseignés quand le réglage a été ramené à ce que la machine peut tenir
+  // (`workers` porte alors la valeur appliquée).
+  workers_requested?: number;
+  workers_cap_reason?: 'gpu_vram';
 }
 
 export interface Task {

@@ -117,7 +117,9 @@ export default function SettingsPage() {
   const applyData = (d: SettingsResponse) => {
     setData(d);
     setAuto(d.stored.ocr_workers == null);
-    setWorkers(d.stored.ocr_workers ?? d.system.recommended_workers);
+    // Le réglage est partagé entre postes : on l'affiche ramené à ce que CETTE machine peut
+    // tenir (le backend applique de toute façon ce plafond à l'exécution).
+    setWorkers(Math.min(d.stored.ocr_workers ?? d.system.recommended_workers, d.system.max_workers));
     setThreads(d.effective.ocr_threads_per_worker);
     setPoolMin(d.effective.ocr_pool_min_pages);
   };
@@ -155,6 +157,9 @@ export default function SettingsPage() {
   };
 
   const cpu = data?.system.cpu_count ?? 1;
+  // Plafond de CE poste : sur GPU c'est la VRAM qui limite, pas les cœurs.
+  const maxWorkers = data?.system.max_workers ?? cpu;
+  const gpuCap = data?.system.gpu_max_workers ?? null;
   const recommended = data?.system.recommended_workers ?? 1;
   const effectiveWorkers = auto ? recommended : workers;
   const freeCores = Math.max(0, cpu - effectiveWorkers);
@@ -290,11 +295,16 @@ export default function SettingsPage() {
                     value={workers}
                     onChange={(_, v) => setWorkers(v as number)}
                     min={1}
-                    max={cpu}
+                    max={maxWorkers}
                     step={1}
-                    marks={[{ value: 1, label: '1' }, { value: recommended, label: `${recommended}` }, { value: cpu, label: `${cpu}` }]}
+                    marks={[{ value: 1, label: '1' }, { value: recommended, label: `${recommended}` }, { value: maxWorkers, label: `${maxWorkers}` }]}
                     valueLabelDisplay="auto"
                   />
+                  {gpuCap != null && (
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                      {t('performance.gpuCapHint', { cap: gpuCap, vram: data?.system.gpu_vram_gb ?? '?', cpu })}
+                    </Typography>
+                  )}
                 </Box>
               </Collapse>
 
