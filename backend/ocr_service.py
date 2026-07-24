@@ -418,10 +418,11 @@ class OcrService:
         return False
 
     @staticmethod
-    def _process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id, device, mixed,
+    def _process_inline(task, touched, todo, seg_model_id, ocr_model_id, device, mixed,
                         on_page_done) -> None:
         """Traitement séquentiel (W=1 ou petit job) : modèles gardés chauds en cache.
-        `todo` est une liste de couples (index dans task['pages'], page)."""
+        `todo` est une liste de couples (index dans task['pages'], page).
+        `touched` collecte les couples (collection, registre) réellement transcrits."""
         import torch
         from PIL import Image
         from kraken import blla, rpred, serialization
@@ -459,7 +460,7 @@ class OcrService:
                 out_path.write_text(xml, encoding='utf-8')
 
                 states[i] = 1
-                touched_collections.add(col)
+                touched.add((col, reg))
                 task['processed'] += 1
             except Exception as e:
                 states[i] = 2
@@ -469,7 +470,7 @@ class OcrService:
             TaskService._save_throttled(task)
 
     @staticmethod
-    def _process_pool(task, todo, touched_collections, seg_model_id, ocr_model_id, device, workers,
+    def _process_pool(task, touched, todo, seg_model_id, ocr_model_id, device, workers,
                       threads, mixed, on_page_done) -> None:
         """Traitement parallèle : un pool de process traite les pages en concurrence
         (le post-traitement CPU, goulot réel, s'étale sur les cœurs). Les pages se terminent
@@ -499,7 +500,7 @@ class OcrService:
                     idx, col, label, ok, err = fut.result()
                     if ok:
                         states[idx] = 1
-                        touched_collections.add(col)
+                        touched.add((col, by_index[idx]['registre']))
                         task['processed'] += 1
                     else:
                         states[idx] = 2
@@ -584,7 +585,7 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
     pages = task.get('pages') or []
     seg_model_id = task['seg_model']
     ocr_model_id = task['ocr_model']
-    touched_collections: set = set()
+    touched: set = set()   # couples (collection, registre) réellement transcrits
     try:
         todo = _plan_todo(task, pages)
         on_page_done = _registre_reporter(task, todo)
@@ -640,12 +641,12 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
 
         if workers <= 1 or len(todo) < effective_pool_min_pages():
             task['preflight']['mode'] = 'sequential'
-            OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
+            OcrService._process_inline(task, touched, todo, seg_model_id, ocr_model_id,
                                        device, mixed, on_page_done)
         else:
             task['preflight']['mode'] = 'parallel'
             try:
-                OcrService._process_pool(task, todo, touched_collections, seg_model_id, ocr_model_id,
+                OcrService._process_pool(task, touched, todo, seg_model_id, ocr_model_id,
                                          device, workers, threads, mixed, on_page_done)
             except Exception as pool_err:
                 if task['cancel']:
@@ -661,12 +662,20 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
                 task['preflight']['pool_fallback'] = str(pool_err)[:300]
                 TaskService._save(task)
                 print(f"[OCR] pool indisponible ({pool_err}); repli séquentiel.", flush=True)
-                OcrService._process_inline(task, todo, touched_collections, seg_model_id, ocr_model_id,
+                OcrService._process_inline(task, touched, todo, seg_model_id, ocr_model_id,
                                            device, mixed, on_page_done)
     finally:
-        for col in touched_collections:
+        # Surtout pas de `sync_collection_metadata` ici : il relit tous les registres de la
+        # collection sur le NAS (≈16 min pour 383 registres) alors qu'un OCR ne change que
+        # les XML — la tâche resterait « en cours » tout ce temps, dernière page écrite.
+        # Le reporter a déjà publié l'ocr_status de chaque registre terminé ; il ne reste
+        # que ceux laissés à moitié par une annulation, une pause ou une erreur.
+        deja_publies = set(task.get('registres_done') or [])
+        for col, reg in touched:
+            if f"{col}/{reg}" in deja_publies:
+                continue
             try:
-                CollectionsService.sync_collection_metadata(col)
+                CollectionsService.refresh_registre_ocr_status(col, reg)
             except Exception:
                 pass
 

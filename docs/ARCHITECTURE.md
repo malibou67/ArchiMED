@@ -134,6 +134,15 @@ register's `ocr_status` is refreshed in the collection metadata
 `sync_collection_metadata`) and its name is appended to the task's `registres_done`, which the OCR
 page watches to reload its counters mid-run.
 
+The runner **never** calls `sync_collection_metadata` when it finishes, only the same targeted
+refresh for registers a cancellation or an error left half-done. A task is only marked `done`
+once its runner returns, so any work in that path delays the status: rebuilding a whole
+collection means relisting every register over the network — measured at 2.5 s per register,
+about 16 minutes for the 383 registers of a real collection — and an OCR run changes nothing
+that rebuild recomputes (pagination, page counts, anomalies), only the XML files under `ocr/`.
+Rebuilding a collection stays an explicit action of the Collections page, where progress is
+streamed.
+
 ## Multi-PC deployment
 
 ArchiMED is designed so the executable can live on a shared drive (e.g. a NAS) and be
