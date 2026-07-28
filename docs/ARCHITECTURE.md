@@ -128,6 +128,23 @@ Long-running work — OCR runs and index builds — goes through a single generi
   models off the NAS — can easily exceed the staleness threshold, which would let another machine
   declare the task dead and steal its scope lock.
 
+Two details of an OCR run are worth spelling out:
+
+- **Pages are checked against the disk before being enqueued.** The page list is built by the
+  frontend from the *detected* pagination, so it can name files that do not exist (a gap in the
+  numbering, a scan moved since the last sync). `OcrService.enqueue` drops those — one directory
+  listing per register — and reports the count as `skipped_missing`; without it every phantom
+  page would be transcribed for nothing and land in the `failed` bucket.
+- **PAGE-XML files are written to a temporary file then `os.replace`d, with retries.** The
+  atomicity is what lets a killed worker leave nothing behind that `done_stems` would count as a
+  transcribed page; the retries (`_write_xml_atomic`, ~3 s of escalating backoff) absorb the
+  `WinError 32` that antivirus or the Windows indexer cause on a network share by briefly holding
+  the freshly written file open.
+
+A resume redoes only the pages still *to do*: the ones recorded as `failed` are deliberately not
+retried automatically. `POST /api/tasks/{id}/retry-failed` re-queues them as a **new** task, which
+leaves the original task — possibly owned by another machine — untouched.
+
 An OCR run also publishes each register as soon as its last page has been attempted: the
 register's `ocr_status` is refreshed in the collection metadata
 (`CollectionsService.refresh_registre_ocr_status`, a targeted update — not the full

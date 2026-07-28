@@ -100,6 +100,8 @@
   "viewTasks": "View tasks",
   "queued_one": "{{count}} page added to the OCR queue.",
   "queued_other": "{{count}} pages added to the OCR queue.",
+  "skipped_one": "1 page skipped: its image could not be found on disk. Resynchronise the collection.",
+  "skipped_other": "{{count}} pages skipped: their images could not be found on disk. Resynchronise the collection.",
   "launchBar": {
     "selected_one": "{{count}} page selected",
     "selected_other": "{{count}} pages selected",

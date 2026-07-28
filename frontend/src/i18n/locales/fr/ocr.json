@@ -100,6 +100,8 @@
   "viewTasks": "Voir les tâches",
   "queued_one": "{{count}} page ajoutée à la file d'attente OCR.",
   "queued_other": "{{count}} pages ajoutées à la file d'attente OCR.",
+  "skipped_one": "1 page ignorée : son image est introuvable sur le disque. Resynchronisez la collection.",
+  "skipped_other": "{{count}} pages ignorées : leurs images sont introuvables sur le disque. Resynchronisez la collection.",
   "launchBar": {
     "selected_one": "{{count}} page sélectionnée",
     "selected_other": "{{count}} pages sélectionnées",

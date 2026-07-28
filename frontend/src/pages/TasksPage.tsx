@@ -17,9 +17,11 @@ import {
   TableHead,
   TableRow,
   Paper,
+  Alert,
 } from '@mui/material';
 import {
   Cancel as CancelIcon,
+  Replay as ReplayIcon,
   Delete as DeleteIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
@@ -300,7 +302,7 @@ function TaskRegistresPanel({ taskId, live }: { taskId: string; live: boolean })
 
 export default function TasksPage() {
   const { t: tr } = useTranslation('tasks');
-  const { cancel, pause, resume, remove, hasActivity } = useTasks();
+  const { cancel, pause, resume, remove, hasActivity, refresh: refreshSummary } = useTasks();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   usePageLoading(tr('loading'), loading);
@@ -310,6 +312,11 @@ export default function TasksPage() {
   const [requestedIds, setRequestedIds] = useState<Map<string, string>>(new Map());
   const [now, setNow] = useState(Date.now());
   const [machineFilter, setMachineFilter] = useState<string | null>(null);
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(new Set());
+  // La relance crée une nouvelle tâche sans toucher à la tâche source, dont les pages restent
+  // en échec : sans cette trace le bouton resterait actif et inviterait à relancer en boucle.
+  const [retriedIds, setRetriedIds] = useState<Set<string>>(new Set());
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try { setTasks(await tasksApi.list()); }
@@ -370,6 +377,23 @@ export default function TasksPage() {
   const handleResume = async (id: string) => { noteRequest(id, await resume(id)); await refresh(); };
   const handleDelete = async (id: string) => { await remove(id); await refresh(); };
 
+  // Réenfile les pages en échec dans une NOUVELLE tâche (la tâche source n'est pas modifiée :
+  // elle peut appartenir à un autre poste). `refreshSummary` réveille le polling et le widget.
+  const handleRetry = async (id: string) => {
+    setRetryingIds((p) => new Set(p).add(id));
+    setActionError(null);
+    try {
+      await tasksApi.retryFailed(id);
+      setRetriedIds((p) => new Set(p).add(id));
+      await refreshSummary();
+      await refresh();
+    } catch (e: any) {
+      setActionError(e?.response?.data?.detail || tr('retryError'));
+    } finally {
+      setRetryingIds((p) => { const n = new Set(p); n.delete(id); return n; });
+    }
+  };
+
   if (loading) return null;  // overlay global (usePageLoading) pendant le chargement initial
 
   if (tasks.length === 0) {
@@ -403,6 +427,9 @@ export default function TasksPage() {
           ))}
         </Stack>
       )}
+      {actionError && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setActionError(null)}>{actionError}</Alert>
+      )}
     <Paper elevation={0} sx={{ border: '1.5px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
     <TableContainer>
       <Table size="small">
@@ -414,7 +441,7 @@ export default function TasksPage() {
             <TableCell sx={{ ...HEADER_CELL, width: 116 }}>{tr('table.status')}</TableCell>
             <TableCell sx={{ ...HEADER_CELL, width: 280 }}>{tr('table.progress')}</TableCell>
             <TableCell sx={{ ...HEADER_CELL, width: 180 }}>{tr('table.time')}</TableCell>
-            <TableCell align="right" sx={{ ...HEADER_CELL, width: 150 }}>{tr('table.actions')}</TableCell>
+            <TableCell align="right" sx={{ ...HEADER_CELL, width: 185 }}>{tr('table.actions')}</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
@@ -551,6 +578,25 @@ export default function TasksPage() {
                       {!requested && (isRunning(t) || isQueued(t) || isPaused(t)) && (
                         <Tooltip title={owned ? tr('actions.cancel') : tr('actions.cancelOther', { machine: machineName })}>
                           <IconButton size="small" color="error" onClick={() => handleCancel(t.id)}><CancelIcon fontSize="small" /></IconButton>
+                        </Tooltip>
+                      )}
+                      {/* Relance des échecs : une reprise ne refait que les pages « à faire », jamais
+                          celles en échec — c'est le seul moyen de les rattraper sans les rechercher
+                          une par une. Autorisé aussi sur la tâche d'un autre poste (qui peut être
+                          éteint) : la nouvelle tâche nous appartient, les conflits de périmètre
+                          restent arbitrés à l'enfilage. */}
+                      {isOcr && t.failed > 0 && ['done', 'error', 'cancelled'].includes(t.status) && (
+                        <Tooltip title={retriedIds.has(t.id) ? tr('actions.retryDone') : tr('actions.retryFailed', { count: t.failed })}>
+                          <span>
+                            <IconButton
+                              size="small"
+                              color="warning"
+                              disabled={retryingIds.has(t.id) || retriedIds.has(t.id)}
+                              onClick={() => handleRetry(t.id)}
+                            >
+                              {retryingIds.has(t.id) ? <CircularProgress size={16} /> : <ReplayIcon fontSize="small" />}
+                            </IconButton>
+                          </span>
                         </Tooltip>
                       )}
                       {/* Suppression : tâche terminée (n'importe quel poste) ou orpheline en attente/pause d'un autre poste. */}

@@ -41,6 +41,7 @@
   "elapsed": "écoulé {{dur}}",
   "remaining": " · reste ~{{dur}}",
   "duration": "durée {{dur}}",
+  "retryError": "Impossible de relancer les pages en échec.",
   "actions": {
     "pausing": "Mise en pause…",
     "pause": "Mettre en pause",
@@ -50,6 +51,9 @@
     "resumeOther": "Reprendre sur le poste {{machine}}",
     "cancelOther": "Annuler sur le poste {{machine}}",
     "requestSent": "Demande envoyée au poste {{machine}}…",
+    "retryFailed_one": "Relancer la page en échec",
+    "retryFailed_other": "Relancer les {{count}} pages en échec",
+    "retryDone": "Relance déjà lancée — voir la nouvelle tâche",
     "delete": "Supprimer",
     "deleteOther": "Supprimer (tâche d'un autre poste)",
     "viewPages": "Voir les pages",

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from task_service import TaskService, REQUESTED, APPLIED
-from ocr_service import OcrService
+from task_service import TaskService, TaskConflict, REQUESTED, APPLIED
+from ocr_service import OcrService, NoPagesToProcess
 from services import IndexesService
 
 router = APIRouter()
@@ -58,6 +58,35 @@ def resume_task(task_id: str):
     if TaskService.get(task_id) is None:
         raise HTTPException(status_code=404, detail="Tâche introuvable.")
     return _control_response(task_id, "resumed", TaskService.resume(task_id))
+
+
+@router.post("/{task_id}/retry-failed")
+def retry_failed_pages(task_id: str):
+    """Relance les pages en échec d'une tâche OCR terminée, dans une **nouvelle** tâche.
+
+    `interrupted` est refusé bien qu'il soit terminal : une tâche interrompue reste reprenable,
+    et la relance viserait le même périmètre — la seconde des deux perdrait la course aux
+    verrous et finirait en erreur. Pour une tâche interrompue, « Reprendre » est la bonne action."""
+    task = TaskService.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Tâche introuvable.")
+    if task.get('type') != 'ocr':
+        raise HTTPException(status_code=400, detail="Seules les tâches OCR ont des pages à relancer.")
+    if task.get('status') not in ('done', 'error', 'cancelled'):
+        raise HTTPException(status_code=409, detail="La tâche n'est pas terminée : reprenez-la "
+                                                    "ou annulez-la avant de relancer ses échecs.")
+    try:
+        new_task = OcrService.retry_failed(task)
+    except NoPagesToProcess as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except TaskConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {
+        "task": new_task,
+        "source_task_id": task_id,
+        "retried": new_task.get('total', 0),
+        "skipped": new_task.get('skipped_missing', 0),
+    }
 
 
 @router.delete("/{task_id}")

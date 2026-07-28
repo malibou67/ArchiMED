@@ -39,7 +39,7 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `GET /api/registres/{collection_id}/{registre_id}/transcriptions` — Map each image to the models that transcribed it
 
 ## OCR
-- `POST /api/ocr/run` — Enqueue a Kraken OCR task (segmentation model + OCR model + an explicit list of pages); returns `409` if a conflicting task is already running
+- `POST /api/ocr/run` — Enqueue a Kraken OCR task (segmentation model + OCR model + an explicit list of pages); pages whose image is missing from disk (pagination gap, file moved since the last sync) are dropped and counted in `skipped_missing`, and the call returns `400` if none is left; returns `409` if a conflicting task is already running
 - `GET /api/ocr/done` — Stems of the pages already transcribed for a (collection, register, model)
 - `POST /api/ocr/missing` — Pages still lacking a transcription for a model (optional scope)
 
@@ -78,6 +78,7 @@ The background task engine (OCR and index builds). See [ARCHITECTURE.md](ARCHITE
 - `POST /api/tasks/{task_id}/cancel` — Cancel a task
 - `POST /api/tasks/{task_id}/pause` — Pause a task (OCR and index builds alike; resumes from its checkpoint)
 - `POST /api/tasks/{task_id}/resume` — Resume a paused or interrupted task
+- `POST /api/tasks/{task_id}/retry-failed` — Re-queue the failed pages of a finished OCR task as a **new** task (a resume only redoes the pages still *to do*, never the failed ones). `400` if the task is not an OCR task, has no failed page, or none of them still has an image on disk; `409` if the task is not finished (`done`/`error`/`cancelled`) or its scope is busy
 - `DELETE /api/tasks/{task_id}` — Remove a task (`409` if it is still running)
 
 > The three control endpoints answer `{ "<action>": bool, "requested": bool, "machine_label": str|null, "task": {…} }`.

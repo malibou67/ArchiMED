@@ -86,8 +86,33 @@ function sortPages(pages: string[], mainPattern?: string, extraPattern?: string)
   }).map(i => i.file);
 }
 
+// Les noms de pages sont reconstruits depuis la pagination détectée, pas lus sur le disque :
+// il faut donc sauter les trous relevés à la synchronisation, sinon on proposerait — et on
+// enfilerait — des pages qui n'existent pas (le backend les écarte, mais l'arbre mentirait).
+// Mémorisé par objet registre : `getColCheckState` appelle ceci pour chaque registre à chaque rendu.
+const pagesCache = new WeakMap<RegistreSummary, string[]>();
+
+function getPages(reg: RegistreSummary): string[] {
+  const cached = pagesCache.get(reg);
+  if (cached) return cached;
+  let pages: string[] = [];
+  if (reg.pages_pattern && reg.pages_start != null && reg.pages_end != null) {
+    const gaps = new Set(reg.pages_gaps ?? []);
+    const main: string[] = [];
+    for (let i = reg.pages_start; i <= reg.pages_end; i++) {
+      if (gaps.has(i)) continue;
+      main.push(reg.pages_pattern.replace('{num}', String(i)));
+    }
+    pages = sortPages([...main, ...(reg.extra_pages ?? [])], reg.pages_pattern, reg.extra_pagination?.pattern);
+  }
+  pagesCache.set(reg, pages);
+  return pages;
+}
+
+// Dénominateur des cases à cocher : même source que les clés réellement sélectionnables,
+// sinon un registre à trous ne pourrait jamais atteindre l'état « tout coché ».
 function getRegPageCount(reg: RegistreSummary): number {
-  return reg.pages_count;
+  return getPages(reg).length;
 }
 
 function PanelHeader({ title }: { title: string }) {
@@ -169,6 +194,9 @@ export default function OcrPage() {
   const [launching, setLaunching] = useState(false);
   const [pausingOcr, setPausingOcr] = useState(false);
   const [queuedNotice, setQueuedNotice] = useState<number | null>(null);
+  // Pages que le backend a écartées faute d'image sur le disque (registre modifié depuis
+  // la dernière synchronisation) : à signaler, sinon le compte annoncé serait inexpliqué.
+  const [skippedNotice, setSkippedNotice] = useState(0);
 
   // La pause est coopérative : elle ne prend effet qu'à la fin de la page en cours.
   const pauseOcr = async () => {
@@ -298,9 +326,11 @@ export default function OcrPage() {
     try {
       setLaunching(true);
       setError(null);
-      await ocrApi.run(selectedSegModel, selectedOcrModel, pages);
+      // `total` et non `pages.length` : le backend écarte les pages dont l'image n'existe pas.
+      const task = await ocrApi.run(selectedSegModel, selectedOcrModel, pages);
       await refreshTasks();
-      setQueuedNotice(pages.length);
+      setQueuedNotice(task.total);
+      setSkippedNotice(task.skipped_missing ?? 0);
       setSelectedPages(new Set()); // on garde les modèles, on libère la sélection pour enchaîner
     } catch (err: any) {
       setError(err?.response?.data?.detail || t('errors.launch'));
@@ -308,14 +338,6 @@ export default function OcrPage() {
     } finally {
       setLaunching(false);
     }
-  };
-
-  const getPages = (reg: RegistreSummary): string[] => {
-    if (!reg.pages_pattern || reg.pages_start == null || reg.pages_end == null) return [];
-    const main: string[] = [];
-    for (let i = reg.pages_start; i <= reg.pages_end; i++)
-      main.push(reg.pages_pattern.replace('{num}', String(i)));
-    return sortPages([...main, ...(reg.extra_pages ?? [])], reg.pages_pattern, reg.extra_pagination?.pattern);
   };
 
   const pageKey = (colId: string, regFolder: string, page: string) => `${colId}/${regFolder}/${page}`;
@@ -1008,6 +1030,13 @@ export default function OcrPage() {
           }
         >
           {t('queued', { count: queuedNotice })}
+        </Alert>
+      )}
+
+      {/* ─── Pages écartées faute d'image sur le disque ─── */}
+      {skippedNotice > 0 && (
+        <Alert severity="warning" sx={{ mt: 1, flexShrink: 0 }} onClose={() => setSkippedNotice(0)}>
+          {t('skipped', { count: skippedNotice })}
         </Alert>
       )}
 

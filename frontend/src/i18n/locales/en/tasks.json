@@ -41,6 +41,7 @@
   "elapsed": "elapsed {{dur}}",
   "remaining": " · ~{{dur}} left",
   "duration": "duration {{dur}}",
+  "retryError": "Could not retry the failed pages.",
   "actions": {
     "pausing": "Pausing…",
     "pause": "Pause",
@@ -50,6 +51,9 @@
     "resumeOther": "Resume on machine {{machine}}",
     "cancelOther": "Cancel on machine {{machine}}",
     "requestSent": "Request sent to machine {{machine}}…",
+    "retryFailed_one": "Retry the failed page",
+    "retryFailed_other": "Retry the {{count}} failed pages",
+    "retryDone": "Retry already queued — see the new task",
     "delete": "Delete",
     "deleteOther": "Delete (task from another machine)",
     "viewPages": "View the pages",

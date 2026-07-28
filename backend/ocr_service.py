@@ -7,10 +7,11 @@ par page (`pages_slice`/`_page_status`), et délègue la file/le cycle de vie à
 import atexit
 import os
 import threading
+import time
 import dataclasses
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional, Tuple
 
 from services import DATA_DIR, ModelsService, CollectionsService, RegistresService
 from settings_service import SettingsService
@@ -158,6 +159,50 @@ def kill_active_pools() -> int:
 atexit.register(kill_active_pools)
 
 
+# ── Écriture des PAGE-XML ─────────────────────────────────────────────────────────
+XML_WRITE_ATTEMPTS = 6
+XML_WRITE_BASE_DELAY = 0.1   # 0,1 → 1,6 s : ~3,1 s d'attente cumulée au pire
+
+
+def _write_xml_atomic(out_path: Path, xml: str) -> None:
+    """Écrit un PAGE-XML en deux temps (fichier temporaire + `os.replace`), avec réessais.
+
+    L'atomicité évite qu'un worker tué en pleine écriture (annulation) laisse un XML tronqué,
+    que `done_stems` compterait comme une page transcrite. Les réessais couvrent l'autre
+    risque, propre aux partages réseau : antivirus, indexeur Windows ou simple lecteur tiennent
+    le fichier ouvert quelques centaines de ms, et l'opération échoue alors en WinError 32
+    (« utilisé par un autre processus ») — sans réessai la page passerait en échec pour rien.
+    Même motif que `IndexesService._save_index_meta`, avec un backoff plus long (le partage
+    réseau est plus lent que le disque local).
+
+    Le nom du temporaire est propre au process/thread (comme `TaskService._save`) : deux
+    écrivains concurrents (repli séquentiel après un pool tué, relance d'un autre poste) ne
+    se disputent pas le même `.tmp`. Son suffixe `.tmp` le rend invisible pour les compteurs,
+    qui ne retiennent que les fichiers `.xml`.
+    """
+    tmp_path = out_path.with_name(f"{out_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    delay = XML_WRITE_BASE_DELAY
+    for attempt in range(XML_WRITE_ATTEMPTS):
+        try:
+            tmp_path.write_text(xml, encoding='utf-8')
+            os.replace(tmp_path, out_path)
+            return
+        except OSError as e:
+            # `PermissionError` (WinError 32/5) mais aussi les coupures SMB transitoires, qui
+            # remontent en OSError nu : on réessaie dans les deux cas, l'attente perdue sur une
+            # erreur définitive (disque plein) est négligeable devant le coût d'une page.
+            if attempt == 0:
+                print(f"[OCR] écriture différée ({out_path.name}) : {e}", flush=True)
+            if attempt == XML_WRITE_ATTEMPTS - 1:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 # ── Workers multiprocessing (fonctions au niveau module → picklables sous Windows) ──
 _W_SEG = None
 _W_OCR = None
@@ -206,14 +251,14 @@ def _ocr_worker_page(task):
         preds = list(rpred.rpred(_W_OCR, im, bounds))
         results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
         xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
-        # Écriture atomique : un worker tué en pleine écriture (annulation) laisserait sinon
-        # un XML tronqué, que `done_stems` compterait comme une page transcrite.
-        tmp_path = out_path.with_name(out_path.name + '.tmp')
-        tmp_path.write_text(xml, encoding='utf-8')
-        os.replace(tmp_path, out_path)
+        _write_xml_atomic(out_path, xml)
         return (idx, col, label, True, None)
     except Exception as e:
         return (idx, col, label, False, str(e))
+
+
+class NoPagesToProcess(Exception):
+    """Aucune page enfilable : toutes les images demandées sont absentes du disque."""
 
 
 class OcrService:
@@ -223,19 +268,41 @@ class OcrService:
 
     # ── Enfilage (délégué au moteur générique) ────────────────────────
     @staticmethod
-    def enqueue(seg_model_id: str, ocr_model_id: str, pages: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Ajoute une tâche OCR à la lane 'ocr'."""
-        collections = sorted({p['collection'] for p in pages})
-        registres = sorted({p['registre'] for p in pages})
+    def enqueue(seg_model_id: str, ocr_model_id: str, pages: List[Dict[str, str]],
+                retry_of: Optional[str] = None) -> Dict[str, Any]:
+        """Ajoute une tâche OCR à la lane 'ocr', après avoir écarté les pages sans image.
+
+        La liste est construite côté client à partir de la pagination détectée : elle peut
+        contenir des pages qui n'existent pas sur le disque (trou de pagination, fichier
+        déplacé depuis la dernière synchronisation). Les enfiler ne produirait que des échecs,
+        on les retire ici — c'est le seul endroit qui voie la vérité du disque."""
+        kept, skipped = OcrService.filter_existing_pages(pages)
+        if not kept:
+            raise NoPagesToProcess(
+                f"Aucune page à traiter : les {len(pages)} image(s) demandée(s) sont "
+                "introuvables sur le disque. Resynchronisez la collection."
+            )
+        if skipped:
+            print(f"[OCR] {len(skipped)} page(s) écartée(s) (image introuvable), "
+                  f"ex. {skipped[0]['registre']}/{skipped[0]['page']}", flush=True)
+        # Collections/registres dérivés des pages **retenues** : ce sont eux qui produisent les
+        # clés de périmètre (verrous), un registre entièrement fantôme ne doit rien verrouiller.
+        collections = sorted({p['collection'] for p in kept})
+        registres = sorted({p['registre'] for p in kept})
         label = ', '.join(collections) if collections else 'OCR'
-        fields = {
-            'total': len(pages),
+        fields: Dict[str, Any] = {
+            'total': len(kept),
             'seg_model': seg_model_id,
             'ocr_model': ocr_model_id,
             'collections': collections,
             'registres': registres,
-            'pages': pages,
+            'pages': kept,
         }
+        if skipped:
+            # Le compte seul : le JSON de tâche est relu en boucle par les autres postes.
+            fields['skipped_missing'] = len(skipped)
+        if retry_of:
+            fields['retry_of'] = retry_of
         return TaskService.enqueue('ocr', label, fields)
 
     # ── Détail par page (utilisé par /api/tasks/{id}/pages) ───────────
@@ -306,6 +373,40 @@ class OcrService:
             'items': items[offset:offset + limit],
         }
 
+    # ── Relance des pages en échec ────────────────────────────────────
+    @staticmethod
+    def failed_pages(task: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Pages en échec d'une tâche OCR.
+
+        On indexe `task['pages']` **par position** via `_page_status` — jamais par le libellé
+        « registre/page », qui perd la collection et n'est donc pas réversible. Passer par
+        `_page_status` couvre au passage les tâches anciennes sans `page_states` (repli)."""
+        pages = task.get('pages') or []
+        return [pages[i] for i, s in enumerate(OcrService._page_status(task))
+                if s['status'] == 'failed']
+
+    @staticmethod
+    def retry_failed(task: Dict[str, Any]) -> Dict[str, Any]:
+        """Réenfile une **nouvelle** tâche OCR limitée aux pages en échec, mêmes modèles.
+
+        La tâche d'origine n'est pas touchée : elle peut appartenir à un autre poste (on
+        n'écrit jamais dans le fichier d'un autre poste), et son historique d'échecs reste
+        consultable. Les pages dont l'image a disparu entre-temps sont écartées par
+        `enqueue`, qui lève `NoPagesToProcess` s'il ne reste rien."""
+        failed = OcrService.failed_pages(task)
+        if not failed:
+            raise NoPagesToProcess("Aucune page en échec à relancer.")
+        # Un modèle supprimé depuis la tâche d'origine donne un refus immédiat, plutôt qu'une
+        # tâche qui part pour échouer au préflight.
+        for kind, model_id in (('de segmentation', task.get('seg_model')), ('OCR', task.get('ocr_model'))):
+            if not model_id or OcrService._resolve_model_path(model_id) is None:
+                raise NoPagesToProcess(
+                    f"Le modèle {kind} « {model_id} » de cette tâche est introuvable : "
+                    "relancez depuis la page OCR avec un modèle disponible."
+                )
+        return OcrService.enqueue(task['seg_model'], task['ocr_model'], failed,
+                                  retry_of=task.get('id'))
+
     # ── État de transcription (pages faites / manquantes) ─────────────
     @staticmethod
     def done_stems(collection: str, registre: str, model_id: str) -> List[str]:
@@ -316,6 +417,37 @@ class OcrService:
         if not d.is_dir():
             return []
         return sorted(f.stem for f in d.iterdir() if f.suffix == '.xml')
+
+    @staticmethod
+    def filter_existing_pages(pages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        """Sépare les pages demandées en (retenues, écartées) selon l'existence de l'image.
+
+        Un seul listing par (collection, registre) : sur un partage réseau, lister un dossier
+        une fois coûte bien moins cher qu'un `stat` par page — sauf pour une poignée de pages,
+        où c'est l'inverse (cas « je relance deux pages »). Sur le chemin par listing, le nom
+        retenu est celui du disque : Windows ouvrirait `Page_1.jpg` demandé en `page_1.jpg`,
+        mais le XML produit prendrait le stem demandé et fausserait les compteurs."""
+        by_registre: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        for p in pages:
+            by_registre.setdefault((p['collection'], p['registre']), []).append(p)
+
+        kept: List[Dict[str, str]] = []
+        skipped: List[Dict[str, str]] = []
+        scans_root = Path(DATA_DIR) / "collections"
+        for (col, reg), group in by_registre.items():
+            if len(group) <= 4:
+                reg_dir = scans_root / col / "scans" / reg
+                for p in group:
+                    (kept if (reg_dir / p['page']).is_file() else skipped).append(p)
+                continue
+            by_lower = {n.lower(): n for n in RegistresService.list_scan_pages(col, reg)}
+            for p in group:
+                real = by_lower.get(p['page'].lower())
+                if real is None:
+                    skipped.append(p)
+                else:
+                    kept.append(p if real == p['page'] else {**p, 'page': real})
+        return kept, skipped
 
     @staticmethod
     def missing_pages(model_id: str, scope: Optional[List[Dict[str, Optional[str]]]] = None) -> List[Dict[str, str]]:
@@ -457,7 +589,7 @@ class OcrService:
                 preds = list(rpred.rpred(ocr_net, im, bounds))
                 results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
                 xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
-                out_path.write_text(xml, encoding='utf-8')
+                _write_xml_atomic(out_path, xml)
 
                 states[i] = 1
                 touched.add((col, reg))

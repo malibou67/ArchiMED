@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
-from ocr_service import OcrService
+from ocr_service import OcrService, NoPagesToProcess
 from task_service import TaskConflict
 
 router = APIRouter()
@@ -40,6 +40,8 @@ def run_ocr(request: OcrRunRequest):
     pages = [p.model_dump() for p in request.pages]
     try:
         return OcrService.enqueue(request.seg_model_id, request.ocr_model_id, pages)
+    except NoPagesToProcess as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
 

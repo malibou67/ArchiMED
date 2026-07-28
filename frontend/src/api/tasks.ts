@@ -45,6 +45,11 @@ export interface Task {
   seg_model?: string;
   ocr_model?: string;
   preflight?: TaskPreflight;
+  // Pages écartées à l'enfilage parce que leur image n'existe pas sur le disque
+  // (trou de pagination, fichier déplacé depuis la dernière synchronisation).
+  skipped_missing?: number;
+  // Tâche née de la relance des pages en échec d'une autre tâche.
+  retry_of?: string;
   // Spécifique Index
   collection_id?: string;
   collection_folder?: string;
@@ -69,6 +74,15 @@ export interface TaskControlResult {
   requested: boolean;
   machine_label: string | null;
   task: Task | null;
+}
+
+// Réponse de la relance des pages en échec : `task` est une **nouvelle** tâche, la tâche
+// d'origine (`source_task_id`) n'est pas modifiée.
+export interface TaskRetryResult {
+  task: Task;
+  source_task_id: string;
+  retried: number;
+  skipped: number;
 }
 
 export interface TasksSummary {
@@ -142,6 +156,13 @@ export const tasksApi = {
 
   remove: async (taskId: string): Promise<void> => {
     await api.delete(`/api/tasks/${taskId}`);
+  },
+
+  // Réenfile les pages en échec d'une tâche OCR terminée dans une nouvelle tâche.
+  // `timeout: 0` : l'enfilage vérifie l'existence des images (listing par registre).
+  retryFailed: async (taskId: string): Promise<TaskRetryResult> => {
+    const response = await api.post(`/api/tasks/${taskId}/retry-failed`, undefined, { timeout: 0 });
+    return response.data;
   },
 
   getPages: async (
