@@ -62,6 +62,7 @@ import {
   IndexProgress as IndexProgressType,
   IndexSource,
   IndexPreview,
+  IndexUpdates,
   CollectionMetadata,
 } from '../types';
 import { useTasks } from '../context/TasksContext';
@@ -141,6 +142,74 @@ function IndexProgress({ progress, rebuild }: { progress?: IndexProgressType; re
     );
   }
   return <LinearProgress variant="indeterminate" color={rebuild ? 'info' : 'warning'} sx={{ height: 5, borderRadius: 3 }} />;
+}
+
+// Part de l'OCR disponible réellement présente dans l'index, avec le détail par source au survol.
+// Composant local : les trois autres indicateurs de couverture de l'app (CollectionsPage,
+// QualityCard, CollectionStatsDashboard) sont eux aussi locaux — les factoriser est un chantier
+// à part. On en reprend en revanche la règle du « pas de 100 % trompeur par arrondi ».
+function IndexCoverage({ updates, locale }: { updates?: IndexUpdates; locale: string }) {
+  const { t } = useTranslation('indexes');
+  if (!updates) return null;
+  const fmtN = (n: number) => n.toLocaleString(locale);
+
+  if (!updates.coverage_known) {
+    return (
+      <Tooltip title={t('list.coverageUnknownTooltip')} arrow>
+        <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.25, cursor: 'help' }}>
+          {t('list.coverageUnknown')}
+        </Typography>
+      </Tooltip>
+    );
+  }
+
+  const ocr = updates.ocr_pages ?? 0;
+  const indexed = updates.indexed_pages ?? 0;
+  if (!ocr) return null;   // aucune page OCR connue : la ligne mots/registres suffit
+
+  const complete = indexed >= ocr;
+  const pct = complete ? 100 : Math.min(99, Math.round((indexed / ocr) * 100));
+
+  const tooltip = (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+      <Typography variant="caption" fontWeight={700}>{t('list.coverageTooltipTitle')}</Typography>
+      {updates.sources.map((s, i) => {
+        const src = s.collection_titre || s.collection_folder;
+        if (!s.resolved) {
+          return <span key={i}>{t('list.coverageSourceMissing', { source: src, model: s.model_name })}</span>;
+        }
+        const sOcr = s.ocr_pages ?? 0;
+        const sIdx = s.indexed_pages ?? 0;
+        const sPct = sIdx >= sOcr ? 100 : sOcr > 0 ? Math.min(99, Math.round((sIdx / sOcr) * 100)) : 0;
+        return (
+          <span key={i}>
+            {t('list.coverageSource', { source: src, model: s.model_name, val: fmtN(sIdx), total: fmtN(sOcr), pct: sPct })}
+          </span>
+        );
+      })}
+      {updates.stale_pages > 0 && (
+        <span>{t('list.coverageStale', { count: updates.stale_pages, val: fmtN(updates.stale_pages) })}</span>
+      )}
+      <Typography variant="caption" color="text.disabled" sx={{ mt: 0.5 }}>
+        {t(updates.rescanned ? 'list.coverageFreshnessScanned' : 'list.coverageFreshness')}
+      </Typography>
+    </Box>
+  );
+
+  return (
+    <Tooltip title={tooltip} arrow>
+      <Box sx={{ mt: 0.25, cursor: 'help' }}>
+        <Typography variant="caption" color="text.secondary">
+          {t('list.coverage', { val: fmtN(indexed), total: fmtN(ocr), pct })}
+        </Typography>
+        {/* Pas de barre quand tout est indexé : une barre pleine sur chaque ligne n'est que du
+            bruit, et son absence rend un index incomplet immédiatement repérable. */}
+        {!complete && (
+          <LinearProgress variant="determinate" value={pct} sx={{ height: 4, borderRadius: 2, mt: 0.25 }} />
+        )}
+      </Box>
+    </Tooltip>
+  );
 }
 
 const HEADER_CELL = {
@@ -477,25 +546,39 @@ export default function IndexesPage() {
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(new Set());
   const [pausingIds, setPausingIds] = useState<Set<string>>(new Set());
   const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
-  const [updatesById, setUpdatesById] = useState<Record<string, { new_registres: number; new_pages: number }>>({});
+  const [updatesById, setUpdatesById] = useState<Record<string, IndexUpdates>>({});
+  const [refreshing, setRefreshing] = useState(false);
 
   const { runningTasks, pausedTasks, interruptedTasks, queuedTasks, hasActivity, cancel: cancelTask, pause: pauseTask, resume: resumeTask, refresh: refreshTasks } = useTasks();
 
-  const loadUpdates = useCallback(async () => {
+  // `rescan` : relire réellement les dossiers OCR au lieu des compteurs publiés. Réservé à une
+  // action explicite de l'utilisateur (bouton Actualiser), car c'est plusieurs secondes.
+  const loadUpdates = useCallback(async (rescan = false) => {
     try {
-      const ups = await indexesApi.getUpdates();
+      const ups = await indexesApi.getUpdates(rescan);
       setUpdatesById(Object.fromEntries(ups.map(u => [u.id, u])));
     } catch {
-      /* non bloquant : pas d'info de fraîcheur */
+      /* non bloquant : pas d'info de couverture */
     }
   }, []);
 
-  const loadIndexes = useCallback(async () => {
+  const loadIndexes = useCallback(async (rescan = false) => {
     try {
       setIndexes(await indexesApi.getAll());
-      loadUpdates();
+      loadUpdates(rescan);
     } catch {
       setError(t('errors.load'));
+    }
+  }, [loadUpdates]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([indexesApi.getAll().then(setIndexes), loadUpdates(true)]);
+    } catch {
+      setError(t('errors.load'));
+    } finally {
+      setRefreshing(false);
     }
   }, [loadUpdates]);
 
@@ -699,11 +782,14 @@ export default function IndexesPage() {
           />
         )}
 
+        {/* Seule action qui relit réellement les dossiers OCR : ailleurs on se fie aux compteurs
+            publiés, qui peuvent ignorer des XML déposés hors de l'application. */}
         <Tooltip title={t('list.refreshTooltip')} arrow>
           <Button
             variant="outlined"
-            startIcon={<RefreshIcon />}
-            onClick={loadIndexes}
+            startIcon={refreshing ? <CircularProgress size={16} /> : <RefreshIcon />}
+            onClick={handleRefresh}
+            disabled={refreshing}
             sx={indexes.length > 0 ? undefined : { ml: 'auto' }}
           >
             {t('list.refresh')}
@@ -762,6 +848,10 @@ export default function IndexesPage() {
                   const isRegenerating = regeneratingIds.has(index.id);
                   const actionsAlwaysVisible = isGenerating || isRegenerating;
                   const labels = sourcesLabels(index, collections);
+                  // Une entrée existe désormais pour chaque index prêt (elle porte la couverture) :
+                  // le chip d'alerte ne doit s'afficher que s'il y a réellement du nouveau.
+                  const updates = updatesById[index.id];
+                  const hasNew = !!updates && (updates.new_pages > 0 || updates.new_registres > 0);
                   return (
                     <TableRow
                       key={index.id}
@@ -816,7 +906,8 @@ export default function IndexesPage() {
                             <Typography variant="caption" color="text.disabled">
                               {t('list.registresCount', { count: index.stats.registres_count })} · {t('list.occAbbr', { val: index.stats.total_word_occurrences.toLocaleString(locale) })}
                             </Typography>
-                            {updatesById[index.id] && (
+                            <IndexCoverage updates={updates} locale={locale} />
+                            {hasNew && (
                               <Tooltip title={t('list.updatesTooltip')} arrow>
                                 <Chip
                                   size="small"
@@ -825,10 +916,9 @@ export default function IndexesPage() {
                                   icon={<SyncIcon sx={{ fontSize: '13px !important' }} />}
                                   onClick={() => handleRegenerate(index)}
                                   label={(() => {
-                                    const u = updatesById[index.id];
                                     const parts = [];
-                                    if (u.new_pages > 0) parts.push(t('list.newPages', { count: u.new_pages, val: u.new_pages.toLocaleString(locale) }));
-                                    if (u.new_registres > 0) parts.push(t('list.newRegistres', { count: u.new_registres }));
+                                    if (updates.new_pages > 0) parts.push(t('list.newPages', { count: updates.new_pages, val: updates.new_pages.toLocaleString(locale) }));
+                                    if (updates.new_registres > 0) parts.push(t('list.newRegistres', { count: updates.new_registres }));
                                     return `${parts.join(' · ')} ${t('list.toIndex')}`;
                                   })()}
                                   sx={{ mt: 0.5, cursor: 'pointer', fontWeight: 500 }}
@@ -924,9 +1014,9 @@ export default function IndexesPage() {
                                   </IconButton>
                                 </span>
                               </Tooltip>
-                              <Tooltip title={updatesById[index.id] ? t('actions.update') : t('actions.updateGeneric')} arrow>
+                              <Tooltip title={hasNew ? t('actions.update') : t('actions.updateGeneric')} arrow>
                                 <span>
-                                  <IconButton size="small" color={updatesById[index.id] ? 'warning' : 'primary'} onClick={() => handleRegenerate(index)} disabled={isRegenerating}>
+                                  <IconButton size="small" color={hasNew ? 'warning' : 'primary'} onClick={() => handleRegenerate(index)} disabled={isRegenerating}>
                                     {isRegenerating ? <CircularProgress size={16} /> : <SyncIcon fontSize="small" />}
                                   </IconButton>
                                 </span>

@@ -57,7 +57,12 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `PATCH /api/indexes/{index_id}` — Rename or change the sources (re-enqueues a **full** build if sources change)
 - `DELETE /api/indexes/{index_id}` — Delete an index
 - `GET /api/indexes/available-models` — OCR models available for a collection (`?collection_id=…`)
-- `GET /api/indexes/updates` — New registers/pages that appeared since each ready index was built
+- `GET /api/indexes/updates[?rescan=true]` — Coverage **and** freshness of every *ready* index:
+  `{id, new_registres, new_pages, coverage_known, indexed_pages, ocr_pages, stale_pages, rescanned, sources[]}`.
+  By default the OCR counters come from each collection's published `ocr_status` (a few milliseconds);
+  `rescan=true` walks the OCR folders instead — authoritative even for XML dropped outside the app, but
+  seconds-slow, and what the "Refresh the list" button sends. Indexes built before coverage tracking
+  report `coverage_known: false`
 - `GET /api/indexes/{index_id}/search?q=…&year_from=…&year_to=…&fuzzy_threshold=…` — Full-text search (multiple terms, optional year range and fuzzy matching)
 - `GET /api/indexes/{index_id}/year-range` — Min/max year covered by the index
 - `GET /api/indexes/{index_id}/words` — Paginated vocabulary (filter / sort / stopwords / min occurrences)

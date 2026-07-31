@@ -230,6 +230,32 @@ export type IndexMetadata = {
   build?: IndexBuild;
 }
 
+// Couverture d'une source d'un index : pages indexées vs pages OCR disponibles.
+export type IndexSourceCoverage = {
+  key?: string | null;            // null pour un ancien index mono-source
+  collection_folder: string;
+  collection_titre?: string | null;
+  model_name: string;
+  resolved: boolean;              // false : collection introuvable ou metadata illisible
+  indexed_pages?: number | null;
+  ocr_pages?: number | null;
+  new_registres: number;
+  new_pages: number;
+}
+
+// Fraîcheur et couverture d'un index prêt (GET /api/indexes/updates).
+export type IndexUpdates = {
+  id: string;
+  new_registres: number;
+  new_pages: number;
+  coverage_known: boolean;        // false : index construit avant le suivi de couverture
+  indexed_pages?: number | null;
+  ocr_pages?: number | null;
+  stale_pages: number;            // pages indexées dont l'OCR n'existe plus
+  rescanned: boolean;
+  sources: IndexSourceCoverage[];
+}
+
 export type IndexCreate = {
   name: string;
   sources: IndexSource[];

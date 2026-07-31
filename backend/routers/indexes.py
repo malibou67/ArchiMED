@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from typing import List, Optional
 from models import (
-    IndexMetadata, IndexCreate, IndexUpdate, IndexPreviewRequest,
+    IndexMetadata, IndexCreate, IndexUpdate, IndexUpdates, IndexPreviewRequest,
     WordSearchResponse, MultiSearchResponse,
 )
 from services import IndexesService
@@ -74,24 +74,21 @@ def list_available_models(collection_id: str = Query(..., description="ID ou fol
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/updates")
-def get_indexes_updates():
-    """Pour chaque index prêt : nb de registres / pages OCR apparus depuis l'indexation.
-    Calcul à part de la liste (peut rescanner index.json une fois) pour ne pas la ralentir."""
+# Nom historique : cette route renvoie désormais la couverture complète de chaque index prêt,
+# pas seulement ce qui a changé. Elle doit rester déclarée AVANT `/{index_id}`, sinon FastAPI
+# la capture comme un identifiant d'index.
+@router.get("/updates", response_model=List[IndexUpdates])
+def get_indexes_updates(
+    rescan: bool = Query(False, description="Rescanner réellement les dossiers OCR au lieu de "
+                                            "lire les compteurs publiés (exact mais lent)"),
+):
+    """Pour chaque index prêt : pages indexées / pages OCR disponibles, et ce qui reste à indexer.
+
+    Par défaut les compteurs OCR viennent de l'`ocr_status` publié dans le metadata de chaque
+    collection (quelques millisecondes) ; `rescan=true` scanne les dossiers, ce qui est exact
+    même si des XML ont été déposés hors de l'application, mais peut prendre plusieurs secondes."""
     try:
-        result = []
-        for meta in IndexesService.list_indexes():
-            if meta.get('status') != 'ready':
-                continue
-            upd = IndexesService.compute_updates(meta)
-            if upd['new_registres'] > 0 or upd['new_pages'] > 0:
-                result.append({
-                    "id": meta['id'],
-                    "new_registres": upd['new_registres'],
-                    "new_pages": upd['new_pages'],
-                    "coverage_known": upd['coverage_known'],
-                })
-        return result
+        return IndexesService.list_updates(rescan)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -43,6 +43,25 @@ def check_data_storage() -> Dict[str, Any]:
     }
 
 
+def _read_json_retry(path: Path, retries: int = 3, delay: float = 0.04) -> Optional[Dict[str, Any]]:
+    """Lit un JSON en tolérant une écriture concurrente. `None` si illisible.
+
+    Les metadata sont réécrits très souvent (progression d'indexation, `ocr_status` publié
+    registre par registre) et relus en boucle, y compris par les autres postes du NAS. Les
+    écritures sont atomiques (tmp + `os.replace`), donc jamais tronquées, mais sous Windows un
+    lecteur peut tomber sur un `PermissionError` transitoire au moment exact du remplacement :
+    on réessaie brièvement plutôt que de faire remonter l'erreur."""
+    for attempt in range(retries):
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, PermissionError, OSError):
+            if attempt == retries - 1:
+                return None
+            time.sleep(delay)
+    return None
+
+
 def _count_ocr_xml(reg_ocr_dir: Path, pages_total: int) -> Dict[str, Dict[str, int]]:
     """État OCR d'un registre : nombre de XML par modèle dans ocr/<registre>/<modele>/.
     Helper partagé entre le scan (diagnostic) et la synchronisation (écriture du metadata)."""
@@ -488,6 +507,49 @@ class CollectionsService:
                 pass
             return False
         return True
+
+    @staticmethod
+    def ocr_counts_from_meta(metadata: Dict[str, Any], model_name: str) -> Dict[str, int]:
+        """`{registre_folder: pages_done}` pour ce modèle, à partir d'un metadata de collection
+        **déjà lu**. Fonction pure : permet de ne lire le fichier qu'une fois quand plusieurs
+        modèles de la même collection sont interrogés.
+
+        Un registre sans page pour ce modèle est **omis**, exactement comme `_count_ocr_xml`
+        (`if n:`) et `IndexesService._current_ocr_counts` : les deux sources restent ainsi
+        isomorphes, ce dont dépend le comptage des nouveaux registres (`reg not in coverage`)."""
+        counts: Dict[str, int] = {}
+        for reg in metadata.get('registres') or []:
+            folder = reg.get('folder_name')
+            if not folder:
+                continue
+            try:
+                n = int(((reg.get('ocr_status') or {}).get(model_name) or {}).get('pages_done') or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue   # metadata édité à la main : structure ou valeur inattendue
+            if n:
+                counts[folder] = n
+        return counts
+
+    @staticmethod
+    def ocr_counts_from_metadata(col_dir: Path, model_name: str) -> Optional[Dict[str, int]]:
+        """Comptage OCR **rapide** d'une collection : lecture du seul metadata.json (~0,5 ms),
+        contre jusqu'à 1,4 s de scan disque pour `IndexesService._current_ocr_counts`.
+
+        Les compteurs viennent de l'`ocr_status` **publié** par l'application : le runner OCR le
+        réécrit registre par registre (`refresh_registre_ocr_status`), et une synchronisation de
+        collection le reconstruit intégralement. Il peut donc être en retard si des XML sont
+        copiés ou supprimés hors de l'application, si un processus OCR est tué avant son
+        nettoyage final, ou si un registre présent dans `ocr/` ne figure pas encore dans
+        `registres[]`. La conséquence est **cosmétique** : la génération d'un index ne consulte
+        jamais l'`ocr_status`, sa première passe scanne réellement les dossiers — une mise à jour
+        n'omet donc jamais de pages, quoi qu'ait affiché le badge de fraîcheur.
+
+        Retourne `None` si le metadata est introuvable ou illisible — à distinguer de `{}`, qui
+        signifie « collection lue, aucune page OCR pour ce modèle »."""
+        metadata = _read_json_retry(col_dir / "metadata.json")
+        if metadata is None:
+            return None
+        return CollectionsService.ocr_counts_from_meta(metadata, model_name)
 
     @staticmethod
     def sync_collection_metadata(collection_id: str) -> Optional[Dict[str, Any]]:
@@ -1029,22 +1091,9 @@ class IndexesService:
 
     @staticmethod
     def _read_index_meta(metadata_file: Path, retries: int = 3, delay: float = 0.04) -> Optional[Dict[str, Any]]:
-        """Lit un metadata.json en tolérant une écriture concurrente.
-
-        La génération réécrit ce fichier très souvent (progression) ; un lecteur qui tombe
-        pendant l'écriture peut voir un contenu tronqué (`JSONDecodeError`) ou, sous Windows,
-        un verrou transitoire (`PermissionError`). On réessaie brièvement plutôt que de faire
-        remonter l'erreur. Les écritures étant désormais atomiques (`_save_index_meta`), un
-        retry suffit largement à retomber sur un fichier complet."""
-        for attempt in range(retries):
-            try:
-                with open(metadata_file, 'r', encoding='utf-8-sig') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, PermissionError, OSError):
-                if attempt == retries - 1:
-                    return None
-                time.sleep(delay)
-        return None
+        """Lit un metadata.json d'index en tolérant une écriture concurrente (cf.
+        `_read_json_retry`) : la génération le réécrit à chaque registre pour la progression."""
+        return _read_json_retry(metadata_file, retries, delay)
 
     @staticmethod
     def list_indexes() -> List[Dict[str, Any]]:
@@ -2481,10 +2530,14 @@ class IndexesService:
             out.append({"name": r.get('name'), "pages": r.get('pages', 0), "status": st})
         return out
 
-    # ── Fraîcheur d'un index (OCR ajouté depuis l'indexation) ──────────
+    # ── Fraîcheur et couverture d'un index ─────────────────────────────
     @staticmethod
     def _current_ocr_counts(col_dir: Path, model_name: str) -> Dict[str, int]:
-        """Nb de XML actuels par registre pour ce modèle (scan léger du dossier ocr)."""
+        """Nb de XML actuels par registre pour ce modèle, par **scan réel** du dossier ocr.
+
+        Source **autoritaire** mais coûteuse (un listing + deux `stat()` par registre, jusqu'à
+        1,4 s sur 25 000 XML à froid, davantage sur un partage réseau). Pour l'affichage on lui
+        préfère `CollectionsService.ocr_counts_from_metadata`, qui lit les compteurs publiés."""
         counts: Dict[str, int] = {}
         ocr_dir = col_dir / "ocr"
         if not ocr_dir.exists():
@@ -2500,61 +2553,168 @@ class IndexesService:
         return counts
 
     @staticmethod
-    def compute_updates(meta: Dict[str, Any]) -> Dict[str, Any]:
-        """Compare ce qui est indexé à l'OCR actuellement sur le disque.
-        Retourne {new_registres, new_pages, coverage_known}.
+    def _make_ocr_counts_fn(rescan: bool = False):
+        """Fabrique la fonction de comptage OCR d'**une** requête :
+        `(collection_id, model_name) -> {registre: pages} | None` (None = collection
+        introuvable ou illisible, à distinguer de `{}` = aucune page pour ce modèle).
 
-        - Index avec `coverage` (générés avec le suivi) → détail précis (registres + pages),
-          scan léger du dossier ocr uniquement.
-        - Index plus anciens (sans `coverage`) → comparaison grossière par nombre de registres
-          (on ne lit PAS l'index.json, qui peut peser >100 Mo) ; une reconstruction passe
-          l'index en suivi précis."""
-        unknown = {"new_registres": 0, "new_pages": 0, "coverage_known": True}
+        `rescan=False` (défaut) lit les compteurs publiés dans le metadata de la collection
+        (~0,5 ms) ; `rescan=True` scanne réellement les dossiers OCR (autoritaire, lent).
+
+        Trois mémoïsations, car une même liste d'index interroge plusieurs fois les mêmes
+        couples : la résolution de collection (qui peut ouvrir tous les metadata quand l'id
+        diffère du nom de dossier), le metadata lu (une seule lecture même pour deux modèles
+        d'une même collection) et le comptage lui-même.
+
+        Volontairement **borné à la requête** : un cache inter-requêtes empêcherait un poste de
+        voir ce qu'un autre poste vient de publier dans le metadata partagé. Le dict retourné
+        est partagé entre appels d'un même couple — aucun appelant ne doit le muter."""
+        dir_cache: Dict[str, Optional[Path]] = {}
+        meta_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        counts_cache: Dict[tuple, Optional[Dict[str, int]]] = {}
+
+        def counts_fn(collection_id: Optional[str], model_name: str) -> Optional[Dict[str, int]]:
+            key = (collection_id, model_name)
+            if key in counts_cache:
+                return counts_cache[key]
+            if collection_id not in dir_cache:   # mémoïser aussi le résultat négatif (None)
+                dir_cache[collection_id] = (
+                    IndexesService._resolve_collection_folder(collection_id) if collection_id else None)
+            col_dir = dir_cache[collection_id]
+            if col_dir is None:
+                counts_cache[key] = None
+                return None
+            if rescan:
+                result = IndexesService._current_ocr_counts(col_dir, model_name)
+            else:
+                ck = str(col_dir)
+                if ck not in meta_cache:
+                    meta_cache[ck] = _read_json_retry(col_dir / "metadata.json")
+                meta = meta_cache[ck]
+                result = (None if meta is None
+                          else CollectionsService.ocr_counts_from_meta(meta, model_name))
+            counts_cache[key] = result
+            return result
+
+        return counts_fn
+
+    @staticmethod
+    def _blank_updates(rescan: bool = False, coverage_known: bool = True) -> Dict[str, Any]:
+        """Réponse « rien à signaler » : ni delta, ni couverture exploitable."""
+        return {"new_registres": 0, "new_pages": 0, "coverage_known": coverage_known,
+                "indexed_pages": None, "ocr_pages": None, "stale_pages": 0,
+                "rescanned": rescan, "sources": []}
+
+    @staticmethod
+    def compute_updates(meta: Dict[str, Any], *, rescan: bool = False,
+                        counts_fn=None) -> Dict[str, Any]:
+        """Compare ce qui est indexé à l'OCR disponible : delta **et** couverture.
+
+        - Index avec `coverage` (générés avec le suivi) → détail précis, par source.
+        - Index plus anciens (sans `coverage`) → `coverage_known: False`, et pour un index
+          mono-source un signal grossier par nombre de registres (on ne lit PAS l'index.json,
+          qui peut peser >100 Mo) ; une mise à jour passe l'index en suivi précis.
+
+        `counts_fn` permet de partager les mémoïsations sur toute une liste d'index (cf.
+        `list_updates`) ; il doit alors correspondre au `rescan` passé, qui n'est plus utilisé
+        que pour renseigner `rescanned`."""
         if meta.get('status') != 'ready':
-            return unknown
+            return IndexesService._blank_updates(rescan)
+        if counts_fn is None:
+            counts_fn = IndexesService._make_ocr_counts_fn(rescan)
 
+        SEP = IndexesService.SOURCE_SEP
         coverage = meta.get('coverage')
         sources = meta.get('sources')
+        legacy = not sources
 
-        # Multi-sources : compare l'OCR actuel de chaque source à sa couverture (clés 'key::reg').
-        if sources:
-            if coverage is None:
-                return {"new_registres": 0, "new_pages": 0, "coverage_known": False}
-            SEP = IndexesService.SOURCE_SEP
-            new_registres = new_pages = 0
-            for src in sources:
-                col_dir = IndexesService._resolve_collection_folder(src.get('collection_id'))
-                if not col_dir:
-                    continue
-                current = IndexesService._current_ocr_counts(col_dir, src.get('model_name', ''))
-                for reg, n in current.items():
-                    reg_key = f"{src['key']}{SEP}{reg}"
-                    if reg_key not in coverage:
-                        new_registres += 1
-                    new_pages += max(0, n - coverage.get(reg_key, 0))
-            return {"new_registres": new_registres, "new_pages": new_pages, "coverage_known": True}
+        if legacy:
+            # Ancien index mono-source : ses clés de couverture sont des noms de registres nus.
+            col_ref = meta.get('collection_folder') or meta.get('collection_id')
+            if not col_ref:
+                return IndexesService._blank_updates(rescan)
+            sources = [{"key": None, "collection_id": col_ref, "collection_folder": col_ref,
+                        "collection_titre": None, "model_name": meta.get('model_name') or ''}]
+        elif coverage is None:
+            # Multi-sources sans couverture : rien de comparable, et inutile de scanner.
+            return IndexesService._blank_updates(rescan, coverage_known=False)
 
-        # ── Legacy (mono-source) ──────────────────────────────────────────────
-        col_ref = meta.get('collection_folder') or meta.get('collection_id')
-        col_dir = IndexesService._resolve_collection_folder(col_ref) if col_ref else None
-        if not col_dir:
-            return unknown
+        per_source: List[Dict[str, Any]] = []
+        new_registres = new_pages = 0
+        total_ocr = total_registres = 0
+        any_resolved = False
+        all_resolved = True
 
-        current = IndexesService._current_ocr_counts(col_dir, meta.get('model_name', ''))
+        for src in sources:
+            counts = counts_fn(src.get('collection_id'), src.get('model_name') or '')
+            entry = {
+                "key": src.get('key'),
+                "collection_folder": src.get('collection_folder') or src.get('collection_id') or '',
+                "collection_titre": src.get('collection_titre'),
+                "model_name": src.get('model_name') or '',
+                "resolved": counts is not None,
+                "indexed_pages": None, "ocr_pages": None,
+                "new_registres": 0, "new_pages": 0,
+            }
+            if counts is None:
+                all_resolved = False
+            else:
+                any_resolved = True
+                entry["ocr_pages"] = sum(counts.values())
+                total_ocr += entry["ocr_pages"]
+                total_registres += len(counts)
+                if coverage is not None:
+                    prefix = None if src['key'] is None else f"{src['key']}{SEP}"
+                    entry["indexed_pages"] = (
+                        sum(coverage.values()) if prefix is None
+                        else sum(v for k, v in coverage.items() if k.startswith(prefix)))
+                    for reg, n in counts.items():
+                        reg_key = reg if prefix is None else f"{prefix}{reg}"
+                        if reg_key not in coverage:
+                            entry["new_registres"] += 1
+                        entry["new_pages"] += max(0, n - coverage.get(reg_key, 0))
+                    new_registres += entry["new_registres"]
+                    new_pages += entry["new_pages"]
+            per_source.append(entry)
 
-        if coverage is not None:
-            new_registres = sum(1 for reg in current if reg not in coverage)
-            new_pages = sum(max(0, n - coverage.get(reg, 0)) for reg, n in current.items())
-            return {"new_registres": new_registres, "new_pages": new_pages, "coverage_known": True}
+        if legacy and not any_resolved:
+            return IndexesService._blank_updates(rescan)
 
-        # Sans couverture : signal grossier (nouveaux registres) sans lire le gros index.json.
-        # Uniquement si on dispose d'un registres_count fiable, sinon on n'alarme pas
-        # (un vieil index sans cette stat semblerait avoir « tous » ses registres nouveaux).
-        indexed_regs = (meta.get('stats') or {}).get('registres_count')
-        if not indexed_regs:
-            return unknown
-        new_registres = max(0, len(current) - indexed_regs)
-        return {"new_registres": new_registres, "new_pages": 0, "coverage_known": False}
+        if coverage is None:
+            # Legacy sans couverture : signal grossier par nombre de registres, et uniquement si
+            # `registres_count` est fiable — sinon un vieil index semblerait tout avoir de neuf.
+            indexed_regs = (meta.get('stats') or {}).get('registres_count')
+            if not indexed_regs:
+                return IndexesService._blank_updates(rescan)
+            out = IndexesService._blank_updates(rescan, coverage_known=False)
+            out["new_registres"] = max(0, total_registres - indexed_regs)
+            out["ocr_pages"] = total_ocr
+            out["sources"] = per_source
+            return out
+
+        indexed_pages = sum(coverage.values())
+        ocr_pages = total_ocr if any_resolved else None
+        # `stale_pages` n'a de sens que si tout l'OCR a pu être compté : une source introuvable
+        # ferait passer ses pages indexées pour des pages disparues.
+        stale = max(0, indexed_pages - total_ocr) if all_resolved else 0
+        return {"new_registres": new_registres, "new_pages": new_pages, "coverage_known": True,
+                "indexed_pages": indexed_pages, "ocr_pages": ocr_pages, "stale_pages": stale,
+                "rescanned": rescan, "sources": per_source}
+
+    @staticmethod
+    def list_updates(rescan: bool = False) -> List[Dict[str, Any]]:
+        """Fraîcheur et couverture de **chaque** index prêt.
+
+        Un seul `counts_fn` pour toute la liste : un couple (collection, modèle) partagé par
+        plusieurs index n'est compté qu'une fois."""
+        counts_fn = IndexesService._make_ocr_counts_fn(rescan)
+        out: List[Dict[str, Any]] = []
+        for meta in IndexesService.list_indexes():
+            if meta.get('status') != 'ready':
+                continue
+            out.append({"id": meta['id'],
+                        **IndexesService.compute_updates(meta, rescan=rescan, counts_fn=counts_fn)})
+        return out
 
 
 class TranscriptionsService:

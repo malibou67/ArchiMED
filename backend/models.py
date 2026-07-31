@@ -144,6 +144,32 @@ class IndexMetadata(BaseModel):
     progress: Optional[IndexProgress] = None
     build: Optional[IndexBuild] = None
 
+class IndexSourceCoverage(BaseModel):
+    """Couverture d'une source d'un index : pages indexées vs pages OCR disponibles."""
+    model_config = ConfigDict(protected_namespaces=())
+
+    key: Optional[str] = None      # None pour un ancien index mono-source
+    collection_folder: str
+    collection_titre: Optional[str] = None
+    model_name: str
+    resolved: bool = True          # False : collection introuvable ou metadata illisible
+    indexed_pages: Optional[int] = None
+    ocr_pages: Optional[int] = None
+    new_registres: int = 0
+    new_pages: int = 0
+
+class IndexUpdates(BaseModel):
+    """Fraîcheur et couverture d'un index prêt (cf. GET /api/indexes/updates)."""
+    id: str
+    new_registres: int = 0
+    new_pages: int = 0
+    coverage_known: bool = True    # False : index construit avant le suivi de couverture
+    indexed_pages: Optional[int] = None
+    ocr_pages: Optional[int] = None
+    stale_pages: int = 0           # pages indexées dont l'OCR n'existe plus
+    rescanned: bool = False        # les compteurs viennent d'un scan disque, pas de l'ocr_status
+    sources: List[IndexSourceCoverage] = []
+
 class IndexCreate(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 

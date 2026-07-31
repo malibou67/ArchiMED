@@ -4,6 +4,7 @@ import {
   IndexCreate,
   IndexUpdate,
   IndexSource,
+  IndexUpdates,
   IndexPreview,
   MultiSearchResponse,
   VocabularyResponse,
@@ -20,8 +21,14 @@ export const indexesApi = {
     return response.data;
   },
 
-  getUpdates: async (): Promise<{ id: string; new_registres: number; new_pages: number; coverage_known: boolean }[]> => {
-    const response = await api.get('/api/indexes/updates', { timeout: 0 });
+  // Couverture et fraîcheur de chaque index prêt. Par défaut les compteurs OCR viennent des
+  // `ocr_status` publiés (quelques ms) ; `rescan` scanne les dossiers — exact même si des XML ont
+  // été déposés hors de l'application, mais lent, d'où le timeout désactivé.
+  getUpdates: async (rescan = false): Promise<IndexUpdates[]> => {
+    const response = await api.get('/api/indexes/updates', {
+      params: rescan ? { rescan: true } : undefined,
+      timeout: 0,
+    });
     return response.data;
   },
 

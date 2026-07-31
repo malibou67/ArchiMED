@@ -154,6 +154,15 @@ register's `ocr_status` is refreshed in the collection metadata
 `sync_collection_metadata`) and its name is appended to the task's `registres_done`, which the OCR
 page watches to reload its counters mid-run.
 
+That published `ocr_status` is also what feeds the Indexes page: `GET /api/indexes/updates` reports
+each index's coverage (`indexed_pages / ocr_pages`) by reading one metadata file per collection —
+about half a millisecond — instead of walking the OCR folders, which costs over a second per
+(collection, model) on a cold cache. Being *published* rather than observed, it can lag behind: XML
+copied or deleted outside the app, an OCR process killed before its cleanup, or a register present
+in `ocr/` but absent from `registres[]`. The consequence is purely cosmetic — index generation never
+consults `ocr_status`, its first pass really scans the folders, so an update never misses pages
+whatever the badge showed. "Refresh the list" (`?rescan=true`) forces the real scan.
+
 The runner **never** calls `sync_collection_metadata` when it finishes, only the same targeted
 refresh for registers a cancellation or an error left half-done. A task is only marked `done`
 once its runner returns, so any work in that path delays the status: rebuilding a whole
@@ -177,7 +186,11 @@ Since every machine both reads and writes that folder, three rules keep them con
 - **Atomic writes.** Task files (`data/tasks/<id>.json`) and collection metadata are written to a
   temporary file then `os.replace`d. Writing in place would expose a truncated JSON to the other
   machines polling it — and a decode error makes a perfectly live scope lock look stale, hence
-  reusable.
+  reusable. This is also what makes published counters usable across machines: the PC running an
+  OCR rewrites the shared collection metadata register by register, so the others read its
+  `ocr_status` instead of listing thousands of files over SMB (see the Indexes page above). Caches
+  built on it must therefore stay scoped to a single request — a longer-lived one would hide what
+  another machine just published.
 - **Liveness by heartbeat.** A `running` task whose heartbeat is older than `HEARTBEAT_STALE`
   (60 s) is considered dead: its scope is released and its lock in `data/locks/` can be reclaimed.
   The supervisor thread keeps that heartbeat fresh independently of the runner's pace, so a slow
