@@ -144,11 +144,17 @@ function IndexProgress({ progress, rebuild }: { progress?: IndexProgressType; re
   return <LinearProgress variant="indeterminate" color={rebuild ? 'info' : 'warning'} sx={{ height: 5, borderRadius: 3 }} />;
 }
 
-// Part de l'OCR disponible réellement présente dans l'index, avec le détail par source au survol.
+// Part de l'OCR disponible réellement présente dans l'index. Porte à elle seule ce qui reste à
+// indexer : le nombre de pages manquantes se lit dans le ratio, un badge séparé ne ferait que
+// répéter la même information. `onIndex` (fourni quand il y a du nouveau) la rend cliquable.
 // Composant local : les trois autres indicateurs de couverture de l'app (CollectionsPage,
 // QualityCard, CollectionStatsDashboard) sont eux aussi locaux — les factoriser est un chantier
 // à part. On en reprend en revanche la règle du « pas de 100 % trompeur par arrondi ».
-function IndexCoverage({ updates, locale }: { updates?: IndexUpdates; locale: string }) {
+function IndexCoverage({ updates, locale, onIndex }: {
+  updates?: IndexUpdates;
+  locale: string;
+  onIndex?: () => void;
+}) {
   const { t } = useTranslation('indexes');
   if (!updates) return null;
   const fmtN = (n: number) => n.toLocaleString(locale);
@@ -190,6 +196,14 @@ function IndexCoverage({ updates, locale }: { updates?: IndexUpdates; locale: st
       {updates.stale_pages > 0 && (
         <span>{t('list.coverageStale', { count: updates.stale_pages, val: fmtN(updates.stale_pages) })}</span>
       )}
+      {onIndex && (
+        <Typography variant="caption" fontWeight={600} sx={{ mt: 0.5 }}>
+          {[
+            updates.new_pages > 0 && t('list.newPages', { count: updates.new_pages, val: fmtN(updates.new_pages) }),
+            updates.new_registres > 0 && t('list.newRegistres', { count: updates.new_registres }),
+          ].filter(Boolean).join(' · ')} {t('list.toIndex')} — {t('list.coverageClickHint')}
+        </Typography>
+      )}
       <Typography variant="caption" color="text.disabled" sx={{ mt: 0.5 }}>
         {t(updates.rescanned ? 'list.coverageFreshnessScanned' : 'list.coverageFreshness')}
       </Typography>
@@ -198,14 +212,22 @@ function IndexCoverage({ updates, locale }: { updates?: IndexUpdates; locale: st
 
   return (
     <Tooltip title={tooltip} arrow>
-      <Box sx={{ mt: 0.25, cursor: 'help' }}>
-        <Typography variant="caption" color="text.secondary">
+      <Box
+        onClick={onIndex}
+        sx={{ mt: 0.25, cursor: onIndex ? 'pointer' : 'help' }}
+      >
+        <Typography variant="caption" color={onIndex ? 'warning.dark' : 'text.secondary'} fontWeight={onIndex ? 600 : 400}>
           {t('list.coverage', { val: fmtN(indexed), total: fmtN(ocr), pct })}
         </Typography>
         {/* Pas de barre quand tout est indexé : une barre pleine sur chaque ligne n'est que du
             bruit, et son absence rend un index incomplet immédiatement repérable. */}
         {!complete && (
-          <LinearProgress variant="determinate" value={pct} sx={{ height: 4, borderRadius: 2, mt: 0.25 }} />
+          <LinearProgress
+            variant="determinate"
+            value={pct}
+            color={onIndex ? 'warning' : 'primary'}
+            sx={{ height: 4, borderRadius: 2, mt: 0.25 }}
+          />
         )}
       </Box>
     </Tooltip>
@@ -906,25 +928,11 @@ export default function IndexesPage() {
                             <Typography variant="caption" color="text.disabled">
                               {t('list.registresCount', { count: index.stats.registres_count })} · {t('list.occAbbr', { val: index.stats.total_word_occurrences.toLocaleString(locale) })}
                             </Typography>
-                            <IndexCoverage updates={updates} locale={locale} />
-                            {hasNew && (
-                              <Tooltip title={t('list.updatesTooltip')} arrow>
-                                <Chip
-                                  size="small"
-                                  color="warning"
-                                  variant="outlined"
-                                  icon={<SyncIcon sx={{ fontSize: '13px !important' }} />}
-                                  onClick={() => handleRegenerate(index)}
-                                  label={(() => {
-                                    const parts = [];
-                                    if (updates.new_pages > 0) parts.push(t('list.newPages', { count: updates.new_pages, val: updates.new_pages.toLocaleString(locale) }));
-                                    if (updates.new_registres > 0) parts.push(t('list.newRegistres', { count: updates.new_registres }));
-                                    return `${parts.join(' · ')} ${t('list.toIndex')}`;
-                                  })()}
-                                  sx={{ mt: 0.5, cursor: 'pointer', fontWeight: 500 }}
-                                />
-                              </Tooltip>
-                            )}
+                            <IndexCoverage
+                              updates={updates}
+                              locale={locale}
+                              onIndex={hasNew ? () => handleRegenerate(index) : undefined}
+                            />
                           </Box>
                         ) : (
                           <Typography variant="body2" color="text.disabled">—</Typography>
