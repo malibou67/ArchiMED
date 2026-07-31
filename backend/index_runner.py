@@ -9,12 +9,18 @@ from services import IndexesService
 from task_service import TaskService
 
 
-def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional[str] = None) -> dict:
+def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional[str] = None,
+                  full: bool = False) -> dict:
     """Ajoute une tâche d'indexation à la lane 'index'.
 
     Deux usages :
       - **nouvel index** : `create = {name, sources:[{collection_id, model_name}]}` ;
-      - **reconstruction** : `index_id` d'un index existant (ses sources/nom sont relus).
+      - **mise à jour** : `index_id` d'un index existant (ses sources/nom sont relus). Elle est
+        incrémentale par défaut ; `full=True` force la réindexation de tous les registres.
+
+    `full` voyage dans la tâche (`index_full`) plutôt que dans le metadata de l'index : les
+    champs de tâche sont persistés tels quels et survivent donc à une pause, une reprise ou un
+    redémarrage de l'application.
 
     L'index est matérialisé AVANT l'enfilage pour que le runner trouve son metadata et que la
     ligne apparaisse immédiatement ; en cas de conflit de scope, on annule la matérialisation.
@@ -38,12 +44,14 @@ def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional
         sources_info = IndexesService._resolve_sources(create['sources'])
         index_id = IndexesService._new_index_id(name)
         is_new = True
+        full = True   # rien à réutiliser pour un index qui n'existe pas encore
 
     registres: List[Dict[str, Any]] = IndexesService.list_sources_registres(sources_info)
     fields = {
         'index_id': index_id,
         'index_name': name,
         'index_is_new': is_new,
+        'index_full': bool(full),
         'index_registres': registres,
         # Résumé compact des sources (collection + modèle) pour l'affichage des tâches
         # multi-collections/modèles ; l'ancien couple collection_id/model_name ne suffit plus.
@@ -98,9 +106,16 @@ def run_index_task(task: dict) -> None:
     def should_pause() -> bool:
         return bool(task.get('pause'))
 
+    def on_plan(skipped: list) -> None:
+        # Registres conservés par la mise à jour incrémentale : déjà comptés dans `processed`,
+        # ils doivent être affichés 'done' d'emblée dans le détail de la tâche.
+        task['index_skipped'] = skipped
+        TaskService._save(task)
+
     result = IndexesService.generate_index(
         index_id,
         on_progress=on_progress, should_cancel=should_cancel, should_pause=should_pause,
+        full=bool(task.get('index_full')), on_plan=on_plan,
     )
 
     if result == 'paused':

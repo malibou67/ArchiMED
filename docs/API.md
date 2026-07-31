@@ -53,8 +53,8 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `GET /api/indexes/{index_id}` — Index metadata and status
 - `POST /api/indexes/generate` — Enqueue a (multi-source) index build (background task)
 - `POST /api/indexes/preview` — Preview the registers/pages of the selected sources before building
-- `POST /api/indexes/{index_id}/regenerate` — Rebuild an existing index from its own sources
-- `PATCH /api/indexes/{index_id}` — Rename or change the sources (re-enqueues a build if sources change)
+- `POST /api/indexes/{index_id}/regenerate[?full=true]` — Update an existing index from its own sources. Incremental by default (only new or modified registers are re-read); `full=true` reindexes everything
+- `PATCH /api/indexes/{index_id}` — Rename or change the sources (re-enqueues a **full** build if sources change)
 - `DELETE /api/indexes/{index_id}` — Delete an index
 - `GET /api/indexes/available-models` — OCR models available for a collection (`?collection_id=…`)
 - `GET /api/indexes/updates` — New registers/pages that appeared since each ready index was built

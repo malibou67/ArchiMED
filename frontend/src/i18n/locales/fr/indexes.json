@@ -51,7 +51,8 @@
   "success": {
     "updated": "Index mis à jour — reconstruction en cours, suivez la progression dans Tâches.",
     "queued": "Indexation ajoutée à la file — suivez la progression dans Tâches.",
-    "rebuildQueued": "Reconstruction ajoutée à la file — l'index reste consultable jusqu'à la fin.",
+    "updateQueued": "Mise à jour ajoutée à la file — seules les pages nouvelles ou modifiées seront réindexées.",
+    "fullRebuildQueued": "Reconstruction complète ajoutée à la file — l'index reste consultable jusqu'à la fin.",
     "cancelled": "Indexation annulée.",
     "pausing": "Mise en pause en cours — reprise possible depuis Tâches.",
     "resumed": "Indexation reprise.",
@@ -74,7 +75,8 @@
     "newPages_other": "+{{val}} pages",
     "newRegistres_one": "+{{count}} registre",
     "newRegistres_other": "+{{count}} registres",
-    "toIndex": "à indexer"
+    "toIndex": "à indexer",
+    "updatesTooltip": "De nouvelles transcriptions OCR sont disponibles depuis l'indexation. Cliquez pour les indexer."
   },
   "table": {
     "index": "Index",
@@ -94,11 +96,18 @@
     "cancelling": "Annulation en cours…",
     "edit": "Modifier (nom, collections, modèles)",
     "update": "Mettre à jour l'index (nouvelles transcriptions disponibles)",
-    "rebuild": "Reconstruire l'index",
+    "updateGeneric": "Mettre à jour l'index (indexer les nouvelles transcriptions)",
+    "fullRebuild": "Reconstruction complète (tout réindexer)",
+    "more": "Autres actions",
     "delete": "Supprimer"
   },
   "deleteDialog": {
     "title": "Supprimer l'index",
     "confirm": "Supprimer l'index <strong>{{name}}</strong> ? Cette action est irréversible."
+  },
+  "fullRebuildDialog": {
+    "title": "Reconstruction complète",
+    "confirm": "Réindexer entièrement l'index <strong>{{name}}</strong> ? Toutes les pages seront relues, ce qui peut prendre très longtemps. Une simple mise à jour suffit pour prendre en compte les nouvelles transcriptions.",
+    "cta": "Tout réindexer"
   }
 }

@@ -1153,6 +1153,10 @@ class IndexesService:
     # Séparateur de namespace des pages/registres par source (URL- & JSON-safe).
     SOURCE_SEP = "::"
 
+    # Version du bloc `index_state` (metadata.json) qui permet la mise à jour incrémentale.
+    # Un index dont l'état porte une autre version est reconstruit intégralement.
+    INDEX_STATE_VERSION = 1
+
     @staticmethod
     def _slugify(name: str) -> str:
         """Slug ASCII sûr pour un nom de fichier/dossier. 'index' si vide."""
@@ -1337,9 +1341,161 @@ class IndexesService:
             except OSError:
                 pass
 
+    # ── Mise à jour incrémentale : empreintes et purge ────────────────────────
+    @staticmethod
+    def _scan_registre_xml(model_dir: Path) -> tuple:
+        """Liste les XML d'un registre et calcule son empreinte.
+        Retourne `(xml_files triés, {"pages": n, "sig": "<hex>"})`.
+
+        Un seul `os.scandir` : sous Windows, `DirEntry.stat()` est servi par l'entrée de
+        répertoire elle-même, donc lister 40 000 fichiers avec leur taille/mtime ne coûte pas
+        plus cher que de les lister — y compris sur un partage réseau, où un `stat()` par
+        fichier serait rédhibitoire.
+
+        Le filtre est insensible à la casse comme l'était `Path.glob("*.xml")` sous Windows :
+        un `.XML` deviendrait invisible avec une comparaison stricte."""
+        import hashlib
+        entries: List[tuple] = []   # (nom, taille, mtime)
+        try:
+            with os.scandir(model_dir) as it:
+                for e in it:
+                    if not e.name.lower().endswith('.xml'):
+                        continue
+                    try:
+                        st = e.stat()
+                    except OSError:
+                        continue
+                    entries.append((e.name, st.st_size, int(st.st_mtime)))
+        except OSError:
+            return [], {"pages": 0, "sig": ""}
+
+        entries.sort()   # tri par nom : même ordre que l'ancien sorted(glob("*.xml"))
+        h = hashlib.blake2b(digest_size=8)
+        for name, size, mtime in entries:
+            h.update(f"{name}|{size}|{mtime}\n".encode('utf-8'))
+        xml_files = [model_dir / name for name, _s, _m in entries]
+        return xml_files, {"pages": len(entries), "sig": h.hexdigest()}
+
+    @staticmethod
+    def _sources_signature(sources_info: List[Dict[str, Any]]) -> str:
+        """Empreinte du mapping `clé de source → (collection, modèle)`.
+
+        Toute édition des sources décale les clés s0/s1/… et invalide donc les préfixes de page
+        (`s0::…`) de l'index existant : l'incrémental doit être refusé dans ce cas.
+        Volontairement indépendante de `collection_folder`/`collection_titre` : renommer une
+        collection ne change ni les noms de page ni les dossiers de registres.
+
+        Un `hash()` intégré ne conviendrait pas : il est randomisé par PYTHONHASHSEED et donc
+        instable d'un lancement à l'autre."""
+        import hashlib
+        h = hashlib.blake2b(digest_size=8)
+        for src in sources_info:
+            h.update(f"{src.get('key')}|{src.get('collection_id')}|{src.get('model_name')}\n".encode('utf-8'))
+        return h.hexdigest()
+
+    @staticmethod
+    def _load_incremental_state(index_dir: Path, metadata: Dict[str, Any],
+                                sources_sig: str) -> Optional[Dict[str, Dict]]:
+        """État des registres du build précédent, ou `None` si l'incrémental est impossible
+        (→ reconstruction complète).
+
+        Refusé si : pas d'`index.json`, pas d'`index_state` (index construit avant l'arrivée du
+        suivi incrémental, dont tous les index legacy mono-source), version d'état inconnue, ou
+        sources différentes de celles de l'index existant."""
+        if not (index_dir / "index.json").exists():
+            return None
+        state = metadata.get('index_state')
+        if not isinstance(state, dict):
+            return None
+        if state.get('version') != IndexesService.INDEX_STATE_VERSION:
+            return None
+        if state.get('sources_sig') != sources_sig:
+            return None
+        registres = state.get('registres')
+        if not isinstance(registres, dict):
+            return None
+        return registres
+
+    @staticmethod
+    def _load_existing_words(index_file: Path,
+                             sources_info: List[Dict[str, Any]]) -> Optional[Dict[str, List[str]]]:
+        """Charge le dictionnaire de mots de l'index existant pour repartir de lui.
+        Retourne `None` si le fichier est inutilisable (→ reconstruction complète).
+
+        Second filet après `_load_incremental_state` : on vérifie que le bloc `sources` du
+        fichier décrit bien les mêmes sources, ce qui écarte un index au format legacy (pages
+        sans préfixe `sX::`, non purgeables par préfixe de registre) ou désynchronisé de son
+        metadata."""
+        try:
+            with open(index_file, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, MemoryError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        words = data.get('words')
+        if not isinstance(words, dict):
+            return None   # ancien format « dict plat » : pas de bloc sources exploitable
+        block = data.get('sources')
+        if not isinstance(block, dict):
+            return None
+        if set(block.keys()) != {s['key'] for s in sources_info}:
+            return None
+        for src in sources_info:
+            if block[src['key']].get('model_name') != src['model_name']:
+                return None
+        data = None   # libère le wrapper ; seul `words` (volumineux) est conservé
+        return words
+
+    @staticmethod
+    def _expand_prefix_conflicts(remove_keys: set, all_keys) -> set:
+        """Étend un jeu de registres à purger aux registres dont la clé en est un dérivé.
+
+        La purge s'appuie sur le préfixe `<reg_key>_` des noms de page. Si `s0::A` est purgé et
+        que `s0::A_B` existe, les pages `s0::A_B_12` seraient effacées alors que `s0::A_B`
+        resterait marqué « déjà indexé » — perte de mots silencieuse. On purge donc aussi les
+        registres emboîtés (et, transitivement, ceux qui s'emboîtent dans eux), comme le reste du
+        code qui résout une page vers son registre par le plus long préfixe."""
+        keys = list(all_keys)
+        out = set(remove_keys)
+        pending = list(out)
+        while pending:
+            rk = pending.pop()
+            for k in keys:
+                if k not in out and k.startswith(rk + '_'):
+                    out.add(k)
+                    pending.append(k)
+        return out
+
+    @staticmethod
+    def _purge_registres(words: Dict[str, List[str]], reg_keys) -> int:
+        """Retire des occurrences tous les mots appartenant aux registres donnés.
+        Retourne le nombre d'occurrences retirées.
+
+        Une page du registre `sX::REG` s'appelle toujours `sX::REG_<n>` : un unique
+        `str.startswith(tuple)` (boucle en C) par occurrence suffit. Les mots dont la liste se
+        vide sont supprimés pour que `total_unique_words` reste exact."""
+        prefixes = tuple(f"{rk}_" for rk in reg_keys)
+        if not prefixes:
+            return 0
+        removed = 0
+        empties: List[str] = []
+        for word, occs in words.items():   # mutation des valeurs seulement : taille constante
+            kept = [o for o in occs if not o.startswith(prefixes)]
+            if len(kept) != len(occs):
+                removed += len(occs) - len(kept)
+                if kept:
+                    words[word] = kept
+                else:
+                    empties.append(word)
+        for word in empties:
+            del words[word]
+        return removed
+
     @staticmethod
     def generate_index(index_id: str, on_progress=None,
-                       should_cancel=None, should_pause=None) -> str:
+                       should_cancel=None, should_pause=None,
+                       *, full: bool = False, on_plan=None) -> str:
         """Construit l'index multi-sources à partir des XML OCR.
         Retourne 'done' | 'cancelled' | 'paused'.
 
@@ -1348,7 +1504,19 @@ class IndexesService:
         **staging** puis basculé atomiquement (os.replace) : l'ancien index reste consultable
         pendant toute une reconstruction.
 
+        Par défaut la génération est **incrémentale** : l'index existant est rechargé, les
+        registres nouveaux ou modifiés (empreinte `index_state`) en sont purgés puis réindexés,
+        et les autres sont conservés tels quels. `full=True` réindexe tout (échappatoire quand
+        un XML a été modifié sans changer ni sa taille ni sa date). Comme `index.json` n'est
+        remplacé qu'à la toute fin, ce préchargement est idempotent : un run interrompu repart
+        proprement du même point de départ.
+
+        ⚠️ Un registre absent du disque est considéré comme supprimé et purgé de l'index. Si une
+        collection est momentanément indisponible (partage réseau déconnecté), ses pages sont
+        donc retirées — comme le ferait une reconstruction complète.
+
         `on_progress(processed, total, current)` rapporte l'avancement,
+        `on_plan(skipped_labels)` annonce les registres conservés (progression déjà acquise),
         `should_cancel()` arrête définitivement, `should_pause()` met en pause via checkpoint."""
         SEP = IndexesService.SOURCE_SEP
         index_dir = IndexesService.get_indexes_dir() / index_id
@@ -1390,16 +1558,28 @@ class IndexesService:
         # État, repris d'un checkpoint si l'indexation avait été mise en pause.
         mots_uniques: Dict[str, List[str]] = {}
         total_words = 0
-        done_registres: set = set()   # clés "key::registre"
+        done_registres: set = set()          # clés "key::registre"
+        done_state: Dict[str, Dict] = {}     # empreintes des registres réellement indexés
+        resumed = False
+        mode = 'full'
         if checkpoint_file.exists():
             try:
                 with open(checkpoint_file, 'r', encoding='utf-8-sig') as f:
                     cp = json.load(f)
-                mots_uniques = cp.get('words', {})
-                total_words = cp.get('total_words', 0)
-                done_registres = set(cp.get('done_registres', []))
+                # Un checkpoint sans 'mode' vient d'une version antérieure : traité comme 'full'.
+                cp_mode = cp.get('mode', 'full')
+                # Une reconstruction complète explicite ne doit pas hériter des registres qu'une
+                # mise à jour incrémentale interrompue avait marqués « déjà indexés » : elle serait
+                # silencieusement dégradée en incrémental (mark_rebuild ne purge pas le checkpoint).
+                if not (full and cp_mode == 'incremental'):
+                    mots_uniques = cp.get('words', {})
+                    total_words = cp.get('total_words', 0)
+                    done_registres = set(cp.get('done_registres', []))
+                    done_state = cp.get('done_state', {}) or {}
+                    resumed = True
+                    mode = cp_mode
             except (OSError, json.JSONDecodeError):
-                pass
+                pass   # checkpoint illisible : on repart de zéro (reconstruction complète)
 
         def _save_checkpoint() -> None:
             # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
@@ -1407,8 +1587,9 @@ class IndexesService:
             tmp = checkpoint_file.with_name(checkpoint_file.name + '.tmp')
             try:
                 with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump({"words": mots_uniques, "total_words": total_words,
-                               "done_registres": sorted(done_registres)}, f, ensure_ascii=False)
+                    json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,
+                               "done_registres": sorted(done_registres),
+                               "done_state": done_state}, f, ensure_ascii=False)
                 os.replace(tmp, checkpoint_file)
             except OSError:
                 try:
@@ -1418,8 +1599,12 @@ class IndexesService:
 
         try:
             # Première passe : lister (source, registre) et compter le total de XML.
-            # Chaque tâche porte sa source pour namespacer pages et registres.
-            registre_tasks: List[tuple] = []   # (src, reg_dir, xml_files, reg_key)
+            # Chaque tâche porte sa source pour namespacer pages et registres. L'empreinte de
+            # chaque registre est relevée ici, au moment où ses fichiers sont figés : elle décrit
+            # donc exactement ce qui sera indexé, même si des XML arrivent pendant le build.
+            sources_sig = IndexesService._sources_signature(sources_info)
+            registre_tasks: List[tuple] = []   # (src, reg_dir, xml_files, reg_key, reg_state)
+            current_state: Dict[str, Dict] = {}
             total_xml = 0
             for src in sources_info:
                 col_dir = IndexesService._resolve_collection_folder(src['collection_id'])
@@ -1434,14 +1619,56 @@ class IndexesService:
                     model_dir = reg_dir / src['model_name']
                     if not model_dir.exists():
                         continue
-                    xml_files = list(sorted(model_dir.glob("*.xml")))
+                    xml_files, reg_state = IndexesService._scan_registre_xml(model_dir)
                     if not xml_files:
                         continue
                     reg_key = f"{src['key']}{SEP}{reg_dir.name}"
-                    registre_tasks.append((src, reg_dir, xml_files, reg_key))
+                    registre_tasks.append((src, reg_dir, xml_files, reg_key, reg_state))
+                    current_state[reg_key] = reg_state
                     total_xml += len(xml_files)
 
-            processed = sum(len(xf) for _s, _rd, xf, rk in registre_tasks if rk in done_registres)
+            if resumed:
+                # Un registre a pu disparaître du disque pendant la pause : ses pages resteraient
+                # dans l'index alors qu'il n'est plus listé (registres_count sur-compterait).
+                orphans = set(done_registres) - set(current_state)
+                if orphans:
+                    to_drop = IndexesService._expand_prefix_conflicts(orphans, done_registres)
+                    IndexesService._purge_registres(mots_uniques, to_drop)
+                    done_registres -= to_drop
+                    done_state = {rk: st for rk, st in done_state.items() if rk in done_registres}
+                    total_words = sum(len(v) for v in mots_uniques.values())
+
+            elif not full:
+                # Mise à jour incrémentale : on repart de l'index existant, dont on ne purge que
+                # les registres nouveaux/modifiés/supprimés — les autres sont marqués « déjà
+                # indexés » et sautés par la deuxième passe, exactement comme à une reprise.
+                previous = IndexesService._load_incremental_state(index_dir, metadata, sources_sig)
+                if previous is not None:
+                    stale = {rk for rk, st in current_state.items()
+                             if previous.get(rk, {}).get('sig') != st['sig']}
+                    deleted = set(previous) - set(current_state)
+                    to_remove = IndexesService._expand_prefix_conflicts(
+                        stale | deleted, current_state.keys())
+                    words = IndexesService._load_existing_words(final_file, sources_info)
+                    if words is not None:
+                        mots_uniques = words
+                        IndexesService._purge_registres(mots_uniques, to_remove)
+                        # `total_words` compte une unité par occurrence stockée (_process_xml) :
+                        # il se recalcule donc exactement depuis le dictionnaire purgé.
+                        total_words = sum(len(v) for v in mots_uniques.values())
+                        done_registres = {rk for rk in current_state if rk not in to_remove}
+                        done_state = {rk: previous[rk] for rk in done_registres}
+                        mode = 'incremental'
+                    # words is None → index illisible/incompatible : reconstruction complète.
+
+            if on_plan is not None:
+                try:
+                    on_plan([IndexesService._source_label(rd.name, s)
+                             for s, rd, _xf, rk, _st in registre_tasks if rk in done_registres])
+                except Exception:
+                    pass
+
+            processed = sum(len(xf) for _s, _rd, xf, rk, _st in registre_tasks if rk in done_registres)
             _set_progress(processed, total_xml, None)
             if not _save_meta():
                 return 'cancelled'  # index supprimé
@@ -1450,9 +1677,13 @@ class IndexesService:
             # Deuxième passe : indexation, registre par registre (namespacé par source).
             # Checkpoint périodique (throttlé) : permet à une indexation *interrompue* (crash,
             # fermeture) de reprendre au dernier registre terminé, comme une pause explicite.
-            CHECKPOINT_THROTTLE_S = 15.0
+            # En mise à jour incrémentale il pèse d'emblée le poids de l'index entier : on
+            # l'espace, et on ne l'écrit que si un registre de plus a été traité depuis le dernier
+            # (sinon il n'apporte rien — le préchargement se refait en quelques secondes).
+            CHECKPOINT_THROTTLE_S = 60.0
             last_checkpoint_at = time.monotonic()
-            for src, reg_dir, xml_files, reg_key in registre_tasks:
+            last_checkpoint_done = len(done_registres)
+            for src, reg_dir, xml_files, reg_key, reg_state in registre_tasks:
                 if reg_key in done_registres:
                     continue
                 if _cancelled():
@@ -1473,13 +1704,16 @@ class IndexesService:
                     total_words = IndexesService._process_xml(xml_file, mots_uniques, total_words, page_prefix)
                     processed += 1
                 done_registres.add(reg_key)
+                done_state[reg_key] = reg_state
 
                 # Le checkpoint n'est écrit qu'entre registres complets : il ne reflète jamais un
                 # registre à moitié traité (cohérent avec le saut via done_registres à la reprise).
                 now = time.monotonic()
-                if now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S:
+                if (now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S
+                        and len(done_registres) > last_checkpoint_done):
                     _save_checkpoint()
                     last_checkpoint_at = now
+                    last_checkpoint_done = len(done_registres)
 
                 _set_progress(processed, total_xml, label)
                 if not _save_meta():
@@ -1553,7 +1787,18 @@ class IndexesService:
                 "year_min": min(year_values) if year_values else None,
                 "year_max": max(year_values) if year_values else None,
             }
-            metadata["coverage"] = {rk: len(xf) for _s, _rd, xf, rk in registre_tasks}
+            # `index_state` décrit ce qui est réellement dans l'index (empreinte relevée au
+            # moment où chaque registre a été traité), et fonde la prochaine mise à jour
+            # incrémentale. `coverage` en est dérivé : il alimente le badge de fraîcheur et le
+            # panneau Qualité OCR, et reste donc cohérent par construction.
+            for rk in done_registres:
+                done_state.setdefault(rk, current_state[rk])   # filet : checkpoint sans done_state
+            metadata["index_state"] = {
+                "version": IndexesService.INDEX_STATE_VERSION,
+                "sources_sig": sources_sig,
+                "registres": done_state,
+            }
+            metadata["coverage"] = {rk: st.get("pages", 0) for rk, st in done_state.items()}
             _save_meta()
             try:
                 checkpoint_file.unlink(missing_ok=True)  # plus de reprise nécessaire
@@ -2210,14 +2455,22 @@ class IndexesService:
     @staticmethod
     def task_registres(task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """État de chaque registre d'une tâche d'indexation. L'indexation étant séquentielle,
-        on déduit l'état depuis `processed` (nb de XML traités) : 'done' / 'current' / 'pending'."""
+        on déduit l'état depuis `processed` (nb de XML traités) : 'done' / 'current' / 'pending'.
+
+        En mise à jour incrémentale, les registres conservés (`index_skipped`) sont comptés dans
+        `processed` dès le départ sans être traités dans l'ordre : ils sont 'done' d'emblée et
+        sortis du cumul, qui ne déroule alors que les registres réellement réindexés."""
         regs = task.get('index_registres') or []
         processed = task.get('processed', 0)
         current = task.get('current')
         active = task.get('status') in ('running', 'paused')
+        skipped = set(task.get('index_skipped') or [])
         out: List[Dict[str, Any]] = []
-        cumulative = 0
+        cumulative = sum(r.get('pages', 0) for r in regs if r.get('name') in skipped)
         for r in regs:
+            if r.get('name') in skipped:
+                out.append({"name": r.get('name'), "pages": r.get('pages', 0), "status": 'done'})
+                continue
             cumulative += r.get('pages', 0)
             if cumulative <= processed:
                 st = 'done'

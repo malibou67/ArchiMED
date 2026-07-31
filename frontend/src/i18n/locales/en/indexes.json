@@ -51,7 +51,8 @@
   "success": {
     "updated": "Index updated — rebuild in progress, follow the progress in Tasks.",
     "queued": "Indexing added to the queue — follow the progress in Tasks.",
-    "rebuildQueued": "Rebuild added to the queue — the index stays available until it finishes.",
+    "updateQueued": "Update added to the queue — only new or modified pages will be reindexed.",
+    "fullRebuildQueued": "Full rebuild added to the queue — the index stays available until it finishes.",
     "cancelled": "Indexing cancelled.",
     "pausing": "Pausing — can be resumed from Tasks.",
     "resumed": "Indexing resumed.",
@@ -74,7 +75,8 @@
     "newPages_other": "+{{val}} pages",
     "newRegistres_one": "+{{count}} registre",
     "newRegistres_other": "+{{count}} registres",
-    "toIndex": "to index"
+    "toIndex": "to index",
+    "updatesTooltip": "New OCR transcriptions are available since the last indexing. Click to index them."
   },
   "table": {
     "index": "Index",
@@ -94,11 +96,18 @@
     "cancelling": "Cancelling…",
     "edit": "Edit (name, collections, models)",
     "update": "Update the index (new transcriptions available)",
-    "rebuild": "Rebuild the index",
+    "updateGeneric": "Update the index (index the new transcriptions)",
+    "fullRebuild": "Full rebuild (reindex everything)",
+    "more": "More actions",
     "delete": "Delete"
   },
   "deleteDialog": {
     "title": "Delete the index",
     "confirm": "Delete the index <strong>{{name}}</strong>? This action is irreversible."
+  },
+  "fullRebuildDialog": {
+    "title": "Full rebuild",
+    "confirm": "Fully reindex the index <strong>{{name}}</strong>? Every page will be read again, which can take a very long time. A simple update is enough to pick up new transcriptions.",
+    "cta": "Reindex everything"
   }
 }

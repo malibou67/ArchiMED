@@ -95,7 +95,8 @@ data/
 │   └── my-model_metadata.json
 ├── indexes/
 │   └── idx_20260115103000_hospital-index/
-│       ├── metadata.json           # id, name, sources, status, stats, build progress
+│       ├── metadata.json           # id, name, sources, status, stats, build progress,
+│       │                           # coverage + index_state (per-register fingerprints)
 │       └── index.json              # words → pages + bounding-box coordinates
 ├── tasks/
 │   ├── <task_id>.json              # Task state (queue, progress, checkpoint)
@@ -118,8 +119,10 @@ Long-running work — OCR runs and index builds — goes through a single generi
   survive a restart and are **resumed on startup** (`load_on_startup()` in `main.py`'s startup hook).
 - **Pause / resume / cancel** support, exposed through the `/api/tasks` router and the
   frontend Tasks page + global task widget. Both runners resume from a checkpoint rather than
-  starting over: index builds use `checkpoint.json`, OCR runs use the `page_states` array persisted
-  with the task (`0` to do, `1` done, `2` failed, `3` in flight) plus the PAGE-XML already on disk.
+  starting over: index builds use `checkpoint.json` (which records its `mode`, `full` or
+  `incremental`, so that an explicit full rebuild never inherits a half-done incremental update),
+  OCR runs use the `page_states` array persisted with the task (`0` to do, `1` done, `2` failed,
+  `3` in flight) plus the PAGE-XML already on disk.
 - **Pluggable runners**: `ocr_service` registers the `'ocr'` runner and `index_runner`
   registers the `'index'` runner (imported for their side effects in `main.py`).
 - A **supervisor thread** (one per process) refreshes the heartbeat of this machine's running
@@ -258,6 +261,16 @@ VITE_API_URL=http://localhost:38520
 - Index generation parses the PAGE-XML files, filters French stopwords, and stores
   bounding-box coordinates; search supports multiple terms, a year range, and optional
   fuzzy matching (RapidFuzz)
+- **Updating an index is incremental.** Each build records a per-register fingerprint
+  (`index_state` in `metadata.json`: file names, sizes and mtimes, hashed with blake2b) plus the
+  signature of its sources. A later update reloads the existing `index.json`, purges only the
+  registers that are new, modified or gone, and reindexes those — the rest is kept as is, and
+  shows up as already-done progress. Anything doubtful (no `index_state`, unknown version,
+  changed sources, unreadable `index.json`) falls back to a full rebuild, as does an explicit
+  “full rebuild” from the UI or `?full=true`. Since no existing index carries an `index_state`,
+  the first update after this feature ships is necessarily a full rebuild — it is the one that
+  writes the state. Note that a register missing from disk counts as deleted, so an unavailable
+  collection (disconnected network share) has its pages purged, exactly as a full rebuild would
 - Layered architecture: HTTP routers → business services → files
 - Long-running work runs through the [task engine](#background-tasks), not FastAPI
   `BackgroundTasks`

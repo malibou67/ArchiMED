@@ -46,13 +46,18 @@ def preview_index(data: IndexPreviewRequest):
 
 
 @router.post("/{index_id}/regenerate")
-def regenerate_index(index_id: str):
-    """Reconstruit un index existant (mêmes sources). L'index précédent reste consultable
-    jusqu'au basculement atomique en fin de génération."""
+def regenerate_index(
+    index_id: str,
+    full: bool = Query(False, description="Reconstruction complète (réindexe tous les registres) "
+                                          "au lieu d'une mise à jour incrémentale"),
+):
+    """Met à jour un index existant (mêmes sources) : seuls les registres nouveaux ou modifiés
+    sont réindexés, sauf si `full=true`. L'index précédent reste consultable jusqu'au
+    basculement atomique en fin de génération."""
     if IndexesService.get_index(index_id) is None:
         raise HTTPException(status_code=404, detail="Index non trouvé")
     try:
-        return enqueue_index(index_id=index_id)
+        return enqueue_index(index_id=index_id, full=full)
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
@@ -319,8 +324,9 @@ def get_page_image(index_id: str, page_name: str):
 
 @router.patch("/{index_id}", response_model=IndexMetadata)
 def update_index(index_id: str, data: IndexUpdate):
-    """Édite un index : renomme et/ou modifie ses sources. Si les sources changent,
-    une reconstruction est ré-enfilée automatiquement."""
+    """Édite un index : renomme et/ou modifie ses sources. Si les sources changent, une
+    reconstruction **complète** est ré-enfilée : les clés de namespace (s0, s1, …) se décalent,
+    donc rien de l'index précédent n'est réutilisable."""
     meta = IndexesService.update_index_meta(
         index_id,
         name=data.name,
@@ -330,7 +336,7 @@ def update_index(index_id: str, data: IndexUpdate):
         raise HTTPException(status_code=404, detail="Index non trouvé")
     if data.sources is not None:
         try:
-            enqueue_index(index_id=index_id)
+            enqueue_index(index_id=index_id, full=True)
         except TaskConflict as e:
             raise HTTPException(status_code=409, detail=str(e))
         except Exception as e:

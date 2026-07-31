@@ -48,9 +48,14 @@ export const indexesApi = {
     return response.data;
   },
 
-  // Reconstruit un index existant (mêmes sources) ; l'ancien reste consultable jusqu'au bout.
-  regenerate: async (indexId: string): Promise<Task> => {
-    const response = await api.post(`/api/indexes/${indexId}/regenerate`);
+  // Met à jour un index existant (mêmes sources) : seuls les registres nouveaux ou modifiés sont
+  // réindexés, sauf `full` qui réindexe tout. L'ancien index reste consultable jusqu'au bout.
+  regenerate: async (indexId: string, opts?: { full?: boolean }): Promise<Task> => {
+    const response = await api.post(
+      `/api/indexes/${indexId}/regenerate`,
+      null,
+      opts?.full ? { params: { full: true } } : undefined,
+    );
     return response.data;
   },
 

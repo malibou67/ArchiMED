@@ -1,0 +1,5 @@
+# Dépendances de développement uniquement (tests). Volontairement séparées de
+# requirements.txt, qui décrit l'environnement embarqué par PyInstaller.
+#   pip install -r backend/requirements-dev.txt
+#   python -m pytest backend/tests
+pytest==8.3.4

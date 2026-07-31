@@ -17,6 +17,7 @@ import {
   InputAdornment,
   LinearProgress,
   ListItemText,
+  Menu,
   MenuItem,
   Paper,
   Select,
@@ -42,6 +43,7 @@ import {
   Error as ErrorIcon,
   HourglassEmpty as HourglassIcon,
   Layers as LayersIcon,
+  MoreVert as MoreVertIcon,
   Search as SearchIcon,
   Pause as PauseIcon,
   PlayArrow as PlayArrowIcon,
@@ -460,6 +462,12 @@ export default function IndexesPage() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [indexToDelete, setIndexToDelete] = useState<string | null>(null);
 
+  // Menu « autres actions » d'une ligne + confirmation de reconstruction complète (opération
+  // longue : elle relit toutes les pages, contrairement à la mise à jour).
+  const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const [menuIndexId, setMenuIndexId] = useState<string | null>(null);
+  const [fullRebuildTarget, setFullRebuildTarget] = useState<IndexMetadata | null>(null);
+
   const [builderOpen, setBuilderOpen] = useState(false);
   const [builderMode, setBuilderMode] = useState<'create' | 'edit'>('create');
   const [editing, setEditing] = useState<IndexMetadata | null>(null);
@@ -534,14 +542,15 @@ export default function IndexesPage() {
     }
   };
 
-  const handleRegenerate = async (index: IndexMetadata) => {
+  // `full` : réindexe tous les registres au lieu des seuls nouveaux/modifiés.
+  const handleRegenerate = async (index: IndexMetadata, full = false) => {
     setRegeneratingIds(prev => new Set([...prev, index.id]));
     setError(null); setSuccess(null);
     try {
-      await indexesApi.regenerate(index.id);
+      await indexesApi.regenerate(index.id, { full });
       await refreshTasks();
       await loadIndexes();
-      setSuccess(t('success.rebuildQueued'));
+      setSuccess(t(full ? 'success.fullRebuildQueued' : 'success.updateQueued'));
     } catch (e: any) {
       setError(e?.response?.data?.detail ?? t('errors.rebuild'));
     } finally {
@@ -607,6 +616,14 @@ export default function IndexesPage() {
   }, [runningTasks]);
 
   const handleDeleteClick = (indexId: string) => { setIndexToDelete(indexId); setDeleteDialogOpen(true); };
+
+  const closeRowMenu = () => { setMenuAnchor(null); setMenuIndexId(null); };
+
+  const handleFullRebuildConfirm = async () => {
+    const target = fullRebuildTarget;
+    setFullRebuildTarget(null);
+    if (target) await handleRegenerate(target, true);
+  };
 
   const handleDeleteConfirm = async () => {
     if (!indexToDelete) return;
@@ -800,7 +817,7 @@ export default function IndexesPage() {
                               {t('list.registresCount', { count: index.stats.registres_count })} · {t('list.occAbbr', { val: index.stats.total_word_occurrences.toLocaleString(locale) })}
                             </Typography>
                             {updatesById[index.id] && (
-                              <Tooltip title="De nouvelles transcriptions OCR sont disponibles depuis l'indexation. Cliquez pour reconstruire l'index et les inclure." arrow>
+                              <Tooltip title={t('list.updatesTooltip')} arrow>
                                 <Chip
                                   size="small"
                                   color="warning"
@@ -907,7 +924,7 @@ export default function IndexesPage() {
                                   </IconButton>
                                 </span>
                               </Tooltip>
-                              <Tooltip title={updatesById[index.id] ? t('actions.update') : t('actions.rebuild')} arrow>
+                              <Tooltip title={updatesById[index.id] ? t('actions.update') : t('actions.updateGeneric')} arrow>
                                 <span>
                                   <IconButton size="small" color={updatesById[index.id] ? 'warning' : 'primary'} onClick={() => handleRegenerate(index)} disabled={isRegenerating}>
                                     {isRegenerating ? <CircularProgress size={16} /> : <SyncIcon fontSize="small" />}
@@ -918,6 +935,17 @@ export default function IndexesPage() {
                                 <span>
                                   <IconButton size="small" color="error" onClick={() => handleDeleteClick(index.id)} disabled={isRegenerating}>
                                     <DeleteIcon fontSize="small" />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                              <Tooltip title={t('actions.more')} arrow>
+                                <span>
+                                  <IconButton
+                                    size="small"
+                                    onClick={e => { setMenuAnchor(e.currentTarget); setMenuIndexId(index.id); }}
+                                    disabled={isRegenerating}
+                                  >
+                                    <MoreVertIcon fontSize="small" />
                                   </IconButton>
                                 </span>
                               </Tooltip>
@@ -945,6 +973,34 @@ export default function IndexesPage() {
         onClose={() => setBuilderOpen(false)}
         onSubmit={handleBuilderSubmit}
       />
+
+      {/* ── Menu : autres actions d'une ligne ───────────────── */}
+      <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={closeRowMenu}>
+        <MenuItem
+          onClick={() => {
+            setFullRebuildTarget(indexes.find(i => i.id === menuIndexId) ?? null);
+            closeRowMenu();
+          }}
+        >
+          <SyncIcon fontSize="small" sx={{ mr: 1.5 }} />
+          {t('actions.fullRebuild')}
+        </MenuItem>
+      </Menu>
+
+      {/* ── Dialog : Reconstruction complète ────────────────── */}
+      <Dialog open={Boolean(fullRebuildTarget)} onClose={() => setFullRebuildTarget(null)} maxWidth="sm" fullWidth slotProps={{ paper: { sx: { borderRadius: 3 } } }}>
+        <DialogTitle sx={{ pb: 0.5 }}>{t('fullRebuildDialog.title')}</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ mt: 1 }}>
+            <Trans t={t} i18nKey="fullRebuildDialog.confirm" components={{ strong: <strong /> }}
+              values={{ name: fullRebuildTarget?.name ?? fullRebuildTarget?.id }} />
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5, pt: 1 }}>
+          <Button onClick={() => setFullRebuildTarget(null)}>{t('common:actions.cancel')}</Button>
+          <Button onClick={handleFullRebuildConfirm} color="warning" variant="contained" disableElevation>{t('fullRebuildDialog.cta')}</Button>
+        </DialogActions>
+      </Dialog>
 
       {/* ── Dialog : Supprimer ──────────────────────────────── */}
       <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)} maxWidth="sm" fullWidth slotProps={{ paper: { sx: { borderRadius: 3 } } }}>
