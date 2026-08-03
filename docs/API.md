@@ -22,6 +22,7 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `POST /api/collections/` — Create a collection
 - `PUT /api/collections/{collection_id}` — Update a collection
 - `POST /api/collections/{collection_id}/sync` — Rebuild one collection's registers from the filesystem
+- `POST /api/collections/{collection_id}/sync/stream` — Same rebuild as an NDJSON stream, with per-register progress
 - `GET /api/collections/scan` — Scan `data/collections` and report the status of every collection/register
 - `GET /api/collections/scan/stream` — Same scan as an NDJSON progress stream
 - `POST /api/collections/sync-all` — Rebuild the register lists of every collection
@@ -66,7 +67,7 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `GET /api/indexes/{index_id}/search?q=…&year_from=…&year_to=…&fuzzy_threshold=…` — Full-text search (multiple terms, optional year range and fuzzy matching)
 - `GET /api/indexes/{index_id}/year-range` — Min/max year covered by the index
 - `GET /api/indexes/{index_id}/words` — Paginated vocabulary (filter / sort / stopwords / min occurrences)
-- `GET /api/indexes/{index_id}/words/{word}/pages` — Every page (with bounding-box coordinates) where a word occurs
+- `GET /api/indexes/{index_id}/words/{word}/pages` — Every page (with bounding-box coordinates) where a word occurs (declared as `{word:path}`, so a word containing `/` is accepted)
 - `GET /api/indexes/{index_id}/page-image/{page_name}` — Image of a matched page
 - `GET /api/indexes/{index_id}/stats/corpus` — Corpus statistics (top words, per register, per decade)
 - `GET /api/indexes/{index_id}/stats/term-frequency` — Term evolution over time (per decade)
@@ -96,7 +97,7 @@ The background task engine (OCR and index builds). See [ARCHITECTURE.md](ARCHITE
 
 ## Settings
 - `GET /api/settings` — Stored settings, effective values (UI > env > default) and system info (CPU, RAM, disk)
-- `PUT /api/settings` — Update OCR settings (`ocr_workers`, `ocr_threads_per_worker`, `ocr_mixed_precision`, `ocr_pool_min_pages`); a `null` value resets the key to its default
+- `PUT /api/settings` — Update OCR settings (`ocr_workers`, `ocr_threads_per_worker`, `ocr_mixed_precision`, `ocr_pool_min_pages`); a `null` value resets the key to its default. `ocr_mixed_precision` is still accepted but has no control in the UI — it is set through `OCR_MIXED_PRECISION` instead
 
 ## System
 - `GET /api/system/requirements` — Check that the environment can run Kraken OCR (Kraken, torch, torchvision, CUDA)

@@ -18,6 +18,9 @@ necessarily have an NVIDIA GPU.
 - **Windows desktop build already works**: `build.ps1` → PyInstaller → `dist/ArchiMED/ArchiMED.exe`
   with a system-tray icon. This is already the simplest channel for the Windows general
   public; only publication is missing.
+  > **Caveat**: `build.ps1` and `archiMED.spec` are excluded by `.gitignore` and absent from
+  > the repository — they only exist on the build machine. Versioning them is a prerequisite
+  > to every step below, since the CI workflow calls `pyinstaller archiMED.spec`.
 - **Weight**: `requirements.txt` forces the torch CUDA 12.8 build (~2.7 GB). A CPU torch build
   is ~200 MB and is enough for consultation/search (OCR is ~100× slower there but still works).
 - **Code is already server-portable**: `pystray` (Windows/desktop) is imported only inside the
@@ -87,7 +90,8 @@ this only as a development procedure.
 - [ ] `.github/workflows/release.yml`: triggered on a `v*` tag (+ `workflow_dispatch`),
       matrix `windows-latest` / `macos-latest`: npm build → pip install requirements-cpu
       + pystray + pyinstaller → `pyinstaller archiMED.spec` → zips attached to the release.
-- [ ] Check that `archiMED.spec` has nothing Windows-only (`.ico` icon, paths).
+- [ ] Version `build.ps1` and `archiMED.spec` (currently gitignored), then check that
+      `archiMED.spec` has nothing Windows-only (`.ico` icon, paths).
 - [ ] A "Distribution" section in the README (Windows / macOS / Docker / hosting), with the
       SmartScreen/Gatekeeper workarounds.
 - [ ] Publication: `git tag v1.0.0 && git push --tags` → CI builds and attaches the zips.

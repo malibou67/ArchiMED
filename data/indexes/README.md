@@ -38,11 +38,32 @@ indexes/
   "stats": {
     "total_unique_words": 12500,
     "total_word_occurrences": 85000,
+    "total_pages": 42590,
     "registres_count": 30,
     "year_min": 1830,
     "year_max": 1975
+  },
+  "coverage": {
+    "s0::my-register": 500
+  },
+  "index_state": {
+    "version": 1,
+    "sources_sig": "…",
+    "registres": {
+      "s0::my-register": { "pages": 500, "sig": "…" }
+    }
   }
 }
 ```
 
-Indexes can be regenerated at any time from the interface without data loss.
+Registers are namespaced by source key (`s0::`, `s1::…`) so that two collections can hold a
+register of the same name. `coverage` gives the number of indexed pages per register — it
+feeds the freshness badge of the Indexes page. `index_state` is the fingerprint of what the
+index actually contains (file names, sizes and mtimes hashed per register), which is what
+makes updates incremental. While a build is running, `metadata.json` also carries `progress`
+and `build`; both are cleared once it finishes.
+
+Indexes can be updated at any time from the interface without data loss. An update is
+**incremental** by default: only registers that are new, modified or gone are re-read. A full
+rebuild is triggered explicitly from the UI, and automatically when the sources change or the
+`index_state` above is missing or unreadable.

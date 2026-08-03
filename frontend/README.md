@@ -1,73 +1,42 @@
-# React + TypeScript + Vite
+# ArchiMED — frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript + Vite single-page application, served in production by the FastAPI
+backend. For the overall picture see [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md); for the
+endpoints this app calls, [docs/API.md](../docs/API.md).
 
-Currently, two official plugins are available:
+## Scripts
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev       # dev server on http://localhost:5173, proxies /api → localhost:38520
+npm run build     # tsc -b && vite build → output goes to ../backend/static/
+npm run lint      # eslint
+npm run preview   # serve the production build locally
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The dev proxy and the build output directory are both set in
+[vite.config.ts](vite.config.ts) — there is no frontend `.env`. In production the API is
+same-origin (FastAPI serves `backend/static/`), so `api/config.ts` keeps an empty `baseURL`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Source layout
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
 ```
+src/
+├── api/          # one module per backend router, over the shared Axios instance (config.ts)
+├── components/   # Layout, TaskWidget, Loader, DataDirGuard, PageImageViewer…
+│   ├── ocr/      # OCR launch bar and environment status chip
+│   └── stats/    # dashboards, charts and statistics cards
+├── context/      # React contexts: Loading, Header, Tasks
+├── pages/        # one file per route (Collections, Ocr, Indexes, Search, Tasks, Settings…)
+├── i18n/         # i18next setup + locales/{en,fr}/*.json — see i18n/README.md
+├── types.ts      # shared domain types (API-specific types live next to each api/*.ts)
+└── App.tsx       # routes + MUI theme
+```
+
+## Conventions
+
+- Material-UI v7 for every component; styling through the `sx` prop, no CSS modules.
+- Strict TypeScript: shared domain models in `types.ts`, request/response shapes exported
+  from the matching `api/*.ts`.
+- All user-facing text goes through `react-i18next` — never hard-code a string in the JSX.
+  See [src/i18n/README.md](src/i18n/README.md).

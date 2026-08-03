@@ -29,12 +29,14 @@ application via PyInstaller (standalone executable + system-tray icon).
 
 ```
 ArchiMED/
+├── data/                   # User data (see DATA_DIR; contents not versioned)
+│   ├── collections/        # Collections with scans and OCR results (XML)
+│   ├── models/             # Kraken OCR models (.mlmodel + <id>_metadata.json)
+│   ├── indexes/            # Generated full-text search indexes
+│   ├── tasks/              # Background task state (+ tasks/control/)
+│   ├── locks/              # Scope locks held by a running task
+│   └── settings.json       # OCR settings set from the UI
 ├── backend/
-│   ├── data/               # User data (see DATA_DIR; not versioned)
-│   │   ├── collections/    # Collections with scans and OCR results (XML)
-│   │   ├── models/         # Kraken OCR models (.mlmodel + <id>_metadata.json)
-│   │   ├── indexes/        # Generated full-text search indexes
-│   │   └── settings.json   # OCR settings set from the UI
 │   ├── routers/            # API routes (9 routers)
 │   │   ├── models.py
 │   │   ├── collections.py
@@ -56,7 +58,10 @@ ArchiMED/
 │   ├── settings_service.py # settings.json read/write
 │   ├── machine_identity.py # Per-machine identity (multi-PC deployment)
 │   ├── system_checks.py    # Kraken/torch readiness checks
-│   └── requirements.txt    # Python dependencies
+│   ├── tests/              # pytest suite (see Roadmap)
+│   ├── .env.example        # HOST / PORT / DATA_DIR
+│   ├── requirements.txt    # Python dependencies
+│   └── requirements-dev.txt # Test-only dependencies (pytest)
 ├── frontend/
 │   ├── src/
 │   │   ├── api/            # API clients (collections, registres, models, ocr, indexes, tasks, settings, system, transcriptions)
@@ -67,11 +72,15 @@ ArchiMED/
 │   │   ├── types.ts        # TypeScript types
 │   │   └── App.tsx         # Main application + MUI theme
 │   ├── vite.config.ts      # Build → backend/static/, proxy /api → localhost:38520
+│   ├── eslint.config.js
 │   └── package.json
-├── archiMED.spec           # PyInstaller configuration
-├── build.ps1               # Windows build script (frontend → PyInstaller)
+├── archiMED.spec           # PyInstaller configuration — local, NOT versioned
+├── build.ps1               # Windows build script — local, NOT versioned
 └── README.md
 ```
+
+> `archiMED.spec` and `build.ps1` are excluded by `.gitignore`: they exist on the build
+> machine but not in a fresh clone. See [DISTRIBUTION.md](DISTRIBUTION.md).
 
 ## Data structure
 
@@ -223,7 +232,8 @@ from the Settings page (stored in `data/settings.json`) or via environment varia
 
 - `OCR_WORKERS` — pages processed in parallel (default: adaptive, `max(1, min(4, cores/2))`)
 - `OCR_THREADS_PER_WORKER` — torch threads per worker (default `1`)
-- `OCR_MIXED_PRECISION` — enable mixed precision (default off)
+- `OCR_MIXED_PRECISION` — enable mixed precision (default off). Environment only: the toggle
+  was removed from the Settings page, even though the key is still accepted by `PUT /api/settings`
 - `OCR_POOL_MIN_PAGES` — minimum pages before using a worker pool (default `3`)
 - `OCR_GPU_VRAM_PER_WORKER_GB` — VRAM budget per CUDA worker (default `2`)
 - `OCR_GPU_VRAM_RESERVE_GB` — VRAM left to the desktop and to segmentation peaks (default `1.5`)
@@ -250,18 +260,19 @@ machine**, never when saving the setting, because `data/settings.json` is shared
 machines with different GPUs. A capped run records `workers_requested` / `workers_cap_reason`
 in its preflight, shown on the Tasks page.
 
-### Frontend (`.env`)
-```
-VITE_API_URL=http://localhost:38520
-```
+### Frontend
+
+Nothing to configure: the dev proxy (`/api` → `localhost:38520`) and the build output
+(`../backend/static/`) are both hard-coded in `frontend/vite.config.ts`, and the Axios
+instance uses an empty `baseURL` since production is same-origin.
 
 ## Technology stack
 
-- **Backend**: FastAPI 0.109, Python 3.10+, Pydantic v2, Uvicorn 0.27, Kraken 4.0+,
-  PyTorch 2.11 (CUDA 12.8 build for GPU acceleration), torchvision 0.26,
-  RapidFuzz (fuzzy search)
+- **Backend**: FastAPI 0.109, Python 3.10+, Pydantic v2, Uvicorn 0.27, Kraken 7.0,
+  PyTorch 2.10 (CUDA 12.8 build for GPU acceleration), torchvision 0.25,
+  RapidFuzz (fuzzy search) — pinned versions in `backend/requirements.txt`
 - **Frontend**: React 19, TypeScript, Vite 7, Material-UI (MUI) v7, `@mui/x-charts` v9,
-  React Router v7, i18next / react-i18next, Axios
+  React Router v7, i18next / react-i18next, Axios, JSZip (ZIP export)
 - **Styling**: Material-UI, CSS-in-JS (Emotion)
 - **Desktop**: PyInstaller, pystray (Windows system-tray icon)
 - **OCR format**: PAGE-XML (Kraken / eScriptorium)
@@ -300,6 +311,9 @@ VITE_API_URL=http://localhost:38520
 ## Roadmap
 
 1. **Authentication** — user management for a multi-user deployment
-2. **Tests** — backend unit tests and frontend integration tests
+2. **Tests** — `backend/tests/` covers incremental index updates (fingerprints, purge, resume)
+   and the coverage/freshness of `GET /api/indexes/updates`
+   (`pip install -r backend/requirements-dev.txt`, then `python -m pytest backend/tests`).
+   Everything else — OCR pipeline, task engine, routers, frontend — is still untested
 3. **Server deployment** — Linux support for a production deployment outside Windows
    (see [DISTRIBUTION.md](DISTRIBUTION.md))

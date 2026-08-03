@@ -148,6 +148,7 @@ Then, from the **Collections** page: **Scan** (read-only diagnosis) → **Synchr
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture, project tree, data
   structure, configuration, development notes.
 - [docs/API.md](docs/API.md) — REST API endpoint reference.
+- [frontend/README.md](frontend/README.md) — frontend scripts, source layout and conventions.
 - [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) — notes on distribution and publication (roadmap).
 - Interactive documentation (Swagger): http://localhost:38520/docs
 

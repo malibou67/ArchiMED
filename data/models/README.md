@@ -27,6 +27,7 @@ models/
   "type": "ocr",
   "description": "Model trained on 19th-century registers",
   "version": "1.0",
+  "created_at": "2026-01-15T10:30:00",
   "trained_on": "...",
   "accuracy": 0.95,
   "file_path": "/path/to/my-model.mlmodel"
