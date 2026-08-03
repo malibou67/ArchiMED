@@ -12,7 +12,9 @@
   "progress": {
     "rebuilding": "Rebuilding…",
     "starting": "Starting…",
-    "queued": "In queue…"
+    "queued": "In queue…",
+    "pages": "{{done}} / {{total}} pages",
+    "pageCount": "{{page}} · {{done}} / {{total}} pages"
   },
   "builder": {
     "createTitle": "Generate an index",

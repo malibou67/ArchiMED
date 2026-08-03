@@ -94,10 +94,11 @@ def run_index_task(task: dict) -> None:
     L'index (metadata.json + index.json) reste la source pour la liste et la recherche."""
     index_id = task['index_id']
 
-    def on_progress(processed: int, total: int, current) -> None:
+    def on_progress(processed: int, total: int, current, page=None) -> None:
         task['total'] = total
         task['processed'] = processed
-        task['current'] = current
+        task['current'] = current      # registre en cours (détail de tâche)
+        task['current_page'] = page    # page en cours de lecture
         TaskService._save_throttled(task)
 
     def should_cancel() -> bool:
@@ -106,10 +107,12 @@ def run_index_task(task: dict) -> None:
     def should_pause() -> bool:
         return bool(task.get('pause'))
 
-    def on_plan(skipped: list) -> None:
-        # Registres conservés par la mise à jour incrémentale : déjà comptés dans `processed`,
-        # ils doivent être affichés 'done' d'emblée dans le détail de la tâche.
+    def on_plan(skipped: list, base: int = 0) -> None:
+        # Registres conservés par la mise à jour incrémentale : hors de la progression (qui ne
+        # décrit que le travail de ce run), ils sont affichés 'done' d'emblée dans le détail de la
+        # tâche, et leurs pages annoncées à part (`index_base`).
         task['index_skipped'] = skipped
+        task['index_base'] = base
         TaskService._save(task)
 
     result = IndexesService.generate_index(

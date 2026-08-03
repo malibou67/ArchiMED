@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Alert,
@@ -112,7 +112,10 @@ function StatusChip({ status }: { status: IndexMetadata['status'] }) {
   return <Chip icon={<ErrorIcon sx={{ fontSize: '14px !important' }} />} label={t('status.error')} color="error" size="small" variant="outlined" sx={{ fontWeight: 500 }} />;
 }
 
-function IndexProgress({ progress, rebuild }: { progress?: IndexProgressType; rebuild?: boolean }) {
+// Ce qui compte pendant une indexation : la page en train d'être lue et le décompte x / y.
+// Le registre (collection · modèle · registre) ne tient pas sur la ligne et n'apprend rien de
+// plus à chaque rafraîchissement : il reste dans l'infobulle.
+function IndexProgress({ progress, rebuild, locale }: { progress?: IndexProgressType; rebuild?: boolean; locale: string }) {
   const { t } = useTranslation('indexes');
   const p = progress;
   if (!p || (p.total === 0 && !p.current_registre)) {
@@ -127,6 +130,7 @@ function IndexProgress({ progress, rebuild }: { progress?: IndexProgressType; re
   }
   if (p.total > 0) {
     const pct = Math.round((p.processed / p.total) * 100);
+    const counts = { done: p.processed.toLocaleString(locale), total: p.total.toLocaleString(locale) };
     return (
       <Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
@@ -135,7 +139,9 @@ function IndexProgress({ progress, rebuild }: { progress?: IndexProgressType; re
         </Box>
         <Tooltip title={p.current_registre ?? ''} arrow disableHoverListener={!p.current_registre}>
           <Typography variant="caption" color="text.disabled" noWrap sx={{ display: 'block', maxWidth: 260 }}>
-            {p.current_registre ?? '…'}
+            {p.current_page
+              ? t('progress.pageCount', { page: p.current_page, ...counts })
+              : t('progress.pages', counts)}
           </Typography>
         </Tooltip>
       </Box>
@@ -624,6 +630,16 @@ export default function IndexesPage() {
     return () => clearInterval(id);
   }, [hasActivity, loadIndexes]);
 
+  // La dernière tâche vient de se terminer : l'intervalle ci-dessus s'arrête sans avoir relu les
+  // index, qui porteraient encore leur `build` — la ligne resterait affichée « En attente »
+  // jusqu'à un rechargement manuel. Un dernier chargement suffit : le serveur écrit
+  // status/stats de l'index avant de passer la tâche à 'done'.
+  const wasActive = useRef(false);
+  useEffect(() => {
+    if (wasActive.current && !hasActivity) loadIndexes();
+    wasActive.current = hasActivity;
+  }, [hasActivity, loadIndexes]);
+
   const openCreate = () => { setBuilderMode('create'); setEditing(null); setBuilderOpen(true); };
   const openEdit = (index: IndexMetadata) => { setBuilderMode('edit'); setEditing(index); setBuilderOpen(true); };
 
@@ -864,9 +880,11 @@ export default function IndexesPage() {
                   const isPaused = !!pausedTask;
                   const interruptedTask = interruptedTasks.find(t => t.type === 'index' && t.index_id === index.id);
                   const isInterrupted = isGenerating && !isPaused && !!interruptedTask;
-                  const isRunning = runningTasks.some(t => t.type === 'index' && t.index_id === index.id);
-                  // En file d'attente : matérialisé (generating/build) mais aucune tâche encore active pour lui.
-                  const isQueued = isGenerating && !isRunning && !isPaused && !isInterrupted;
+                  // En file d'attente : matérialisé (generating/build) et une tâche l'attend
+                  // réellement. Le déduire de l'absence de toute tâche ferait passer un
+                  // instantané périmé (indexation terminée, liste pas encore relue) pour une
+                  // attente.
+                  const isQueued = isGenerating && queuedTasks.some(t => t.type === 'index' && t.index_id === index.id);
                   const isRegenerating = regeneratingIds.has(index.id);
                   const actionsAlwaysVisible = isGenerating || isRegenerating;
                   const labels = sourcesLabels(index, collections);
@@ -918,7 +936,7 @@ export default function IndexesPage() {
                               <Typography variant="caption">{t('progress.queued')}</Typography>
                             </Box>
                           ) : (
-                            <IndexProgress progress={progress} rebuild={rebuild} />
+                            <IndexProgress progress={progress} rebuild={rebuild} locale={locale} />
                           )
                         ) : index.stats ? (
                           <Box>

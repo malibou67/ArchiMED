@@ -192,6 +192,7 @@ export type IndexProgress = {
   processed: number;
   total: number;
   current_registre?: string;
+  current_page?: string;   // page (XML) en cours de lecture
 }
 
 // Une brique d'un index : un modèle OCR d'une collection.

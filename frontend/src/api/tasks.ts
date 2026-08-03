@@ -60,6 +60,13 @@ export interface Task {
   index_id?: string;
   // Sources d'un index multi-collections/modèles (résumé compact pour l'affichage).
   index_sources?: { collection_titre?: string; collection_folder?: string; model_name?: string }[];
+  // Page (XML) en cours de lecture — l'équivalent de `current` pour l'OCR, `current` portant
+  // ici le registre (collection · modèle · registre).
+  current_page?: string | null;
+  index_is_new?: boolean;    // première génération de cet index
+  index_full?: boolean;      // reconstruction complète (sinon mise à jour incrémentale)
+  // Pages conservées par une mise à jour incrémentale : déjà indexées, hors de `total`.
+  index_base?: number;
   // Origine multi-PC
   machine_id?: string;
   machine_label?: string;

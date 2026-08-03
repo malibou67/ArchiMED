@@ -38,6 +38,13 @@
   "queuedOther": "En attente sur {{machine}}",
   "pagesProcessed_one": "{{count}} page traitée",
   "pagesProcessed_other": "{{count}} pages traitées",
+  "keptPages_one": "{{val}} page déjà indexée, conservée",
+  "keptPages_other": "{{val}} pages déjà indexées, conservées",
+  "indexMode": {
+    "update": "Mise à jour",
+    "fullRebuild": "Reconstruction complète",
+    "firstBuild": "Première génération"
+  },
   "elapsed": "écoulé {{dur}}",
   "remaining": " · reste ~{{dur}}",
   "duration": "durée {{dur}}",

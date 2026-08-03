@@ -48,7 +48,14 @@
     "failures_one": "{{count}} échec",
     "failures_other": "{{count}} échecs",
     "typeOcr": "OCR",
-    "typeIndexation": "Indexation"
+    "typeIndexation": "Indexation",
+    "keptPages_one": "{{val}} page déjà indexée, conservée",
+    "keptPages_other": "{{val}} pages déjà indexées, conservées",
+    "indexMode": {
+      "update": "Mise à jour",
+      "fullRebuild": "Reconstruction complète",
+      "firstBuild": "Première génération"
+    }
   },
   "loading": {
     "stats": "Calcul des statistiques…",

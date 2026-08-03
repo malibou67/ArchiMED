@@ -64,6 +64,17 @@ const taskTitle = (t: Task, tr: TFunction) => {
 };
 const taskModel = (t: Task) => (t.type === 'ocr' ? t.ocr_model : t.model_name) || '—';
 
+// Ce qu'un run d'indexation couvre réellement : sans cela, un total de 30 pages sur un index de
+// 25 000 reste incompréhensible.
+const indexModeLabel = (t: Task, tr: TFunction) =>
+  t.index_is_new ? tr('indexMode.firstBuild')
+    : t.index_full ? tr('indexMode.fullRebuild')
+      : tr('indexMode.update');
+
+// Sous la barre : pour l'OCR `current` est déjà la page ; pour l'indexation c'est le registre
+// (collection · modèle · registre), trop long ici — on affiche la page lue, registre en infobulle.
+const currentLabel = (t: Task) => (t.type === 'ocr' ? t.current : t.current_page) || '';
+
 const fmtTime = (iso: string | null) => (iso ? new Date(iso).toLocaleString(currentLocale(), { dateStyle: 'short', timeStyle: 'short' }) : '');
 
 const fmtDuration = (ms: number) => {
@@ -472,6 +483,7 @@ export default function TasksPage() {
                     <Typography variant="body2" fontWeight={500}>{taskTitle(t, tr)}</Typography>
                     {t.type === 'index' && (t.index_sources?.length ?? 0) > 0 ? (
                       <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 0.5, maxWidth: 440 }}>
+                        <Chip size="small" variant="outlined" color="info" label={indexModeLabel(t, tr)} sx={{ height: 20 }} />
                         {t.index_sources!.slice(0, 4).map((s, i) => {
                           const label = `${s.collection_titre || s.collection_folder || '—'} · ${s.model_name || '—'}`;
                           return (
@@ -518,11 +530,18 @@ export default function TasksPage() {
                           color={isPaused(t) ? 'warning' : 'primary'}
                           sx={{ height: 6, borderRadius: 3, mb: 0.5 }}
                         />
-                        <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block' }}>
+                        <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block' }} title={t.current ?? ''}>
                           {fmtNum(done)} / {fmtNum(t.total)}
-                          {t.current ? ` · ${t.current}` : ''}
+                          {currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
                           {t.failed > 0 ? ` · ${tr('failures', { count: t.failed })}` : ''}
                         </Typography>
+                        {/* Les pages déjà indexées sortent de la barre : sans cette mention, un
+                            total réduit aux seules pages nouvelles surprend. */}
+                        {(t.index_base ?? 0) > 0 && (
+                          <Typography variant="caption" color="text.disabled" noWrap sx={{ display: 'block' }}>
+                            {tr('keptPages', { count: t.index_base!, val: fmtNum(t.index_base!) })}
+                          </Typography>
+                        )}
                       </Box>
                     ) : isQueued(t) ? (
                       <Typography variant="caption" color="text.secondary">

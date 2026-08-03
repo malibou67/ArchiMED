@@ -1564,8 +1564,10 @@ class IndexesService:
         collection est momentanément indisponible (partage réseau déconnecté), ses pages sont
         donc retirées — comme le ferait une reconstruction complète.
 
-        `on_progress(processed, total, current)` rapporte l'avancement,
-        `on_plan(skipped_labels)` annonce les registres conservés (progression déjà acquise),
+        `on_progress(processed, total, current, page)` rapporte l'avancement (registre courant et
+        page en cours de lecture),
+        `on_plan(skipped_labels, base_pages)` annonce les registres conservés et leurs pages, hors
+        de la progression publiée (qui ne décrit que le travail de ce run),
         `should_cancel()` arrête définitivement, `should_pause()` met en pause via checkpoint."""
         SEP = IndexesService.SOURCE_SEP
         index_dir = IndexesService.get_indexes_dir() / index_id
@@ -1585,10 +1587,12 @@ class IndexesService:
         def _save_meta() -> bool:
             return IndexesService._save_index_meta(index_id, metadata)
 
-        def _set_progress(processed: int, total: int, current: Optional[str]) -> None:
+        def _set_progress(processed: int, total: int, current: Optional[str],
+                          page: Optional[str] = None) -> None:
             metadata.setdefault('build', {})['status'] = 'generating'
             metadata['build']['progress'] = {
                 "processed": processed, "total": total, "current_registre": current,
+                "current_page": page,
             }
 
         def _cancelled() -> bool:
@@ -1597,12 +1601,39 @@ class IndexesService:
         def _paused() -> bool:
             return should_pause is not None and should_pause()
 
-        def _report(processed: int, total: int, current: Optional[str]) -> None:
+        def _report(processed: int, total: int, current: Optional[str],
+                    page: Optional[str] = None) -> None:
             if on_progress is not None:
                 try:
-                    on_progress(processed, total, current)
+                    on_progress(processed, total, current, page)
                 except Exception:
                     pass
+
+        last_publish = 0.0
+        # Pages acquises hors de ce run (registres conservés par la mise à jour incrémentale).
+        # Elles sortent de la progression publiée : une mise à jour de 30 pages sur un index de
+        # 25 000 doit afficher « 12 / 30 », pas « 24 982 / 25 000 » — barre déjà pleine et ETA
+        # absurde. Les appelants raisonnent en compteurs absolus, `_publish` retranche la base.
+        base = 0
+
+        def _publish(processed: int, total: int, current: Optional[str],
+                     page: Optional[str] = None, *, force: bool = False) -> bool:
+            """Publie l'avancement (metadata.json + tâche). Retourne False si l'index a disparu,
+            ce que les appelants traitent comme une annulation.
+
+            Throttlé à ~1/s : la boucle interne appelle à chaque page, et `_save_meta` réécrit
+            tout le metadata (la liste, elle, ne le relit que toutes les 2 s). `force=True` aux
+            bornes de registre, où la publication doit être exacte."""
+            nonlocal last_publish
+            now = time.monotonic()
+            if not force and now - last_publish < 1.0:
+                return True
+            last_publish = now
+            _set_progress(processed - base, total - base, current, page)
+            if not _save_meta():
+                return False
+            _report(processed - base, total - base, current, page)
+            return True
 
         # État, repris d'un checkpoint si l'indexation avait été mise en pause.
         mots_uniques: Dict[str, List[str]] = {}
@@ -1611,6 +1642,7 @@ class IndexesService:
         done_state: Dict[str, Dict] = {}     # empreintes des registres réellement indexés
         resumed = False
         mode = 'full'
+        cp_skipped: Optional[set] = None     # base du run d'origine, à la reprise
         if checkpoint_file.exists():
             try:
                 with open(checkpoint_file, 'r', encoding='utf-8-sig') as f:
@@ -1625,10 +1657,17 @@ class IndexesService:
                     total_words = cp.get('total_words', 0)
                     done_registres = set(cp.get('done_registres', []))
                     done_state = cp.get('done_state', {}) or {}
+                    # Base du run d'origine : la reprise doit repartir de la même barre de
+                    # progression (même total), pas d'un total rétréci au travail restant.
+                    # Absente d'un checkpoint hérité → on retombe sur `done_registres`.
+                    if cp.get('skipped') is not None:
+                        cp_skipped = set(cp['skipped'])
                     resumed = True
                     mode = cp_mode
             except (OSError, json.JSONDecodeError):
                 pass   # checkpoint illisible : on repart de zéro (reconstruction complète)
+
+        base_registres: set = set()   # registres conservés : la base de progression de ce run
 
         def _save_checkpoint() -> None:
             # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
@@ -1638,6 +1677,7 @@ class IndexesService:
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,
                                "done_registres": sorted(done_registres),
+                               "skipped": sorted(base_registres),
                                "done_state": done_state}, f, ensure_ascii=False)
                 os.replace(tmp, checkpoint_file)
             except OSError:
@@ -1710,18 +1750,23 @@ class IndexesService:
                         mode = 'incremental'
                     # words is None → index illisible/incompatible : reconstruction complète.
 
+            # Base de la progression : les registres conservés, hors du travail de ce run. À une
+            # reprise, c'est celle du run d'origine (checkpoint) : les registres traités *pendant*
+            # ce run restent dans la barre, sinon elle repartirait de zéro à chaque reprise.
+            base_registres = set(done_registres) if cp_skipped is None else (cp_skipped & done_registres)
+            base = sum(len(xf) for _s, _rd, xf, rk, _st in registre_tasks if rk in base_registres)
+
             if on_plan is not None:
                 try:
                     on_plan([IndexesService._source_label(rd.name, s)
-                             for s, rd, _xf, rk, _st in registre_tasks if rk in done_registres])
+                             for s, rd, _xf, rk, _st in registre_tasks if rk in base_registres],
+                            base)
                 except Exception:
                     pass
 
             processed = sum(len(xf) for _s, _rd, xf, rk, _st in registre_tasks if rk in done_registres)
-            _set_progress(processed, total_xml, None)
-            if not _save_meta():
+            if not _publish(processed, total_xml, None, force=True):
                 return 'cancelled'  # index supprimé
-            _report(processed, total_xml, None)
 
             # Deuxième passe : indexation, registre par registre (namespacé par source).
             # Checkpoint périodique (throttlé) : permet à une indexation *interrompue* (crash,
@@ -1743,15 +1788,17 @@ class IndexesService:
                     return 'paused'
 
                 label = IndexesService._source_label(reg_dir.name, src)
-                _set_progress(processed, total_xml, label)
-                if not _save_meta():
+                if not _publish(processed, total_xml, label, force=True):
                     return 'cancelled'
-                _report(processed, total_xml, label)
 
                 page_prefix = f"{src['key']}{SEP}"
                 for xml_file in xml_files:
                     total_words = IndexesService._process_xml(xml_file, mots_uniques, total_words, page_prefix)
                     processed += 1
+                    # Page par page (throttlé) : sans cela un gros registre fige la progression
+                    # pendant toute sa durée.
+                    if not _publish(processed, total_xml, label, xml_file.stem):
+                        return 'cancelled'
                 done_registres.add(reg_key)
                 done_state[reg_key] = reg_state
 
@@ -1764,10 +1811,8 @@ class IndexesService:
                     last_checkpoint_at = now
                     last_checkpoint_done = len(done_registres)
 
-                _set_progress(processed, total_xml, label)
-                if not _save_meta():
+                if not _publish(processed, total_xml, label, force=True):
                     return 'cancelled'
-                _report(processed, total_xml, label)
 
             if _cancelled():
                 IndexesService._discard_staging(staging_file)
@@ -2506,16 +2551,16 @@ class IndexesService:
         """État de chaque registre d'une tâche d'indexation. L'indexation étant séquentielle,
         on déduit l'état depuis `processed` (nb de XML traités) : 'done' / 'current' / 'pending'.
 
-        En mise à jour incrémentale, les registres conservés (`index_skipped`) sont comptés dans
-        `processed` dès le départ sans être traités dans l'ordre : ils sont 'done' d'emblée et
-        sortis du cumul, qui ne déroule alors que les registres réellement réindexés."""
+        En mise à jour incrémentale, les registres conservés (`index_skipped`) ne sont pas traités
+        dans l'ordre et sortent de `processed`, qui ne compte que le travail de ce run : ils sont
+        'done' d'emblée, et le cumul ne déroule que les registres réellement réindexés."""
         regs = task.get('index_registres') or []
         processed = task.get('processed', 0)
         current = task.get('current')
         active = task.get('status') in ('running', 'paused')
         skipped = set(task.get('index_skipped') or [])
         out: List[Dict[str, Any]] = []
-        cumulative = sum(r.get('pages', 0) for r in regs if r.get('name') in skipped)
+        cumulative = 0
         for r in regs:
             if r.get('name') in skipped:
                 out.append({"name": r.get('name'), "pages": r.get('pages', 0), "status": 'done'})

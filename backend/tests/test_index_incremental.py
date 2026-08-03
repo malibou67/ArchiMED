@@ -4,9 +4,11 @@ L'invariant vérifié de bout en bout est le seul qui compte vraiment : une mise
 incrémentale doit produire *exactement* le même index qu'une reconstruction complète, tout en
 ne relisant que les registres nouveaux ou modifiés.
 """
+import itertools
 import json
 import os
 
+import services
 from services import IndexesService
 
 from conftest import build, make_collection, read_index, write_page_xml
@@ -165,7 +167,7 @@ def test_task_registres_marque_les_registres_conserves():
     """Les registres sautés sont 'done' même s'ils ne sont pas en tête de liste."""
     task = {
         'status': 'running',
-        'processed': 10,          # = les 10 pages de R1 et R3, conservées
+        'processed': 0,           # R1 et R3 conservés : hors du travail de ce run
         'current': 'R2',
         'index_registres': [{"name": "R1", "pages": 5}, {"name": "R2", "pages": 7},
                             {"name": "R3", "pages": 5}],
@@ -311,12 +313,14 @@ def test_on_plan_annonce_les_registres_conserves(data_dir):
     assert build("idx1") == 'done'
     write_page_xml(col / "ocr" / "REGB" / "modelA" / "REGB_2.xml", ["hibou"])
 
-    skipped = []
-    assert build("idx1", on_plan=skipped.extend) == 'done'
-    assert skipped == ["COL · modelA · REGA"]
+    plan = []
+    assert build("idx1", on_plan=lambda skipped, base: plan.append((skipped, base))) == 'done'
+    assert plan == [(["COL · modelA · REGA"], 1)]   # 1 page conservée, hors progression
 
 
-def test_progression_demarre_aux_pages_conservees(data_dir):
+def test_progression_compte_les_pages_a_reindexer(data_dir):
+    """La barre décrit le travail de ce run : une mise à jour de 2 pages sur un index de 7 doit
+    afficher « x / 2 », pas « 5 / 7 » (barre déjà pleine, ETA absurde)."""
     col = make_collection(data_dir, "COL", {
         "REGA": {f"REGA_{i}": ["chat"] for i in range(1, 6)},
         "REGB": {"REGB_1": ["rat"]},
@@ -325,9 +329,51 @@ def test_progression_demarre_aux_pages_conservees(data_dir):
     write_page_xml(col / "ocr" / "REGB" / "modelA" / "REGB_2.xml", ["hibou"])
 
     reports = []
-    assert build("idx1", on_progress=lambda p, tot, cur: reports.append((p, tot))) == 'done'
-    assert reports[0] == (5, 7)        # les 5 pages de REGA sont acquises d'emblée
-    assert reports[-1] == (7, 7)
+    assert build("idx1", on_progress=lambda p, tot, cur, page: reports.append((p, tot))) == 'done'
+    assert reports[0] == (0, 2)        # les 5 pages de REGA sont conservées, hors barre
+    assert reports[-1] == (2, 2)
+
+
+def test_reprise_garde_la_base_du_run_dorigine(data_dir):
+    """Après une pause, la progression reprend là où elle s'est arrêtée : la base (registres
+    conservés) est celle du run d'origine, relue dans le checkpoint. Sans cela, les registres
+    déjà traités passeraient pour « conservés » et le total se rétrécirait à chaque reprise."""
+    col = make_collection(data_dir, "COL", {
+        "REGA": {"REGA_1": ["chat"]},
+        "REGB": {"REGB_1": ["rat"]},
+        "REGC": {"REGC_1": ["hibou"]},
+    })
+    assert build("idx1") == 'done'
+    write_page_xml(col / "ocr" / "REGB" / "modelA" / "REGB_2.xml", ["loup"])
+    write_page_xml(col / "ocr" / "REGC" / "modelA" / "REGC_2.xml", ["renard"])
+
+    # Pause à la deuxième borne de registre : REGB est indexé, REGC reste à faire.
+    bornes = itertools.count()
+    reports = []
+    assert build("idx1", should_pause=lambda: next(bornes) >= 1,
+                 on_progress=lambda p, tot, cur, page: reports.append((p, tot))) == 'paused'
+    assert reports[0] == (0, 4)        # REGA conservé (1 page), 4 pages à réindexer
+    assert reports[-1] == (2, 4)
+
+    resumed = []
+    assert build("idx1", on_progress=lambda p, tot, cur, page: resumed.append((p, tot))) == 'done'
+    assert resumed[0] == (2, 4)        # même barre : REGB reste au crédit de ce run
+    assert resumed[-1] == (4, 4)
+
+
+def test_progression_page_par_page(data_dir, monkeypatch):
+    """La progression doit défiler *à l'intérieur* d'un registre, en nommant la page lue :
+    publiée seulement aux bornes de registre, elle resterait figée pendant des milliers de pages."""
+    make_collection(data_dir, "COL", {"REGA": {f"REGA_{i}": ["chat"] for i in range(1, 4)}})
+
+    # La publication est throttlée à 1/s : on avance l'horloge à chaque appel pour l'observer.
+    clock = itertools.count(0, 2.0)
+    monkeypatch.setattr(services.time, 'monotonic', lambda: next(clock))
+
+    reports = []
+    assert build("idx1", on_progress=lambda p, tot, cur, page: reports.append((p, page))) == 'done'
+    assert (1, "REGA_1") in reports
+    assert (3, "REGA_3") in reports
 
 
 def test_changement_de_modele_ocr_force_une_reconstruction(data_dir):

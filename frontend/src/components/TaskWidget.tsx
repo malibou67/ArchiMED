@@ -34,6 +34,14 @@ export default function TaskWidget() {
 
   const fmtNum = (n: number) => n.toLocaleString(i18n.language.startsWith('fr') ? 'fr-FR' : 'en-US');
   const typeLabel = (task: Task) => (task.type === 'ocr' ? tr('taskWidget.typeOcr') : tr('taskWidget.typeIndexation'));
+  // Ce que le run couvre : explique un total réduit aux seules pages nouvelles.
+  const indexModeLabel = (task: Task) =>
+    task.index_is_new ? tr('taskWidget.indexMode.firstBuild')
+      : task.index_full ? tr('taskWidget.indexMode.fullRebuild')
+        : tr('taskWidget.indexMode.update');
+  // Pour l'OCR `current` est la page ; pour l'indexation c'est le registre (trop long ici) :
+  // on affiche la page lue, le registre restant en infobulle.
+  const currentLabel = (task: Task) => (task.type === 'ocr' ? task.current : task.current_page) || '';
   const [collapsed, setCollapsed] = useState(false);
   const [justFinished, setJustFinished] = useState(false);
   const [resumingIds, setResumingIds] = useState<Set<string>>(new Set());
@@ -148,6 +156,9 @@ export default function TaskWidget() {
               {/* Chips de statut sur leur propre ligne */}
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.5, flexWrap: 'wrap' }}>
                 <Chip size="small" label={typeLabel(t)} color={t.type === 'ocr' ? 'success' : 'info'} variant="outlined" sx={{ height: 20 }} />
+                {t.type === 'index' && (
+                  <Chip size="small" label={indexModeLabel(t)} variant="outlined" sx={{ height: 20 }} />
+                )}
                 {paused && <Chip size="small" label={tr('taskWidget.pausedChip')} color="warning" sx={{ height: 20 }} />}
                 {!owned && t.machine_label && (
                   <Chip size="small" label={t.machine_label} variant="outlined" sx={{ height: 20 }} />
@@ -169,9 +180,9 @@ export default function TaskWidget() {
                 sx={{ mt: 0.5, mb: 0.5, height: 6, borderRadius: 3 }}
               />
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }} title={t.current ?? ''}>
                   {fmtNum(done)} / {fmtNum(t.total)}
-                  {!paused && t.current ? ` · ${t.current}` : ''}
+                  {!paused && currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
                   {t.failed > 0 ? ` · ${tr('taskWidget.failures', { count: t.failed })}` : ''}
                 </Typography>
                 {paused && owned && (
@@ -189,6 +200,13 @@ export default function TaskWidget() {
                   </Button>
                 )}
               </Box>
+              {/* Les pages déjà indexées sortent de la barre : sans cette mention, un total
+                  réduit aux seules pages nouvelles surprend. */}
+              {(t.index_base ?? 0) > 0 && (
+                <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
+                  {tr('taskWidget.keptPages', { count: t.index_base!, val: fmtNum(t.index_base!) })}
+                </Typography>
+              )}
             </Box>
           );
         })}

@@ -104,6 +104,7 @@ class IndexProgress(BaseModel):
     processed: int = 0
     total: int = 0
     current_registre: Optional[str] = None
+    current_page: Optional[str] = None   # page (XML) en cours de lecture
 
 class IndexSource(BaseModel):
     """Une brique d'un index : un modèle OCR d'une collection."""
