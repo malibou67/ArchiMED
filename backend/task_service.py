@@ -259,11 +259,16 @@ class TaskService:
     @staticmethod
     def _scope_keys(task: Dict[str, Any]) -> List[str]:
         """Clés de scope d'une tâche (unité de conflit). OCR = (collection, registre, modèle) ;
-        index = (collection, modèle). Pour l'OCR, on s'appuie sur les listes `collections` /
-        `registres` (déjà agrégées à l'enfilage) : produit cartésien, sur-approximation sûre."""
+        index = (collection, modèle)."""
         ttype = task.get('type')
         if ttype == 'ocr':
             model = task.get('ocr_model') or ''
+            scopes = task.get('scopes')
+            if scopes:
+                return sorted({f"ocr__{c}__{r}__{model}" for c, r in scopes})
+            # Repli pour les tâches enfilées avant l'ajout de `scopes` (JSON encore présents sur
+            # le partage, ou poste pas à jour) : croiser `collections` × `registres`. Sur-approxime
+            # (verrouille des couples non traités), mais ne laisse jamais passer un vrai conflit.
             cols = task.get('collections') or []
             regs = task.get('registres') or []
             return sorted({f"ocr__{c}__{r}__{model}" for c in cols for r in regs})

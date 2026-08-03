@@ -285,10 +285,14 @@ class OcrService:
         if skipped:
             print(f"[OCR] {len(skipped)} page(s) écartée(s) (image introuvable), "
                   f"ex. {skipped[0]['registre']}/{skipped[0]['page']}", flush=True)
-        # Collections/registres dérivés des pages **retenues** : ce sont eux qui produisent les
-        # clés de périmètre (verrous), un registre entièrement fantôme ne doit rien verrouiller.
+        # Collections/registres dérivés des pages **retenues** : un registre entièrement
+        # fantôme ne doit rien verrouiller ni apparaître dans le récapitulatif.
         collections = sorted({p['collection'] for p in kept})
         registres = sorted({p['registre'] for p in kept})
+        # Les couples réellement couverts — unité de verrou. Les deux listes ci-dessus, aplaties
+        # séparément, perdent l'appariement : les recroiser verrouillerait des registres qu'aucune
+        # page ne concerne (sélection multi-collections). On les garde pour le label et le repli.
+        scopes = sorted({(p['collection'], p['registre']) for p in kept})
         label = ', '.join(collections) if collections else 'OCR'
         fields: Dict[str, Any] = {
             'total': len(kept),
@@ -296,6 +300,7 @@ class OcrService:
             'ocr_model': ocr_model_id,
             'collections': collections,
             'registres': registres,
+            'scopes': [[c, r] for c, r in scopes],
             'pages': kept,
         }
         if skipped:

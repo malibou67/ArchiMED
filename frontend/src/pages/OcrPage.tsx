@@ -24,6 +24,11 @@ import {
   Paper,
   ToggleButton,
   ToggleButtonGroup,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
 } from '@mui/material';
 import {
   ExpandMore as ExpandMoreIcon,
@@ -32,6 +37,7 @@ import {
   Book as BookIcon,
   Image as ImageIcon,
   Cancel as CancelIcon,
+  HourglassEmpty as HourglassEmptyIcon,
   Search as SearchIcon,
   Clear as ClearIcon,
   Circle as CircleIcon,
@@ -188,15 +194,41 @@ export default function OcrPage() {
   // Historique des tâches OCR terminées (pour l'estimation de durée).
   const [pastOcrTasks, setPastOcrTasks] = useState<Task[]>([]);
 
-  const { hasActivity, refresh: refreshTasks, runningTasks, pausedTasks, pause, resume } = useTasks();
+  const { hasActivity, refresh: refreshTasks, runningTasks, pausedTasks, queuedTasks, pause, resume } = useTasks();
   // Tâche OCR contrôlable depuis cette page : celle de ce poste, en cours ou en pause.
   const activeOcr = [...runningTasks, ...pausedTasks].find((t) => t.type === 'ocr' && t.owned !== false) ?? null;
+
+  // Registres déjà verrouillés pour le modèle OCR choisi, **tous postes confondus** — y compris
+  // celui-ci, car le backend refuse aussi une seconde tâche locale sur le même périmètre.
+  // Clé « collection/registre » = la `rKey` de l'arbre ; valeur = poste, vide si c'est le nôtre.
+  // Doit rester le miroir de `TaskService._scope_keys`, repli cartésien compris.
+  const busyRegistres = useMemo(() => {
+    const out = new Map<string, string>();
+    if (!selectedOcrModel) return out;
+    for (const task of [...runningTasks, ...pausedTasks, ...queuedTasks]) {
+      if (task.type !== 'ocr' || task.ocr_model !== selectedOcrModel) continue;
+      const from = task.owned === false ? (task.machine_label ?? '?') : '';
+      const pairs: [string, string][] = task.scopes
+        ?? (task.collections ?? []).flatMap((c) =>
+             (task.registres ?? []).map((r) => [c, r] as [string, string]));
+      for (const [c, r] of pairs) out.set(`${c}/${r}`, from);
+    }
+    return out;
+  }, [runningTasks, pausedTasks, queuedTasks, selectedOcrModel]);
+
+  const busyLabel = (from: string) =>
+    from ? t('tree.busyOn', { machine: from }) : t('tree.busyHere');
+
   const [launching, setLaunching] = useState(false);
   const [pausingOcr, setPausingOcr] = useState(false);
   const [queuedNotice, setQueuedNotice] = useState<number | null>(null);
   // Pages que le backend a écartées faute d'image sur le disque (registre modifié depuis
   // la dernière synchronisation) : à signaler, sinon le compte annoncé serait inexpliqué.
   const [skippedNotice, setSkippedNotice] = useState(0);
+  // Confirmation d'écrasement. `all` = la sélection telle quelle (l'ordre est celui du
+  // traitement), `doneCount` = combien y sont déjà transcrites avec le modèle choisi,
+  // `missing` = le sous-ensemble restant. null = pas de dialogue.
+  const [overwrite, setOverwrite] = useState<{ all: string[]; doneCount: number; missing: string[] } | null>(null);
 
   // La pause est coopérative : elle ne prend effet qu'à la fin de la page en cours.
   const pauseOcr = async () => {
@@ -216,6 +248,9 @@ export default function OcrPage() {
     loadCollections();
     loadModels();
     loadPastTasks();
+    // Le contexte ne poll que s'il sait déjà qu'une tâche tourne : sans ce relevé, une appli
+    // restée ouverte au repos ignorerait un OCR démarré entre-temps sur un autre poste.
+    refreshTasks();
     systemApi.getRequirements()
       .then((r) => { setRequirements(r); setReqFailed(false); })
       .catch(() => { setRequirements(null); setReqFailed(true); })
@@ -320,8 +355,9 @@ export default function OcrPage() {
     };
   };
 
-  const launchOcr = async () => {
-    const pages = [...selectedPages].map(parsePageKey).filter((p): p is OcrPageRef => p !== null);
+  // Envoi effectif. L'éventuelle confirmation d'écrasement a déjà été tranchée par `requestLaunch`.
+  const doLaunch = async (keys: string[]) => {
+    const pages = keys.map(parsePageKey).filter((p): p is OcrPageRef => p !== null);
     if (pages.length === 0 || !selectedSegModel || !selectedOcrModel) return;
     try {
       setLaunching(true);
@@ -454,17 +490,90 @@ export default function OcrPage() {
   };
 
   const toggleAllPages = async (colId: string, reg: RegistreSummary) => {
+    if (busyRegistres.has(`${colId}/${reg.folder_name}`)) return;
     const keys = (await filteredPages(colId, reg)).map((p) => pageKey(colId, reg.folder_name, p));
     toggleKeys(keys);
   };
 
   const toggleAllCollection = async (collection: CollectionMetadata) => {
     const cKey = colKey(collection);
+    // Les registres verrouillés ailleurs sont exclus du lot : les cocher ne mènerait qu'à un refus.
     const perReg = await Promise.all(
-      (collection.registres || []).map(async (r) =>
-        (await filteredPages(cKey, r)).map((p) => pageKey(cKey, r.folder_name, p))),
+      (collection.registres || [])
+        .filter((r) => !busyRegistres.has(`${cKey}/${r.folder_name}`))
+        .map(async (r) =>
+          (await filteredPages(cKey, r)).map((p) => pageKey(cKey, r.folder_name, p))),
     );
     toggleKeys(perReg.flat());
+  };
+
+  // ── Périmètres verrouillés touchés par la sélection ────────────────
+  // Une sélection faite avant qu'un autre poste ne démarre — ou conservée après un changement
+  // de modèle OCR — peut viser un registre devenu occupé : filet avant l'envoi.
+  const blockedSelection = useMemo(() => {
+    const out = new Map<string, string>();
+    for (const key of selectedPages) {
+      const second = key.indexOf('/', key.indexOf('/') + 1);
+      if (second < 0) continue;
+      const rKey = key.substring(0, second);
+      const from = busyRegistres.get(rKey);
+      if (from !== undefined) out.set(rKey, from);
+    }
+    return out;
+  }, [selectedPages, busyRegistres]);
+
+  const dropBlockedSelection = () => {
+    setSelectedPages((prev) => {
+      const next = new Set<string>();
+      for (const key of prev) {
+        const second = key.indexOf('/', key.indexOf('/') + 1);
+        if (second >= 0 && busyRegistres.has(key.substring(0, second))) continue;
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  // ── Lancement : confirmation si des transcriptions vont être écrasées ──
+  const requestLaunch = async () => {
+    const keys = [...selectedPages];
+    setError(null);
+    setLaunching(true);
+    try {
+      // On ne sonde que les registres dont les métadonnées annoncent au moins une page faite :
+      // sur une grosse sélection, cela évite un aller-retour réseau par registre vierge.
+      const byReg = new Map<string, { ref: OcrPageRef; key: string }[]>();
+      for (const key of keys) {
+        const ref = parsePageKey(key);
+        if (!ref) continue;
+        const rKey = `${ref.collection}/${ref.registre}`;
+        const bucket = byReg.get(rKey);
+        if (bucket) bucket.push({ ref, key });
+        else byReg.set(rKey, [{ ref, key }]);
+      }
+      const done: string[] = [];
+      for (const [, entries] of byReg) {
+        const { collection: cKey, registre: folder } = entries[0].ref;
+        const reg = collections.find((c) => colKey(c) === cKey)
+          ?.registres?.find((r) => r.folder_name === folder);
+        if (!reg || regPagesDone(reg) === 0) continue;
+        const doneSet = await ensureDoneSet(cKey, folder);
+        for (const { ref, key } of entries) {
+          if (doneSet.has(pageStem(ref.page))) done.push(key);
+        }
+      }
+      if (done.length === 0) {
+        await doLaunch(keys);
+        return;
+      }
+      const already = new Set(done);
+      setOverwrite({ all: keys, doneCount: done.length, missing: keys.filter((k) => !already.has(k)) });
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || t('errors.launch'));
+      console.error(err);
+    } finally {
+      setLaunching(false);
+    }
   };
 
   // ── Filtre de l'arbre (la sélection et les checkboxes restent sur les données complètes) ──
@@ -601,12 +710,14 @@ export default function OcrPage() {
   );
 
   const canLaunch = !launching && !reqLoading && blockers.length === 0
-    && !!selectedSegModel && !!selectedOcrModel && selectedPages.size > 0;
+    && !!selectedSegModel && !!selectedOcrModel && selectedPages.size > 0
+    && blockedSelection.size === 0;
   let disabledReason: string | null = null;
   if (reqLoading) disabledReason = t('disabled.checking');
   else if (envBlockers.length > 0) disabledReason = t('disabled.envIncomplete');
   else if (setupBlockers.length > 0) disabledReason = t('disabled.configIncomplete');
   else if (!selectedSegModel || !selectedOcrModel) disabledReason = t('disabled.chooseModels');
+  else if (blockedSelection.size > 0) disabledReason = t('disabled.selectionBusy', { count: blockedSelection.size });
   else if (selectedPages.size === 0) disabledReason = t('disabled.selectPage');
 
   // ── Estimation de durée (débit des dernières tâches OCR terminées) ──
@@ -886,6 +997,9 @@ export default function OcrPage() {
                               const rKey = `${cKey}/${reg.folder_name}`;
                               const isRegExpanded = expandedRegistres.has(rKey);
                               const regCheck = getRegCheckState(cKey, reg);
+                              // Verrouillé par une tâche OCR (ce poste ou un autre) sur le même
+                              // modèle : reste consultable, mais plus sélectionnable.
+                              const busyFrom = busyRegistres.get(rKey);
 
                               return (
                                 <Box key={reg.id} sx={{ pl: 3 }}>
@@ -895,6 +1009,7 @@ export default function OcrPage() {
                                         edge="start"
                                         checked={regCheck.checked}
                                         indeterminate={regCheck.indeterminate}
+                                        disabled={busyFrom !== undefined}
                                         onClick={(e) => { e.stopPropagation(); toggleAllPages(cKey, reg); }}
                                         size="small"
                                       />
@@ -902,7 +1017,24 @@ export default function OcrPage() {
                                     <ListItemIcon sx={{ minWidth: 28 }}>
                                       <BookIcon fontSize="small" color="action" />
                                     </ListItemIcon>
-                                    <ListItemText primary={reg.titre} secondary={t('pages', { count: reg.pages_count })} />
+                                    <ListItemText
+                                      primary={reg.titre}
+                                      secondary={t('pages', { count: reg.pages_count })}
+                                      sx={busyFrom !== undefined ? { color: 'text.disabled' } : undefined}
+                                    />
+                                    {busyFrom !== undefined && (
+                                      <Tooltip title={busyLabel(busyFrom)} arrow>
+                                        <Chip
+                                          size="small"
+                                          color="warning"
+                                          variant="outlined"
+                                          icon={<HourglassEmptyIcon />}
+                                          label={busyFrom || t('tree.busyChip')}
+                                          sx={{ mr: 0.5, cursor: 'default' }}
+                                          onClick={(e) => e.stopPropagation()}
+                                        />
+                                      </Tooltip>
+                                    )}
                                     {(() => {
                                       if (!selectedOcrModel) return null;
                                       const done = reg.ocr_status?.[selectedOcrModel]?.pages_done ?? 0;
@@ -957,7 +1089,13 @@ export default function OcrPage() {
                                             const pKey = pageKey(cKey, reg.folder_name, page);
                                             const isDone = doneSet?.has(pageStem(page));
                                             return (
-                                              <ListItemButton key={page} sx={{ pl: 6, py: 0.25 }} dense onClick={() => togglePage(pKey)}>
+                                              <ListItemButton
+                                                key={page}
+                                                sx={{ pl: 6, py: 0.25 }}
+                                                dense
+                                                disabled={busyFrom !== undefined}
+                                                onClick={() => togglePage(pKey)}
+                                              >
                                                 <ListItemIcon sx={{ minWidth: 36 }}>
                                                   <Checkbox edge="start" checked={selectedPages.has(pKey)} size="small" />
                                                 </ListItemIcon>
@@ -1040,6 +1178,26 @@ export default function OcrPage() {
         </Alert>
       )}
 
+      {/* ─── Sélection portant sur un registre verrouillé ailleurs ─── */}
+      {blockedSelection.size > 0 && (
+        <Alert
+          severity="warning"
+          sx={{ mt: 1, flexShrink: 0 }}
+          action={
+            <Button color="inherit" size="small" onClick={dropBlockedSelection}>
+              {t('busySelection.remove')}
+            </Button>
+          }
+        >
+          <Typography variant="body2" fontWeight={600}>
+            {t('busySelection.title', { count: blockedSelection.size })}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {[...blockedSelection].map(([rKey, from]) => `${rKey} — ${busyLabel(from)}`).join(' · ')}
+          </Typography>
+        </Alert>
+      )}
+
       {/* ─── Barre de lancement ─── */}
       <OcrLaunchBar
         selectedCount={selectedPages.size}
@@ -1052,11 +1210,42 @@ export default function OcrPage() {
         canLaunch={canLaunch}
         disabledReason={disabledReason}
         envChip={<EnvStatusChip requirements={requirements} loading={reqLoading} failed={reqFailed} />}
-        onLaunch={launchOcr}
+        onLaunch={requestLaunch}
         onClearSelection={() => setSelectedPages(new Set())}
         onPauseOcr={pauseOcr}
         onResumeOcr={resumeOcr}
       />
+
+      {/* ─── Confirmation d'écrasement ─── */}
+      <Dialog open={overwrite !== null} onClose={() => setOverwrite(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>{t('overwrite.title')}</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {t('overwrite.detail', {
+              count: overwrite?.doneCount ?? 0,
+              total: overwrite?.all.length ?? 0,
+              model: models.find((m) => m.id === selectedOcrModel)?.name ?? selectedOcrModel,
+            })}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOverwrite(null)}>{t('common:actions.cancel')}</Button>
+          {(overwrite?.missing.length ?? 0) > 0 && (
+            <Button
+              onClick={() => { const keys = overwrite!.missing; setOverwrite(null); doLaunch(keys); }}
+            >
+              {t('overwrite.missingOnly', { count: overwrite?.missing.length ?? 0 })}
+            </Button>
+          )}
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={() => { const keys = overwrite!.all; setOverwrite(null); doLaunch(keys); }}
+          >
+            {t('overwrite.confirm')}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
     </Box>
   );

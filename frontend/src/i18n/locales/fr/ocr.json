@@ -54,7 +54,9 @@
     "envIncomplete": "Environnement OCR incomplet — voir le bandeau en haut de page",
     "configIncomplete": "Configuration incomplète — complétez les prérequis",
     "chooseModels": "Choisissez un modèle de segmentation et un modèle OCR",
-    "selectPage": "Sélectionnez au moins une page"
+    "selectPage": "Sélectionnez au moins une page",
+    "selectionBusy_one": "Un registre sélectionné est déjà en cours de transcription avec ce modèle",
+    "selectionBusy_other": "{{count}} registres sélectionnés sont déjà en cours de transcription avec ce modèle"
   },
   "ready": {
     "title": "Prêt à transcrire ?",
@@ -91,7 +93,10 @@
     "loadingStates": "Chargement des états…",
     "noPageDone": "Aucune page transcrite",
     "noPageMissing": "Aucune page non transcrite",
-    "noPage": "Aucune page"
+    "noPage": "Aucune page",
+    "busyHere": "Transcription en cours sur ce poste avec ce modèle — sélection impossible",
+    "busyOn": "Transcription en cours sur « {{machine}} » avec ce modèle — sélection impossible",
+    "busyChip": "en cours"
   },
   "page": {
     "transcribedWith": "Transcrite avec ce modèle",
@@ -102,6 +107,19 @@
   "queued_other": "{{count}} pages ajoutées à la file d'attente OCR.",
   "skipped_one": "1 page ignorée : son image est introuvable sur le disque. Resynchronisez la collection.",
   "skipped_other": "{{count}} pages ignorées : leurs images sont introuvables sur le disque. Resynchronisez la collection.",
+  "busySelection": {
+    "title_one": "1 registre sélectionné est déjà en cours de transcription",
+    "title_other": "{{count}} registres sélectionnés sont déjà en cours de transcription",
+    "remove": "Retirer de la sélection"
+  },
+  "overwrite": {
+    "title": "Des transcriptions existantes vont être écrasées",
+    "detail_one": "1 des {{total}} pages sélectionnées a déjà une transcription avec le modèle « {{model}} ». La relancer remplacera le fichier existant — il n'y a pas d'historique.",
+    "detail_other": "{{count}} des {{total}} pages sélectionnées ont déjà une transcription avec le modèle « {{model}} ». Les relancer remplacera les fichiers existants — il n'y a pas d'historique.",
+    "missingOnly_one": "Ne transcrire que la page manquante",
+    "missingOnly_other": "Ne transcrire que les {{count}} pages manquantes",
+    "confirm": "Relancer et écraser"
+  },
   "launchBar": {
     "selected_one": "{{count}} page sélectionnée",
     "selected_other": "{{count}} pages sélectionnées",

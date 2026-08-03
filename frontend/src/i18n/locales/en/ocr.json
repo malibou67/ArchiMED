@@ -54,7 +54,9 @@
     "envIncomplete": "OCR environment incomplete — see the banner at the top of the page",
     "configIncomplete": "Incomplete configuration — complete the requirements",
     "chooseModels": "Choose a segmentation model and an OCR model",
-    "selectPage": "Select at least one page"
+    "selectPage": "Select at least one page",
+    "selectionBusy_one": "One selected register is already being transcribed with this model",
+    "selectionBusy_other": "{{count}} selected registers are already being transcribed with this model"
   },
   "ready": {
     "title": "Ready to transcribe?",
@@ -91,7 +93,10 @@
     "loadingStates": "Loading states…",
     "noPageDone": "No transcribed page",
     "noPageMissing": "No untranscribed page",
-    "noPage": "No page"
+    "noPage": "No page",
+    "busyHere": "Being transcribed on this computer with this model — cannot be selected",
+    "busyOn": "Being transcribed on “{{machine}}” with this model — cannot be selected",
+    "busyChip": "running"
   },
   "page": {
     "transcribedWith": "Transcribed with this model",
@@ -102,6 +107,19 @@
   "queued_other": "{{count}} pages added to the OCR queue.",
   "skipped_one": "1 page skipped: its image could not be found on disk. Resynchronise the collection.",
   "skipped_other": "{{count}} pages skipped: their images could not be found on disk. Resynchronise the collection.",
+  "busySelection": {
+    "title_one": "1 selected register is already being transcribed",
+    "title_other": "{{count}} selected registers are already being transcribed",
+    "remove": "Remove from selection"
+  },
+  "overwrite": {
+    "title": "Existing transcriptions will be overwritten",
+    "detail_one": "1 of the {{total}} selected pages already has a transcription with the “{{model}}” model. Running it again will replace the existing file — there is no history.",
+    "detail_other": "{{count}} of the {{total}} selected pages already have a transcription with the “{{model}}” model. Running them again will replace the existing files — there is no history.",
+    "missingOnly_one": "Transcribe the missing page only",
+    "missingOnly_other": "Transcribe the {{count}} missing pages only",
+    "confirm": "Run again and overwrite"
+  },
   "launchBar": {
     "selected_one": "{{count}} page selected",
     "selected_other": "{{count}} pages selected",

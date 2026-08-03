@@ -39,6 +39,9 @@ export interface Task {
   // Spécifique OCR
   collections?: string[];
   registres?: string[];
+  // Couples (collection, registre) réellement couverts — l'unité de verrou côté backend.
+  // Absent des tâches enfilées avant son introduction : replier sur collections × registres.
+  scopes?: [string, string][];
   // « collection/registre » des registres entièrement traités, publiés au fil de l'eau
   // (les métadonnées de la collection sont à jour pour eux, sans attendre la fin de la tâche).
   registres_done?: string[];
