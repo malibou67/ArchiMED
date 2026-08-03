@@ -23,6 +23,13 @@ from dotenv import load_dotenv
 # OCR_MIXED_PRECISION au moment de l'import.
 load_dotenv()
 
+# …et avant tout code applicatif : le journal doit être en place pour capter ce que les
+# imports eux-mêmes émettent. Au niveau module (et non dans `__main__`) pour couvrir aussi le
+# lancement via `uvicorn main:app` en développement.
+import app_logging
+_log_file = app_logging.setup()
+log = app_logging.get_logger('app')
+
 from routers import models, collections, registres, transcriptions, indexes, system, ocr, settings, tasks
 # Importer les modules de runners enregistre leurs types auprès du moteur de tâches
 # (ocr_service → 'ocr', index_runner → 'index') AVANT la reprise au démarrage.
@@ -47,9 +54,32 @@ app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
 
 
 @app.on_event("startup")
-async def _resume_tasks():
-    """Recharge la file de tâches : marque les tâches interrompues et reprend les attentes."""
+async def _on_startup():
+    """Ouvre le journal du poste, contrôle le stockage, puis recharge la file de tâches
+    (marque les tâches interrompues et reprend les attentes)."""
+    import machine_identity
+    from services import DATA_DIR, check_data_storage
+    from app_logging import kv
     from task_service import TaskService
+
+    ident = machine_identity.get_identity()
+    log.info("Démarrage " + kv(
+        version=app.version,
+        poste=ident['machine_id'],
+        libellé=ident['machine_label'],
+        opérateur=ident['operator'],
+        data=DATA_DIR,
+        journal=_log_file,
+        mode='exe' if getattr(sys, 'frozen', False) else 'dev',
+        python=sys.version.split()[0],
+    ))
+
+    storage = check_data_storage()
+    if not storage['exists']:
+        log.error(f"Dossier de données introuvable {kv(data=storage['data_dir'])}")
+    elif not storage['writable']:
+        log.error(f"Dossier de données en lecture seule {kv(data=storage['data_dir'])}")
+
     TaskService.load_on_startup()
 
 
@@ -83,6 +113,7 @@ if os.path.isdir(_static_dir):
         return FileResponse(os.path.join(_static_dir, "index.html"))
 
 if __name__ == "__main__":
+    import logging
     import uvicorn
     import webbrowser
     import threading
@@ -90,12 +121,12 @@ if __name__ == "__main__":
     import pystray
     from PIL import Image, ImageDraw
 
-    # PyInstaller sans console : stdout/stderr sont None, uvicorn plante sur isatty()
+    # PyInstaller sans console : stdout/stderr sont None, uvicorn plante sur isatty(). La
+    # redirection va dans le journal du poste : tracebacks de threads et impressions des
+    # bibliothèques tierces y sont datés et rangés avec le reste, au lieu d'un fichier brut
+    # écrit à côté de l'exe — donc sur le NAS, donc partagé avec tous les autres postes.
     if getattr(sys, 'frozen', False):
-        log_path = os.path.join(os.path.dirname(sys.executable), 'archiMED.log')
-        _log_file = open(log_path, 'w', encoding='utf-8')
-        sys.stdout = _log_file
-        sys.stderr = _log_file
+        app_logging.redirect_std_streams()
 
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", 38520))
@@ -104,14 +135,17 @@ if __name__ == "__main__":
     # Instance déjà active → ouvrir le navigateur et quitter
     try:
         urllib.request.urlopen(f"{url}/health", timeout=1)
+        log.info("Instance déjà active, ouverture du navigateur")
         webbrowser.open(url)
         sys.exit(0)
     except Exception:
         pass
 
-    # Uvicorn dans un thread daemon
+    # Uvicorn dans un thread daemon. `log_config=None` laisse ses journaux remonter au handler
+    # racine ; `access_log=False` les garde exploitables : l'UI interroge /api/tasks chaque
+    # seconde, une ligne par requête noierait tout le reste.
     threading.Thread(
-        target=lambda: uvicorn.run(app, host=host, port=port, log_config=None),
+        target=lambda: uvicorn.run(app, host=host, port=port, log_config=None, access_log=False),
         daemon=True
     ).start()
 
@@ -136,14 +170,16 @@ if __name__ == "__main__":
         webbrowser.open(url)
 
     def _on_quit(icon, item):
+        log.info("Arrêt demandé depuis la zone de notification")
         icon.stop()
         # os._exit saute les handlers atexit : sans ce nettoyage, les workers d'un OCR en
         # cours survivent à la fermeture et continuent d'occuper le GPU.
         try:
             import ocr_service
             ocr_service.kill_active_pools()
-        except Exception:
-            pass
+        except Exception as e:
+            log.error(f"Échec de l'arrêt des workers OCR : {e}")
+        logging.shutdown()
         os._exit(0)
 
     tray = pystray.Icon(

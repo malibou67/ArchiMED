@@ -40,6 +40,9 @@ data/indexes/*
 # tasks = état runtime du moteur de tâches — jamais versionné
 data/tasks/
 
+# logs = journal d'exploitation, un sous-dossier par poste — jamais versionné
+data/logs/
+
 # ─── OS ───────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

@@ -13,10 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional, Tuple
 
+from app_logging import get_logger, kv
 from services import DATA_DIR, ModelsService, CollectionsService, RegistresService
 from settings_service import SettingsService
 from system_checks import check_requirements
 from task_service import TaskService
+
+log = get_logger('ocr')
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
 
@@ -192,7 +195,7 @@ def _write_xml_atomic(out_path: Path, xml: str) -> None:
             # remontent en OSError nu : on réessaie dans les deux cas, l'attente perdue sur une
             # erreur définitive (disque plein) est négligeable devant le coût d'une page.
             if attempt == 0:
-                print(f"[OCR] écriture différée ({out_path.name}) : {e}", flush=True)
+                log.warning("Écriture XML différée " + kv(fichier=out_path.name, err=e))
             if attempt == XML_WRITE_ATTEMPTS - 1:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -283,8 +286,8 @@ class OcrService:
                 "introuvables sur le disque. Resynchronisez la collection."
             )
         if skipped:
-            print(f"[OCR] {len(skipped)} page(s) écartée(s) (image introuvable), "
-                  f"ex. {skipped[0]['registre']}/{skipped[0]['page']}", flush=True)
+            log.warning("Pages écartées, image introuvable " + kv(
+                nombre=len(skipped), exemple=f"{skipped[0]['registre']}/{skipped[0]['page']}"))
         # Collections/registres dérivés des pages **retenues** : un registre entièrement
         # fantôme ne doit rien verrouiller ni apparaître dans le récapitulatif.
         collections = sorted({p['collection'] for p in kept})
@@ -603,6 +606,9 @@ class OcrService:
                 states[i] = 2
                 task['failed'] += 1
                 task['errors'].append({'page': label, 'error': str(e)})
+                # `errors` est plafonné à l'affichage et disparaît avec la tâche purgée :
+                # le journal est la seule trace durable des pages en échec.
+                log.warning("Page en échec " + kv(registre=reg, page=img_name, err=e))
             on_page_done(col, reg)
             TaskService._save_throttled(task)
 
@@ -643,6 +649,8 @@ class OcrService:
                         states[idx] = 2
                         task['failed'] += 1
                         task['errors'].append({'page': label, 'error': err})
+                        log.warning("Page en échec " + kv(
+                            registre=by_index[idx]['registre'], page=by_index[idx]['page'], err=err))
                     task['current'] = label
                     on_page_done(col, by_index[idx]['registre'])
                 if done:
@@ -654,7 +662,7 @@ class OcrService:
             if OcrService._stop_requested(task):
                 killed = _kill_pool(executor)
                 if killed:
-                    print(f"[OCR] arrêt demandé : {killed} worker(s) interrompu(s).", flush=True)
+                    log.info("Arrêt demandé " + kv(workers_interrompus=killed))
             with _POOLS_LOCK:
                 _ACTIVE_POOLS.discard(executor)
             try:
@@ -693,6 +701,8 @@ def _registre_reporter(task: Dict[str, Any], todo: List) -> Callable[[str, str],
     for _, p in todo:
         key = (p['collection'], p['registre'])
         remaining[key] = remaining.get(key, 0) + 1
+    planned = dict(remaining)
+    started = time.time()
     done: List[str] = task.setdefault('registres_done', [])
 
     def on_page_done(collection: str, registre: str) -> None:
@@ -707,11 +717,20 @@ def _registre_reporter(task: Dict[str, Any], todo: List) -> Callable[[str, str],
         remaining.pop(key, None)
         try:
             CollectionsService.refresh_registre_ocr_status(collection, registre)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Publication de l'ocr_status en échec " + kv(
+                collection=collection, registre=registre, err=e))
         label = f"{collection}/{registre}"
         if label not in done:
             done.append(label)
+        # Un résumé par registre, jamais par page : un gros registre produirait des milliers
+        # de lignes et ferait tourner la rotation avant même la fin de la tâche. La durée est
+        # celle écoulée depuis le début de l'exécution — en mode pool les pages de plusieurs
+        # registres s'entrelacent, une durée « par registre » n'aurait pas de sens. L'écart
+        # entre deux lignes donne la cadence.
+        log.info("Registre terminé " + kv(
+            collection=collection, registre=registre, pages=planned[key],
+            écoulé=f"{int(time.time() - started)}s"))
 
     return on_page_done
 
@@ -753,6 +772,16 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
             task['preflight']['workers_requested'] = requested
             task['preflight']['workers_cap_reason'] = cap_reason
         TaskService._save(task)
+        # Photo de l'environnement d'exécution : elle ne vit sinon que dans la tâche, donc
+        # disparaît à la purge, alors que c'est la première chose qu'on veut relire quand un
+        # poste transcrit dix fois plus lentement qu'un autre.
+        log.info("Préflight " + kv(
+            id=task['id'], device=device, vram=(pre.get('cuda') or {}).get('vram_gb'),
+            workers=workers, workers_demandés=requested if cap_reason else None,
+            bridage=cap_reason, threads=task['preflight']['threads'],
+            précision_mixte=task['preflight']['mixed_precision'],
+            kraken=(pre.get('kraken') or {}).get('version'),
+            torch=(pre.get('torch') or {}).get('version')))
 
         missing = [label for key, label in
                    (('torch', 'PyTorch'), ('torchvision', 'torchvision'), ('kraken', 'Kraken'))
@@ -798,7 +827,7 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
                 task['preflight']['mode'] = 'sequential'
                 task['preflight']['pool_fallback'] = str(pool_err)[:300]
                 TaskService._save(task)
-                print(f"[OCR] pool indisponible ({pool_err}); repli séquentiel.", flush=True)
+                log.warning("Pool indisponible, repli séquentiel " + kv(id=task['id'], err=pool_err))
                 OcrService._process_inline(task, touched, todo, seg_model_id, ocr_model_id,
                                            device, mixed, on_page_done)
     finally:

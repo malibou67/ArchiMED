@@ -35,6 +35,7 @@ ArchiMED/
 │   ├── indexes/            # Generated full-text search indexes
 │   ├── tasks/              # Background task state (+ tasks/control/)
 │   ├── locks/              # Scope locks held by a running task
+│   ├── logs/               # Operation log, one subfolder per machine
 │   └── settings.json       # OCR settings set from the UI
 ├── backend/
 │   ├── routers/            # API routes (9 routers)
@@ -57,6 +58,7 @@ ArchiMED/
 │   ├── stats_service.py    # Collection and index statistics
 │   ├── settings_service.py # settings.json read/write
 │   ├── machine_identity.py # Per-machine identity (multi-PC deployment)
+│   ├── app_logging.py      # Per-machine log file (setup, kv formatting)
 │   ├── system_checks.py    # Kraken/torch readiness checks
 │   ├── tests/              # pytest suite (see Roadmap)
 │   ├── .env.example        # HOST / PORT / DATA_DIR
@@ -210,6 +212,32 @@ Since every machine both reads and writes that folder, three rules keep them con
   up and applies. Tasks left behind by a machine that is off (queued, paused, interrupted) are still
   finalised directly, so an orphan never blocks anyone.
 
+### Logs
+
+Each machine writes its own file, `data/logs/<machine_id>/archimed.log` — a single writer per
+file, so nothing interleaves and no two processes fight over the rotation rename, yet every
+machine's log is readable from any PC. That last point is what makes remote diagnosis possible
+at all: each backend binds `127.0.0.1`, so there is no cross-machine HTTP, and the shared folder
+is the only common ground. If `data/` is unreachable the log falls back to
+`%LOCALAPPDATA%\ArchiMED\logs\` — an unreachable NAS is exactly when the log is needed.
+
+Format is plain text plus `key=value` fields (`app_logging.kv`), openable in Notepad straight
+from the NAS. Timestamps carry their UTC offset, unlike the naive `datetime.now()` used
+elsewhere: files from several machines are meant to be read side by side. Rotation caps each
+machine at 5 MB × 5 files ≈ 25 MB, which is the entire cleanup story — there is no age-based
+purge to run.
+
+What gets logged: process lifecycle, task lifecycle (created / started / finished with status,
+duration and counts), OCR preflight, per-page failures, index runs, and the multi-machine
+events that are otherwise invisible — refused creations, stale locks reclaimed, control
+commands sent and received, failed writes to the shared folder. Successful OCR pages are
+deliberately **not** logged (thousands of lines per register); one summary per finished
+register is emitted instead. `setup()` is a no-op in child processes, because the OCR pool
+workers re-execute the executable and a second writer would corrupt rotation.
+
+**Confidentiality.** The registers are hospital archives: transcribed text and patient names
+must never reach the log. Only identifiers — register, page number, file name, model.
+
 ## Configuration
 
 ### Backend (`.env`)
@@ -217,6 +245,7 @@ Since every machine both reads and writes that folder, three rules keep them con
 HOST=0.0.0.0
 PORT=38520
 DATA_DIR=../data
+LOG_LEVEL=INFO
 ```
 
 - `HOST` — bind address. Note: the code **defaults to `127.0.0.1`** (local only); the shipped
@@ -224,6 +253,9 @@ DATA_DIR=../data
 - `PORT` — HTTP port (default `38520`).
 - `DATA_DIR` — location of the `data/` folder. When frozen (PyInstaller) it defaults to the
   folder next to the executable; in development it defaults to the project root.
+- `LOG_LEVEL` — log verbosity (default `INFO`). `DEBUG` adds the shared-folder read retries,
+  which is what you want when investigating a flaky NAS. An unrecognised value falls back to
+  `INFO` rather than preventing startup.
 
 ### OCR settings (env + `data/settings.json`)
 

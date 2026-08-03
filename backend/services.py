@@ -1,12 +1,17 @@
 import os
 import sys
 import json
+import logging
 import re
 import tempfile
 import time
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from rapidfuzz import fuzz as _fuzz
+
+# `logging` de la stdlib, pas `app_logging` : celui-ci importe DATA_DIR d'ici, l'inverse
+# créerait un cycle. Le handler est posé sur la racine par `app_logging.setup()`.
+log = logging.getLogger('data')
 
 def _get_base_dir() -> str:
     if getattr(sys, 'frozen', False):
@@ -55,9 +60,16 @@ def _read_json_retry(path: Path, retries: int = 3, delay: float = 0.04) -> Optio
         try:
             with open(path, 'r', encoding='utf-8-sig') as f:
                 return json.load(f)
-        except (json.JSONDecodeError, PermissionError, OSError):
+        except FileNotFoundError:
+            return None   # absence normale (metadata pas encore écrit) — rien à réessayer
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
             if attempt == retries - 1:
+                # L'appelant interprète `None` comme « pas de metadata » et publie des
+                # compteurs vides : sans cette trace, un NAS qui décroche se manifeste par des
+                # chiffres qui s'effondrent sans la moindre erreur nulle part.
+                log.warning(f"Lecture JSON abandonnée fichier={path.name} err={e}")
                 return None
+            log.debug(f"Relecture JSON fichier={path.name} tentative={attempt + 1} err={e}")
             time.sleep(delay)
     return None
 

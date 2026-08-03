@@ -97,6 +97,17 @@ this only as a development procedure.
 - [ ] Publication: `git tag v1.0.0 && git push --tags` → CI builds and attaches the zips.
 - [ ] Have the macOS zip tested by a Mac user (not testable from Windows).
 
+## Troubleshooting an installed copy
+
+Ask for `data/logs/<machine_id>/archimed.log` (machine_id is the lowercase Windows computer
+name). It records startup — resolved `DATA_DIR`, port, versions, whether the data folder is
+writable — plus every task, the OCR preflight, and the failures that never surface in the UI.
+Set `LOG_LEVEL=DEBUG` in `.env` to also capture shared-folder read retries. See the "Logs"
+section of ARCHITECTURE.md.
+
+Older builds wrote an `archiMED.log` next to `ArchiMED.exe`, shared by every machine and wiped
+at each launch. It is no longer written and can be deleted.
+
 ## Associated verifications (when implementing)
 
 1. `docker build -t archimed .` then `docker compose up` →

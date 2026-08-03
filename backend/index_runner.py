@@ -3,10 +3,14 @@
 Module séparé (importe `services` ET `task_service`) pour éviter un cycle d'import :
 `task_service` importe `services`, et `services` n'importe pas `task_service`.
 """
+import time
 from typing import Any, Dict, List, Optional
 
+from app_logging import get_logger, kv
 from services import IndexesService
 from task_service import TaskService
+
+log = get_logger('index')
 
 
 def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional[str] = None,
@@ -93,6 +97,13 @@ def run_index_task(task: dict) -> None:
     """Runner appelé par TaskService : construit l'index et rapporte la progression.
     L'index (metadata.json + index.json) reste la source pour la liste et la recherche."""
     index_id = task['index_id']
+    started = time.time()
+    log.info("Indexation " + kv(
+        id=task['id'], index=index_id, nom=task.get('index_name'),
+        mode='complète' if task.get('index_full') else 'incrémentale',
+        nouveau=bool(task.get('index_is_new')),
+        registres=len(task.get('index_registres') or []), pages=task.get('total'),
+        sources=len(task.get('index_sources') or [])))
 
     def on_progress(processed: int, total: int, current, page=None) -> None:
         task['total'] = total
@@ -114,12 +125,19 @@ def run_index_task(task: dict) -> None:
         task['index_skipped'] = skipped
         task['index_base'] = base
         TaskService._save(task)
+        if skipped:
+            log.info("Registres réutilisés tels quels " + kv(
+                index=index_id, registres=len(skipped), pages=base))
 
     result = IndexesService.generate_index(
         index_id,
         on_progress=on_progress, should_cancel=should_cancel, should_pause=should_pause,
         full=bool(task.get('index_full')), on_plan=on_plan,
     )
+
+    log.info("Indexation terminée " + kv(
+        id=task['id'], index=index_id, issue=result or 'done',
+        pages=task.get('processed'), écoulé=f"{int(time.time() - started)}s"))
 
     if result == 'paused':
         task['status'] = 'paused'   # le checkpoint permettra la reprise
