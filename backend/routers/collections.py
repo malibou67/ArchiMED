@@ -64,7 +64,7 @@ def sync_all_collections(token: Optional[str] = None):
 def sync_all_collections_stream(token: Optional[str] = None):
     """Même synchronisation que /sync-all, mais en flux NDJSON : une ligne JSON de
     progression par collection ({"type":"progress","current","total","name"}) puis une
-    ligne finale ({"type":"done","results":[...],"summary":[...]}).
+    ligne finale ({"type":"done","results":[...]}).
 
     `token` est celui rendu par l'analyse : s'il désigne un instantané encore valable, la
     synchronisation ne relit pas le NAS et se contente d'écrire."""

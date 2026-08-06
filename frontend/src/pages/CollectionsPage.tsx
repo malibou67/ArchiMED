@@ -15,7 +15,6 @@ import {
   TextField,
   Chip,
   IconButton,
-  Skeleton,
   Table,
   TableHead,
   TableBody,
@@ -48,7 +47,6 @@ import type { TFunction } from 'i18next';
 import { ImageViewer, FullPageViewer, makePatternRegex, sortPages, pageFamilyFromList, thumbLabel } from '../components/PageImageViewer';
 import { collectionsApi } from '../api/collections';
 import { registresApi } from '../api/registres';
-import { transcriptionsApi } from '../api/transcriptions';
 import EmptyState from '../components/EmptyState';
 import Loader from '../components/Loader';
 import {
@@ -59,7 +57,6 @@ import {
   CollectionScanStatus,
   ScanReport,
   ScanProgress,
-  TranscriptionsSummary,
 } from '../types';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -278,7 +275,7 @@ function ScanCollectionRow({ col, onSync, syncing }: {
                         {reg.pages_count.toLocaleString('fr-FR')}
                       </TableCell>
                       <TableCell align="right">
-                        <CoverageCell counts={ocrCounts} pageCount={reg.pages_count} loading={false} />
+                        <CoverageCell counts={ocrCounts} pageCount={reg.pages_count} />
                       </TableCell>
                       <TableCell>
                         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, alignItems: 'center' }}>
@@ -298,10 +295,11 @@ function ScanCollectionRow({ col, onSync, syncing }: {
   );
 }
 
-function CoverageCell({ counts, pageCount, loading, compact = false }: {
+// Plus d'état de chargement : la couverture se déduit des métadonnées, elle est donc prête
+// en même temps que la ligne qui la porte.
+function CoverageCell({ counts, pageCount, compact = false }: {
   counts: Record<string, number> | null;
   pageCount: number;
-  loading: boolean;
   // En mode compact : un seul badge « Transcrit » avec le détail des modèles au survol
   // (comme les lignes de pages), au lieu d'un badge par modèle.
   compact?: boolean;
@@ -310,10 +308,6 @@ function CoverageCell({ counts, pageCount, loading, compact = false }: {
   const locale = i18n.language.startsWith('fr') ? 'fr-FR' : 'en-US';
   const fmtN = (n: number) => n.toLocaleString(locale);
   const pagesStr = fmtN(pageCount);
-
-  if (loading) {
-    return <Skeleton variant="rounded" width={110} height={22} sx={{ ml: 'auto' }} />;
-  }
 
   const entries = counts ? Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)) : [];
 
@@ -473,16 +467,8 @@ export default function CollectionsPage() {
     extraPattern: string;
   } | null>(null);
 
-  // Transcriptions
-  const [summary, setSummary] = useState<TranscriptionsSummary[]>([]);
-  const [transcLoading, setTranscLoading] = useState(true);
-
   useEffect(() => {
     loadCollections();
-    transcriptionsApi.getSummary()
-      .then(setSummary)
-      .catch(() => {})
-      .finally(() => setTranscLoading(false));
   }, []);
 
   const loadCollections = async () => {
@@ -624,16 +610,15 @@ export default function CollectionsPage() {
     }
   };
 
-  // Le flux de synchronisation renvoie déjà les métadonnées de toutes les collections et la
-  // couverture de transcription : inutile de recharger l'une puis l'autre derrière, ce qui
-  // faisait reparcourir le NAS deux fois de plus pour des données qu'on venait de recevoir.
+  // Le flux de synchronisation renvoie déjà les métadonnées de toutes les collections :
+  // inutile de les recharger derrière, ce qui faisait reparcourir le NAS pour des données
+  // qu'on venait de recevoir. La couverture s'en déduit (cf. summaryMap).
   const handleSyncAll = async () => {
     setSyncing(true);
     setSyncProgress(null);
     try {
-      const { results, summary } = await collectionsApi.syncAllStream(scanReport?.token, setSyncProgress);
+      const results = await collectionsApi.syncAllStream(scanReport?.token, setSyncProgress);
       setCollections(results);
-      setSummary(summary);
       setError(null);
       // Synchronisation terminée : on ferme le dialog sans relancer de scan.
       setScanOpen(false);
@@ -685,12 +670,6 @@ export default function CollectionsPage() {
     try {
       await collectionsApi.sync(id);
       await loadCollections();
-      setTranscLoading(true);
-      try {
-        setSummary(await transcriptionsApi.getSummary());
-      } finally {
-        setTranscLoading(false);
-      }
     } catch (err) {
       setError(t('errors.syncCollection'));
       console.error(err);
@@ -699,7 +678,29 @@ export default function CollectionsPage() {
     }
   };
 
-  const summaryMap = new Map(summary.map(s => [s.collection_id, s]));
+  // Couverture OCR déduite des métadonnées déjà chargées, au lieu d'un appel qui énumérait
+  // tout l'arbre ocr/ et comptait chaque XML — le seul des deux appels de la page qui
+  // touchait vraiment le NAS, et celui qui retardait l'affichage. `ocr_status` est écrit par
+  // la synchronisation et rafraîchi registre par registre par le runner OCR ; c'est déjà la
+  // source utilisée pour cette même colonne dans le dialogue d'analyse et sur la page OCR.
+  const summaryMap = useMemo(() => {
+    const map = new Map<string, { totals: Record<string, number>; counts: Map<string, Record<string, number>> }>();
+    for (const col of collections) {
+      const key = col.folder_name || col.type;
+      const totals: Record<string, number> = {};
+      const counts = new Map<string, Record<string, number>>();
+      for (const reg of col.registres || []) {
+        const perModel: Record<string, number> = {};
+        for (const [model, status] of Object.entries(reg.ocr_status || {})) {
+          perModel[model] = status.pages_done;
+          totals[model] = (totals[model] ?? 0) + status.pages_done;
+        }
+        if (Object.keys(perModel).length) counts.set(reg.folder_name, perModel);
+      }
+      map.set(key, { totals, counts });
+    }
+    return map;
+  }, [collections]);
 
   // ── Liste filtrée : type + recherche (collections et registres, sans diacritiques) ──
   const searchActive = searchFilter.trim().length > 0;
@@ -725,9 +726,9 @@ export default function CollectionsPage() {
     return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
   }, [collections]);
 
-  // On garde le loader tant que collections ET couverture ne sont pas prêtes,
-  // sinon le tableau s'affiche puis change de hauteur quand les taux arrivent.
-  if (loading || transcLoading) return <Loader message={t('loading')} minHeight="60vh" />;
+  // La couverture se déduit des collections : elle est prête en même temps qu'elles, et le
+  // tableau ne change plus de hauteur quand les taux arrivent.
+  if (loading) return <Loader message={t('loading')} minHeight="60vh" />;
 
   // Vue pleine page d'un registre — le composant reste monté, donc l'état
   // (expansion, caches de pages) est préservé au retour.
@@ -886,7 +887,6 @@ export default function CollectionsPage() {
                         <CoverageCell
                           counts={colSummary?.totals ?? null}
                           pageCount={allRegs.reduce((s, r) => s + r.pages_count, 0)}
-                          loading={transcLoading}
                           compact
                         />
                       </TableCell>
@@ -950,7 +950,7 @@ export default function CollectionsPage() {
                                 const regPages = registrePagesCache.get(cacheKey);
                                 const regOcr = registreOcrCache.get(cacheKey) ?? {};
                                 const regLoading = loadingRegistrePages === cacheKey;
-                                const regSummary = colSummary?.registres.find(r => r.registre_id === regKey);
+                                const regCounts = colSummary?.counts.get(regKey);
                                 // Anomalies/trous/doublons lus depuis le metadata persisté au dernier sync.
                                 // (fallback sur la dérivation client pour les collections pas encore resynchronisées).
                                 const regAnomalies_ = registre.anomalies ?? registreAnomalies(registre);
@@ -1037,9 +1037,8 @@ export default function CollectionsPage() {
                                       </TableCell>
                                       <TableCell align="right">
                                         <CoverageCell
-                                          counts={regSummary?.counts ?? null}
+                                          counts={regCounts ?? null}
                                           pageCount={registre.pages_count}
-                                          loading={transcLoading}
                                           compact
                                         />
                                       </TableCell>

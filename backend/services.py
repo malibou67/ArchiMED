@@ -1074,34 +1074,6 @@ class CollectionsService:
         }
 
     @staticmethod
-    def summary_from_snapshot(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Couverture de transcription au format de `TranscriptionsService.get_summary`,
-        déduite de l'instantané. Même source (les XML comptés sur le disque), mais sans le
-        parcours complet de `ocr/` que la page déclenchait après chaque synchronisation."""
-        result = []
-        for folder_name, entry in snap.get('collections', {}).items():
-            if not entry.get('has_ocr_folder'):
-                continue
-            all_models: set = set()
-            registres_data = []
-            for reg_name, reg in (entry.get('registres') or {}).items():
-                counts = {m: s.get('pages_done', 0) for m, s in (reg.get('ocr_status') or {}).items()}
-                if counts:
-                    registres_data.append({"registre_id": reg_name, "counts": counts})
-                    all_models.update(counts)
-
-            models = sorted(all_models)
-            totals = {m: sum(r["counts"].get(m, 0) for r in registres_data) for m in models}
-            result.append({
-                "collection_id": folder_name,
-                "models": models,
-                "registres": registres_data,
-                "totals": totals,
-                "grand_total": sum(totals.values()),
-            })
-        return result
-
-    @staticmethod
     def scan_filesystem() -> Dict[str, Any]:
         """Diagnostic en lecture seule du dossier collections : présence des fichiers,
         couverture OCR par modèle, état de pagination et anomalies. N'écrit rien sur le NAS
@@ -1141,7 +1113,7 @@ class CollectionsService:
     def sync_all_collections_iter(token: Optional[str] = None):
         """Variante en flux de sync_all_collections : émet un événement de progression par
         collection ({'type': 'progress', 'current', 'total', 'name'}) puis un événement
-        final ({'type': 'done', 'results': [...], 'summary': [...]}).
+        final ({'type': 'done', 'results': [...]}).
 
         `token` est celui rendu par l'analyse. S'il désigne un instantané encore valable, la
         synchronisation repart de ce que l'analyse a déjà lu et ne fait plus que des
@@ -1149,7 +1121,7 @@ class CollectionsService:
         started = time.time()
         collections_dir = CollectionsService.get_collections_dir()
         if not collections_dir.exists():
-            yield {"type": "done", "results": [], "summary": []}
+            yield {"type": "done", "results": []}
             return
 
         snap = scan_snapshot.load(token, DATA_DIR)
@@ -1177,13 +1149,11 @@ class CollectionsService:
 
         # L'instantané a été réaligné sur ce qui vient d'être écrit : on le persiste pour que
         # le rapport puisse être rejoué ensuite sans retoucher au NAS.
-        summary: List[Dict[str, Any]] = []
         if snap:
             scan_snapshot.save(snap)
-            summary = CollectionsService.summary_from_snapshot(snap)
 
         log.info(f"Synchronisation terminée collections={total} durée={time.time() - started:.1f}s")
-        yield {"type": "done", "results": results, "summary": summary}
+        yield {"type": "done", "results": results}
 
     @staticmethod
     def sync_collection_with_token_iter(collection_id: str, token: Optional[str] = None):

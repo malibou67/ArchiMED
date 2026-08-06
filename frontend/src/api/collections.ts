@@ -1,5 +1,5 @@
 import api from './config';
-import { CollectionMetadata, CollectionUpdate, ScanReport, ScanProgress, CollectionStatsResponse, TranscriptionsSummary } from '../types';
+import { CollectionMetadata, CollectionUpdate, ScanReport, ScanProgress, CollectionStatsResponse } from '../types';
 
 // Lit un flux NDJSON (une ligne JSON par événement) et appelle onEvent pour chacun.
 // Utilisé par les variantes en flux du scan et de la synchronisation.
@@ -122,14 +122,12 @@ export const collectionsApi = {
   // Même synchronisation que syncAll(), mais en flux NDJSON : onProgress est appelé à
   // chaque collection synchronisée, et la promesse résout sur la liste finale.
   // `token` est celui du rapport d'analyse : fourni, la synchronisation repart de ce que
-  // l'analyse a déjà lu au lieu de reparcourir tout le NAS. Le résumé de transcription est
-  // renvoyé avec les résultats, ce qui évite un troisième parcours côté page.
+  // l'analyse a déjà lu au lieu de reparcourir tout le NAS.
   syncAllStream: async (
     token: string | undefined,
     onProgress: (p: ScanProgress) => void,
-  ): Promise<{ results: CollectionMetadata[]; summary: TranscriptionsSummary[] }> => {
+  ): Promise<CollectionMetadata[]> => {
     let results: CollectionMetadata[] | null = null;
-    let summary: TranscriptionsSummary[] = [];
     let cur: ScanProgress | null = null;
     const url = `/api/collections/sync-all/stream${token ? `?token=${encodeURIComponent(token)}` : ''}`;
     await readNdjson(url, { method: 'POST' }, (event) => {
@@ -141,10 +139,9 @@ export const collectionsApi = {
         onProgress(cur);
       } else if (event.type === 'done') {
         results = event.results;
-        summary = event.summary ?? [];
       }
     });
-    return { results: results ?? [], summary };
+    return results ?? [];
   },
 
   getStats: async (id: string): Promise<CollectionStatsResponse> => {
