@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import json
@@ -5,9 +6,12 @@ import logging
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from rapidfuzz import fuzz as _fuzz
+
+import scan_snapshot
 
 # `logging` de la stdlib, pas `app_logging` : celui-ci importe DATA_DIR d'ici, l'inverse
 # créerait un cycle. Le handler est posé sur la racine par `app_logging.setup()`.
@@ -48,6 +52,32 @@ def check_data_storage() -> Dict[str, Any]:
     }
 
 
+def _read_json_probe(path: Path, retries: int = 3, delay: float = 0.04):
+    """`(présent, contenu)` — même lecture tolérante que `_read_json_retry`, mais en
+    distinguant le fichier **absent** (cas normal, rien à signaler) du fichier **présent
+    mais illisible** (anomalie à remonter). Un simple `None` confond les deux, alors que
+    l'analyse doit précisément savoir les séparer pour publier `metadata_illisible`.
+
+    Rend aussi une lecture unique suffisante là où il fallait sinon un `exists()` puis un
+    `open()` — un aller-retour SMB de moins par fichier."""
+    for attempt in range(retries):
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                return True, json.load(f)
+        except FileNotFoundError:
+            return False, None   # absence normale (metadata pas encore écrit) — rien à réessayer
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
+            if attempt == retries - 1:
+                # L'appelant interprète `None` comme « pas de metadata » et publie des
+                # compteurs vides : sans cette trace, un NAS qui décroche se manifeste par des
+                # chiffres qui s'effondrent sans la moindre erreur nulle part.
+                log.warning(f"Lecture JSON abandonnée fichier={path.name} err={e}")
+                return True, None
+            log.debug(f"Relecture JSON fichier={path.name} tentative={attempt + 1} err={e}")
+            time.sleep(delay)
+    return True, None
+
+
 def _read_json_retry(path: Path, retries: int = 3, delay: float = 0.04) -> Optional[Dict[str, Any]]:
     """Lit un JSON en tolérant une écriture concurrente. `None` si illisible.
 
@@ -56,22 +86,26 @@ def _read_json_retry(path: Path, retries: int = 3, delay: float = 0.04) -> Optio
     écritures sont atomiques (tmp + `os.replace`), donc jamais tronquées, mais sous Windows un
     lecteur peut tomber sur un `PermissionError` transitoire au moment exact du remplacement :
     on réessaie brièvement plutôt que de faire remonter l'erreur."""
-    for attempt in range(retries):
+    return _read_json_probe(path, retries, delay)[1]
+
+
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Écrit un JSON de façon atomique (tmp + `os.replace`).
+
+    Ces fichiers sont relus en boucle par les autres postes du NAS : une écriture en place
+    les expose à lire un contenu tronqué, ce que `_read_json_retry` ne peut pas rattraper
+    puisque le fichier reste tronqué."""
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
         try:
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return None   # absence normale (metadata pas encore écrit) — rien à réessayer
-        except (json.JSONDecodeError, PermissionError, OSError) as e:
-            if attempt == retries - 1:
-                # L'appelant interprète `None` comme « pas de metadata » et publie des
-                # compteurs vides : sans cette trace, un NAS qui décroche se manifeste par des
-                # chiffres qui s'effondrent sans la moindre erreur nulle part.
-                log.warning(f"Lecture JSON abandonnée fichier={path.name} err={e}")
-                return None
-            log.debug(f"Relecture JSON fichier={path.name} tentative={attempt + 1} err={e}")
-            time.sleep(delay)
-    return None
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _count_ocr_xml(reg_ocr_dir: Path, pages_total: int) -> Dict[str, Dict[str, int]]:
@@ -390,7 +424,11 @@ class CollectionsService:
 
     @staticmethod
     def list_collections() -> List[Dict[str, Any]]:
-        """Liste toutes les collections disponibles"""
+        """Liste toutes les collections disponibles.
+
+        Une collection dont le metadata.json est illisible est ignorée plutôt que de faire
+        échouer tout le listing : un seul fichier abîmé rendait auparavant l'application
+        entièrement muette, alors que l'analyse sait signaler le cas (`metadata_illisible`)."""
         collections_dir = CollectionsService.get_collections_dir()
         collections = []
 
@@ -399,12 +437,10 @@ class CollectionsService:
 
         for item in collections_dir.iterdir():
             if item.is_dir() and not item.name.startswith('.'):
-                metadata_file = item / "metadata.json"
-                if metadata_file.exists():
-                    with open(metadata_file, 'r', encoding='utf-8-sig') as f:
-                        metadata = json.load(f)
-                        metadata['folder_name'] = item.name
-                        collections.append(metadata)
+                metadata = _read_json_retry(item / "metadata.json")
+                if metadata is not None:
+                    metadata['folder_name'] = item.name
+                    collections.append(metadata)
 
         return collections
 
@@ -564,17 +600,19 @@ class CollectionsService:
         return CollectionsService.ocr_counts_from_meta(metadata, model_name)
 
     @staticmethod
-    def sync_collection_metadata(collection_id: str) -> Optional[Dict[str, Any]]:
+    def sync_collection_metadata(collection_id: str,
+                                 snap_entry: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Wrapper non-streaming de sync_collection_metadata_iter : draine l'itérateur et
         renvoie le metadata reconstruit (ou None si le dossier n'est pas une collection)."""
         result = None
-        for event in CollectionsService.sync_collection_metadata_iter(collection_id):
+        for event in CollectionsService.sync_collection_metadata_iter(collection_id, snap_entry):
             if event.get('type') == 'result':
                 result = event['metadata']
         return result
 
     @staticmethod
-    def sync_collection_metadata_iter(collection_id: str):
+    def sync_collection_metadata_iter(collection_id: str,
+                                      snap_entry: Optional[Dict[str, Any]] = None):
         """Variante en flux de sync_collection_metadata : reconstruit la liste des
         registres dans le metadata.json d'une collection, en émettant un événement de
         progression par registre ({'type': 'registre', 'reg_current', 'reg_total'}) puis
@@ -583,23 +621,38 @@ class CollectionsService:
 
         Si le dossier n'a pas encore de metadata.json (collection déposée à la main dans
         data/collections), un squelette minimal est créé — c'est le point d'entrée voulu :
-        déposer le dossier, scanner, synchroniser, puis affiner les métadonnées dans l'UI."""
+        déposer le dossier, scanner, synchroniser, puis affiner les métadonnées dans l'UI.
+
+        `snap_entry` : les faits que l'analyse vient de lire (cf. `scan_snapshot`). Fourni,
+        il supprime toute lecture du NAS — il ne reste que les écritures. À `None`, la
+        fonction sonde le disque elle-même via le même `_probe_collection_iter` : c'est le
+        chemin de référence, celui sur lequel on retombe dès qu'un instantané est refusé."""
         collections_dir = CollectionsService.get_collections_dir()
         collection_dir = collections_dir / collection_id
 
         if not collection_dir.is_dir():
             return None
 
+        # Le sondage émet déjà la progression par registre : on ne la réémet dans la boucle
+        # de traitement que s'il n'a pas eu lieu, pour que le compteur défile une seule fois.
+        emit_progress = snap_entry is not None
+        if snap_entry is None:
+            snap_entry = yield from CollectionsService._probe_collection_iter(collection_dir)
+
         metadata_file = collection_dir / "metadata.json"
-        if metadata_file.exists():
-            with open(metadata_file, 'r', encoding='utf-8-sig') as f:
-                metadata = json.load(f)
-        else:
+        scans_dir = collection_dir / "scans"
+        ocr_root = collection_dir / "ocr"
+
+        previous_metadata = snap_entry.get('metadata')
+        metadata = copy.deepcopy(previous_metadata)
+        if metadata is None:
+            if snap_entry.get('metadata_present'):
+                # Présent mais illisible : surtout pas de squelette neuf par-dessus, ce
+                # serait effacer des métadonnées saisies à la main.
+                raise ValueError(f"metadata.json illisible : {collection_id}")
             # Garde-fou : on ne transforme en collection que les dossiers qui ressemblent
             # à une collection (scans/ non vide ou ocr/ présent).
-            scans = collection_dir / "scans"
-            has_scans = scans.is_dir() and any(scans.iterdir())
-            if not has_scans and not (collection_dir / "ocr").is_dir():
+            if not snap_entry.get('scans_non_empty') and not snap_entry.get('has_ocr_folder'):
                 return None
             metadata = {
                 "id": f"col_{int(time.time())}_{re.sub(r'[^a-z0-9_-]', '_', collection_id.lower())}",
@@ -610,126 +663,132 @@ class CollectionsService:
                 "commentaire": "",
             }
 
-        scans_dir = collection_dir / "scans"
-        ocr_root = collection_dir / "ocr"
-        ocr_root.mkdir(exist_ok=True)
+        ocr_dirs = set(snap_entry.get('ocr_dirs') or [])
+        if not snap_entry.get('has_ocr_folder'):
+            ocr_root.mkdir(exist_ok=True)
         registres_summary = []
-        scan_reg_names = set()  # registres réellement présents dans scans/
+        registres = snap_entry.get('registres') or {}
+        scan_reg_names = set(registres)  # registres réellement présents dans scans/
+        reg_total = len(registres)
+        created_ocr_dirs = []
 
-        if scans_dir.exists():
-            reg_dirs = [d for d in sorted(scans_dir.iterdir(), key=lambda x: x.name) if d.is_dir()]
-            reg_total = len(reg_dirs)
-            for j, item in enumerate(reg_dirs, 1):
+        for j, (reg_name, reg) in enumerate(registres.items(), 1):
+            if emit_progress:
                 yield {"type": "registre", "reg_current": j, "reg_total": reg_total}
-                scan_reg_names.add(item.name)
 
-                reg_metadata_file = item / "metadata.json"
-                if reg_metadata_file.exists():
-                    with open(reg_metadata_file, 'r', encoding='utf-8-sig') as f:
-                        reg_meta = json.load(f)
-                    changed = False
-                else:
-                    reg_meta = {}
-                    changed = True
+            reg_metadata_file = scans_dir / reg_name / "metadata.json"
+            reg_meta = copy.deepcopy(reg.get('metadata'))
+            if reg_meta is None:
+                if reg.get('metadata_present'):
+                    raise ValueError(f"metadata.json illisible : {collection_id}/{reg_name}")
+                reg_meta = {}
+                changed = True
+            else:
+                changed = False
 
-                # Compter les pages images
-                pages = [
-                    f.name for f in item.iterdir()
-                    if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-                ]
+            pages = reg.get('pages') or []
 
-                # Pattern, bornes et pages hors-pattern (motif du metadata réutilisé s'il existe)
-                pagination = _diagnose_pagination(
-                    pages,
-                    known_pattern=reg_meta.get('pagination', {}).get('pattern'),
-                    known_start=reg_meta.get('pagination', {}).get('start'),
-                    known_end=reg_meta.get('pagination', {}).get('end'),
-                )
+            # Pattern, bornes et pages hors-pattern (motif du metadata réutilisé s'il existe)
+            pagination = _diagnose_pagination(
+                pages,
+                known_pattern=reg_meta.get('pagination', {}).get('pattern'),
+                known_start=reg_meta.get('pagination', {}).get('start'),
+                known_end=reg_meta.get('pagination', {}).get('end'),
+            )
 
-                # Compléter les champs dérivables manquants/vides (sans écraser les saisies)
-                if not reg_meta.get('id'):
-                    reg_meta['id'] = item.name
-                    changed = True
-                if not reg_meta.get('titre'):
-                    reg_meta['titre'] = item.name
-                    changed = True
+            # Compléter les champs dérivables manquants/vides (sans écraser les saisies)
+            if not reg_meta.get('id'):
+                reg_meta['id'] = reg_name
+                changed = True
+            if not reg_meta.get('titre'):
+                reg_meta['titre'] = reg_name
+                changed = True
 
-                periode = reg_meta.get('periode')
-                periode_empty = (
-                    not periode
-                    or (isinstance(periode, list) and all(not str(x).strip() for x in periode))
-                )
-                if periode_empty:
-                    year = _extract_year(item.name)
-                    reg_meta['periode'] = [year, year] if year else ['', '']
-                    changed = True
+            periode = reg_meta.get('periode')
+            periode_empty = (
+                not periode
+                or (isinstance(periode, list) and all(not str(x).strip() for x in periode))
+            )
+            if periode_empty:
+                year = _extract_year(reg_name)
+                reg_meta['periode'] = [year, year] if year else ['', '']
+                changed = True
 
-                if pagination['pattern'] and not reg_meta.get('pagination', {}).get('pattern'):
-                    reg_meta['pagination'] = {
-                        'pattern': pagination['pattern'],
-                        'start': pagination['start'],
-                        'end': pagination['end'],
-                    }
-                    changed = True
-
-                if (pagination['extra_pages'] and pagination['pattern']
-                        and not reg_meta.get('extra_pagination', {}).get('pattern')):
-                    guess = _guess_extra_pagination(pagination['extra_pages'], pagination['pattern'])
-                    if guess:
-                        reg_meta['extra_pagination'] = {'pattern': guess}
-                        changed = True
-
-                if 'stats' not in reg_meta:
-                    reg_meta['stats'] = {
-                        'total_pages': len(pages) - len(pagination['extra_pages']),
-                        'total_files': len(pages),
-                    }
-                    changed = True
-
-                if changed:
-                    with open(reg_metadata_file, 'w', encoding='utf-8') as f:
-                        json.dump(reg_meta, f, indent=2, ensure_ascii=False)
-
-                # Scaffolder le dossier OCR du registre
-                (ocr_root / item.name).mkdir(exist_ok=True)
-
-                entry = {
-                    'id': reg_meta.get('id', item.name),
-                    'titre': reg_meta.get('titre', item.name),
-                    'periode': reg_meta.get('periode', ['', '']),
-                    'folder_name': item.name,
-                    'pages_count': len(pages),
-                    'pages_pattern': pagination['pattern'],
-                    'pages_start': pagination['start'],
-                    'pages_end': pagination['end'],
+            if pagination['pattern'] and not reg_meta.get('pagination', {}).get('pattern'):
+                reg_meta['pagination'] = {
+                    'pattern': pagination['pattern'],
+                    'start': pagination['start'],
+                    'end': pagination['end'],
                 }
-                if pagination['extra_pages']:
-                    entry['extra_pages'] = pagination['extra_pages']
-                if reg_meta.get('extra_pagination'):
-                    entry['extra_pagination'] = reg_meta['extra_pagination']
-                # Trous et doublons de pagination : persistés pour le badge du listing
-                # (le détail page-par-page est recalculé côté client au dépliage).
-                if pagination['gaps']:
-                    entry['pages_gaps'] = pagination['gaps']
-                if pagination['duplicates']:
-                    entry['pages_duplicates'] = pagination['duplicates']
+                changed = True
 
-                # Anomalies du registre persistées pour le badge du listing (mêmes
-                # codes que le scan), afin de les afficher sans relire le disque.
-                reg_anomalies: List[str] = []
-                if not pages:
-                    reg_anomalies.append('registre_vide')
-                elif pagination['pattern'] is None:
-                    reg_anomalies.append('pagination_indetectable')
-                if reg_anomalies:
-                    entry['anomalies'] = reg_anomalies
+            if (pagination['extra_pages'] and pagination['pattern']
+                    and not reg_meta.get('extra_pagination', {}).get('pattern')):
+                guess = _guess_extra_pagination(pagination['extra_pages'], pagination['pattern'])
+                if guess:
+                    reg_meta['extra_pagination'] = {'pattern': guess}
+                    changed = True
 
-                # État OCR réel : comptage des XML par modèle sur le disque
-                status = _count_ocr_xml(ocr_root / item.name, len(pages))
-                if status:
-                    entry['ocr_status'] = status
+            if 'stats' not in reg_meta:
+                reg_meta['stats'] = {
+                    'total_pages': len(pages) - len(pagination['extra_pages']),
+                    'total_files': len(pages),
+                }
+                changed = True
 
-                registres_summary.append(entry)
+            # `changed` dit qu'un champ a été complété ; encore faut-il que le résultat
+            # diffère de ce qui est déjà sur le disque. Plusieurs compléments recalculent à
+            # l'identique — une période indéterminable revaut `['', '']` à chaque passage —
+            # et refaisaient écrire le fichier à chaque synchronisation pour rien.
+            if changed and reg_meta != reg.get('metadata'):
+                _write_json_atomic(reg_metadata_file, reg_meta)
+                # L'instantané reste vrai après l'écriture : le rapport peut être rejoué
+                # ensuite sans retoucher au NAS.
+                reg['metadata'] = copy.deepcopy(reg_meta)
+                reg['metadata_present'] = True
+
+            # Scaffolder le dossier OCR du registre
+            if reg_name not in ocr_dirs:
+                (ocr_root / reg_name).mkdir(exist_ok=True)
+                created_ocr_dirs.append(reg_name)
+
+            entry = {
+                'id': reg_meta.get('id', reg_name),
+                'titre': reg_meta.get('titre', reg_name),
+                'periode': reg_meta.get('periode', ['', '']),
+                'folder_name': reg_name,
+                'pages_count': len(pages),
+                'pages_pattern': pagination['pattern'],
+                'pages_start': pagination['start'],
+                'pages_end': pagination['end'],
+            }
+            if pagination['extra_pages']:
+                entry['extra_pages'] = pagination['extra_pages']
+            if reg_meta.get('extra_pagination'):
+                entry['extra_pagination'] = reg_meta['extra_pagination']
+            # Trous et doublons de pagination : persistés pour le badge du listing
+            # (le détail page-par-page est recalculé côté client au dépliage).
+            if pagination['gaps']:
+                entry['pages_gaps'] = pagination['gaps']
+            if pagination['duplicates']:
+                entry['pages_duplicates'] = pagination['duplicates']
+
+            # Anomalies du registre persistées pour le badge du listing (mêmes
+            # codes que le scan), afin de les afficher sans relire le disque.
+            reg_anomalies: List[str] = []
+            if not pages:
+                reg_anomalies.append('registre_vide')
+            elif pagination['pattern'] is None:
+                reg_anomalies.append('pagination_indetectable')
+            if reg_anomalies:
+                entry['anomalies'] = reg_anomalies
+
+            # État OCR réel : comptage des XML par modèle relevé lors du parcours
+            status = reg.get('ocr_status') or {}
+            if status:
+                entry['ocr_status'] = status
+
+            registres_summary.append(entry)
 
         metadata['registres'] = registres_summary
 
@@ -739,16 +798,11 @@ class CollectionsService:
         # depuis pages_count/pages_pattern ; registre_absent_disque est réconcilié ici même
         # (la liste est reconstruite depuis le disque).
         col_anomalies: List[str] = []
-        for ocr_reg in sorted(ocr_root.iterdir()):
-            if ocr_reg.is_dir() and ocr_reg.name not in scan_reg_names:
-                col_anomalies.append(f'ocr_orphelin:{ocr_reg.name}')
-        for sub in sorted(collection_dir.iterdir()):
-            if not sub.is_dir() or sub.name in ('scans', 'ocr'):
-                continue
-            if CollectionsService._SCAN_EXCLUDE.match(sub.name):
-                continue
-            if any(f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS for f in sub.iterdir()):
-                col_anomalies.append(f'registre_hors_scans:{sub.name}')
+        for ocr_reg in sorted(ocr_dirs):
+            if ocr_reg not in scan_reg_names:
+                col_anomalies.append(f'ocr_orphelin:{ocr_reg}')
+        for sub in snap_entry.get('stray_dirs_with_images') or []:
+            col_anomalies.append(f'registre_hors_scans:{sub}')
         metadata['anomalies'] = col_anomalies
 
         # Période de la collection déduite des registres si encore vide
@@ -765,8 +819,16 @@ class CollectionsService:
             if years:
                 metadata['periode'] = [min(years), max(years)]
 
-        with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        # Réécrit seulement si le contenu bouge. Une collection déjà à jour ne coûte alors
+        # plus aucune écriture sur le NAS — le cas de loin le plus fréquent.
+        if metadata != previous_metadata:
+            _write_json_atomic(metadata_file, metadata)
+
+        snap_entry['metadata'] = copy.deepcopy(metadata)
+        snap_entry['metadata_present'] = True
+        if created_ocr_dirs:
+            snap_entry['ocr_dirs'] = sorted(ocr_dirs | set(created_ocr_dirs))
+            snap_entry['has_ocr_folder'] = True
 
         metadata['folder_name'] = collection_dir.name
         yield {"type": "result", "metadata": metadata}
@@ -774,11 +836,278 @@ class CollectionsService:
     # Dossiers à ignorer lors du scan (cachés, Python, système)
     _SCAN_EXCLUDE = re.compile(r'^(\.|__)')
 
+    # Nombre de registres sondés en parallèle. Le parcours n'est pas limité par le CPU mais
+    # par les allers-retours SMB : `iterdir`/`stat` relâchent le GIL, donc quelques threads
+    # suffisent à masquer la latence réseau. Réglable si le NAS n'aime pas la concurrence.
+    _WALK_WORKERS = max(1, int(os.getenv('ARCHIMED_SCAN_WORKERS', '8')))
+
+    @staticmethod
+    def _probe_registre(reg_dir: Path, ocr_reg_dir: Optional[Path]) -> Dict[str, Any]:
+        """Faits bruts d'un registre, tels qu'ils sont sur le disque. Aucune interprétation
+        ici : l'analyse et la synchronisation en tirent chacune leurs propres conclusions."""
+        pages = [
+            f.name for f in reg_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        metadata_present, metadata = _read_json_probe(reg_dir / "metadata.json")
+        return {
+            'pages': pages,
+            'metadata': metadata,
+            'metadata_present': metadata_present,
+            # Dossier OCR absent : inutile d'aller le demander au NAS pour s'entendre dire non.
+            'ocr_status': _count_ocr_xml(ocr_reg_dir, len(pages)) if ocr_reg_dir else {},
+        }
+
+    @staticmethod
+    def _probe_collection_iter(col_dir: Path):
+        """Faits bruts d'une collection, lus du disque. Émet {'type': 'registre'} au fil du
+        sondage et **retourne** l'entrée d'instantané (`entry = yield from ...`).
+
+        Seul endroit qui lit l'arborescence d'une collection : l'analyse s'en sert pour bâtir
+        l'instantané, la synchronisation comme repli quand elle n'en reçoit pas. Deux
+        chemins de lecture divergents seraient la façon la plus sûre de faire dire deux
+        choses différentes aux deux boutons."""
+        scans_dir = col_dir / "scans"
+        ocr_dir = col_dir / "ocr"
+        metadata_present, metadata = _read_json_probe(col_dir / "metadata.json")
+
+        # Listé avant les registres : le `has_ocr_folder` de chacun s'en déduit, ce qui
+        # épargne un `stat` par registre.
+        has_ocr_folder = ocr_dir.is_dir()
+        ocr_dirs = (
+            [d.name for d in sorted(ocr_dir.iterdir()) if d.is_dir()]
+            if has_ocr_folder else []
+        )
+        ocr_names = set(ocr_dirs)
+
+        entry: Dict[str, Any] = {
+            'metadata': metadata,
+            'metadata_present': metadata_present,
+            'has_scans_folder': scans_dir.is_dir(),
+            'has_ocr_folder': has_ocr_folder,
+            'ocr_dirs': ocr_dirs,
+            'stray_dirs_with_images': [],
+            # Distinct de `registres` : un scans/ ne contenant que des fichiers en vrac est
+            # non vide sans avoir le moindre registre. C'est ce qui autorise l'amorçage.
+            'scans_non_empty': False,
+            'registres': {},
+        }
+
+        if entry['has_scans_folder']:
+            scans_entries = sorted(scans_dir.iterdir())
+            entry['scans_non_empty'] = bool(scans_entries)
+            reg_dirs = [d for d in scans_entries if d.is_dir()]
+            reg_total = len(reg_dirs)
+            registres: Dict[str, Any] = {}
+            if reg_dirs:
+                with ThreadPoolExecutor(max_workers=CollectionsService._WALK_WORKERS) as pool:
+                    pending = {
+                        pool.submit(
+                            CollectionsService._probe_registre,
+                            d,
+                            (ocr_dir / d.name) if d.name in ocr_names else None,
+                        ): d.name
+                        for d in reg_dirs
+                    }
+                    for done, future in enumerate(as_completed(pending), 1):
+                        # Compteur d'arrivée, pas indice de soumission : les registres se
+                        # terminent dans le désordre, la progression doit rester monotone.
+                        yield {"type": "registre", "reg_current": done, "reg_total": reg_total}
+                        registres[pending[future]] = future.result()
+            # Remis dans l'ordre du disque : la sortie ne doit pas dépendre de l'ordre
+            # d'arrivée des threads.
+            entry['registres'] = {name: registres[name] for name in sorted(registres)}
+
+        for sub in sorted(col_dir.iterdir()):
+            if not sub.is_dir() or sub.name in ('scans', 'ocr'):
+                continue
+            if CollectionsService._SCAN_EXCLUDE.match(sub.name):
+                continue
+            if any(f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS for f in sub.iterdir()):
+                entry['stray_dirs_with_images'].append(sub.name)
+
+        return entry
+
+    @staticmethod
+    def _walk_iter():
+        """**L'unique parcours disque.** Émet la progression ({'type': 'progress'} par
+        collection, {'type': 'registre'} par registre) puis {'type': 'snapshot'}.
+
+        Regroupe ce que l'analyse et la synchronisation lisaient chacune de leur côté, pour
+        que l'enchaînement « Analyser » puis « Synchroniser tout » ne touche le NAS qu'une
+        fois. Cf. `scan_snapshot` pour la forme et la durée de vie du résultat."""
+        started = time.time()
+        collections_dir = CollectionsService.get_collections_dir()
+        snap: Dict[str, Any] = {
+            'token': scan_snapshot.new_token(),
+            'created_at': started,
+            'data_dir': str(DATA_DIR),
+            'collections': {},
+        }
+        if not collections_dir.exists():
+            yield {"type": "snapshot", "snapshot": snap}
+            return
+
+        col_dirs = [
+            d for d in sorted(collections_dir.iterdir())
+            if d.is_dir() and not CollectionsService._SCAN_EXCLUDE.match(d.name)
+        ]
+        total = len(col_dirs)
+        reg_count = 0
+
+        for idx, col_dir in enumerate(col_dirs, 1):
+            yield {"type": "progress", "current": idx, "total": total, "name": col_dir.name}
+            entry = yield from CollectionsService._probe_collection_iter(col_dir)
+            reg_count += len(entry['registres'])
+            snap['collections'][col_dir.name] = entry
+
+        log.info(
+            f"Parcours disque terminé collections={total} registres={reg_count} "
+            f"threads={CollectionsService._WALK_WORKERS} durée={time.time() - started:.1f}s"
+        )
+        yield {"type": "snapshot", "snapshot": snap}
+
+    @staticmethod
+    def build_report(snap: Dict[str, Any]) -> Dict[str, Any]:
+        """Rapport de diagnostic déduit de l'instantané. **Fonction pure, aucune I/O.**
+
+        Ce qui permet de rejouer le rapport après une synchronisation sans retoucher au NAS.
+        La référence « ce qu'on connaissait déjà » est le metadata.json de chaque collection
+        tel que le parcours l'a lu."""
+        report_cols = []
+        new_collections = 0
+        new_registres = 0
+        anomalies_count = 0
+
+        for folder_name, entry in snap.get('collections', {}).items():
+            metadata = entry.get('metadata')
+            is_known = metadata is not None
+            if not is_known:
+                new_collections += 1
+
+            known_regs = {
+                r.get('folder_name') for r in (metadata or {}).get('registres') or []
+                if r.get('folder_name')
+            }
+            ocr_names = set(entry.get('ocr_dirs') or [])
+            col_anomalies: List[str] = []
+
+            # metadata.json présent mais illisible
+            if entry.get('metadata_present') and metadata is None:
+                col_anomalies.append('metadata_illisible')
+                anomalies_count += 1
+
+            scan_reg_names = set()
+            regs = []
+            for reg_name, reg in (entry.get('registres') or {}).items():
+                scan_reg_names.add(reg_name)
+                reg_known = reg_name in known_regs
+                if not reg_known:
+                    new_registres += 1
+
+                pages = reg.get('pages') or []
+                # Détection fraîche depuis les noms de fichiers : l'analyse dit ce qu'il y a
+                # sur le disque, là où la synchronisation respecte le motif déjà enregistré.
+                pagination = _diagnose_pagination(pages)
+
+                reg_anomalies: List[str] = []
+                if not pages:
+                    reg_anomalies.append('registre_vide')
+                elif pagination['pattern'] is None:
+                    reg_anomalies.append('pagination_indetectable')
+                anomalies_count += len(reg_anomalies)
+
+                regs.append({
+                    "folder_name": reg_name,
+                    "is_known": reg_known,
+                    "has_metadata": bool(reg.get('metadata_present')),
+                    "has_ocr_folder": reg_name in ocr_names,
+                    "pages_count": len(pages),
+                    "ocr_status": reg.get('ocr_status') or {},
+                    "anomalies": reg_anomalies,
+                    "pagination": pagination,
+                })
+
+            # Registres listés dans le metadata mais absents du disque
+            for missing in sorted(known_regs - scan_reg_names):
+                regs.append({
+                    "folder_name": missing,
+                    "is_known": True,
+                    "has_metadata": False,
+                    "has_ocr_folder": missing in ocr_names,
+                    "pages_count": 0,
+                    "ocr_status": {},
+                    "anomalies": ['registre_absent_disque'],
+                    "pagination": None,
+                })
+                anomalies_count += 1
+
+            # Dossiers ocr/ orphelins (sans scans/<reg> correspondant)
+            for ocr_reg in entry.get('ocr_dirs') or []:
+                if ocr_reg not in scan_reg_names:
+                    col_anomalies.append(f'ocr_orphelin:{ocr_reg}')
+                    anomalies_count += 1
+
+            # Sous-dossiers déposés directement sous la collection (hors scans/ et ocr/)
+            for sub in entry.get('stray_dirs_with_images') or []:
+                col_anomalies.append(f'registre_hors_scans:{sub}')
+                anomalies_count += 1
+
+            report_cols.append({
+                "folder_name": folder_name,
+                "is_known": is_known,
+                "has_metadata": bool(entry.get('metadata_present')),
+                "has_scans_folder": bool(entry.get('has_scans_folder')),
+                "has_ocr_folder": bool(entry.get('has_ocr_folder')),
+                "anomalies": col_anomalies,
+                "registres": regs,
+            })
+
+        return {
+            "collections": report_cols,
+            "new_collections": new_collections,
+            "new_registres": new_registres,
+            "anomalies_count": anomalies_count,
+            # Rendu au client, qui le représente à la synchronisation pour qu'elle reparte
+            # de ce parcours-ci au lieu d'en refaire un.
+            "token": snap.get('token', ''),
+        }
+
+    @staticmethod
+    def summary_from_snapshot(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Couverture de transcription au format de `TranscriptionsService.get_summary`,
+        déduite de l'instantané. Même source (les XML comptés sur le disque), mais sans le
+        parcours complet de `ocr/` que la page déclenchait après chaque synchronisation."""
+        result = []
+        for folder_name, entry in snap.get('collections', {}).items():
+            if not entry.get('has_ocr_folder'):
+                continue
+            all_models: set = set()
+            registres_data = []
+            for reg_name, reg in (entry.get('registres') or {}).items():
+                counts = {m: s.get('pages_done', 0) for m, s in (reg.get('ocr_status') or {}).items()}
+                if counts:
+                    registres_data.append({"registre_id": reg_name, "counts": counts})
+                    all_models.update(counts)
+
+            models = sorted(all_models)
+            totals = {m: sum(r["counts"].get(m, 0) for r in registres_data) for m in models}
+            result.append({
+                "collection_id": folder_name,
+                "models": models,
+                "registres": registres_data,
+                "totals": totals,
+                "grand_total": sum(totals.values()),
+            })
+        return result
+
     @staticmethod
     def scan_filesystem() -> Dict[str, Any]:
         """Diagnostic en lecture seule du dossier collections : présence des fichiers,
-        couverture OCR par modèle, état de pagination et anomalies. N'écrit rien."""
-        report: Dict[str, Any] = {"collections": [], "new_collections": 0, "new_registres": 0, "anomalies_count": 0}
+        couverture OCR par modèle, état de pagination et anomalies. N'écrit rien sur le NAS
+        (l'instantané du parcours, lui, est déposé en cache local)."""
+        report: Dict[str, Any] = {"collections": [], "new_collections": 0, "new_registres": 0,
+                                  "anomalies_count": 0, "token": ""}
         for event in CollectionsService.scan_filesystem_iter():
             if event.get('type') == 'report':
                 report = event['report']
@@ -789,164 +1118,42 @@ class CollectionsService:
         """Variante en flux de scan_filesystem : émet un événement de progression par
         collection ({'type': 'progress', 'current', 'total', 'name'}) puis un événement
         final ({'type': 'report', 'report': {...}}). Lecture seule, même diagnostic."""
-        collections_dir = CollectionsService.get_collections_dir()
-        if not collections_dir.exists():
-            yield {"type": "report", "report": {"collections": [], "new_collections": 0, "new_registres": 0, "anomalies_count": 0}}
-            return
-
-        known = CollectionsService.list_collections()
-        known_folders = {c.get('folder_name') for c in known}
-        known_registres = {
-            c.get('folder_name'): {r['folder_name'] for r in c.get('registres') or []}
-            for c in known
-        }
-
-        # Dossiers de collections à analyser : total connu d'emblée pour la progression.
-        col_dirs = [
-            d for d in sorted(collections_dir.iterdir())
-            if d.is_dir() and not CollectionsService._SCAN_EXCLUDE.match(d.name)
-        ]
-        total = len(col_dirs)
-
-        report_cols = []
-        new_collections = 0
-        new_registres = 0
-        anomalies_count = 0
-
-        for idx, col_dir in enumerate(col_dirs, 1):
-            yield {"type": "progress", "current": idx, "total": total, "name": col_dir.name}
-            is_known = col_dir.name in known_folders
-            if not is_known:
-                new_collections += 1
-
-            scans_dir = col_dir / "scans"
-            ocr_dir = col_dir / "ocr"
-            known_regs = known_registres.get(col_dir.name, set())
-            col_anomalies: List[str] = []
-
-            # metadata.json présent mais illisible
-            metadata_file = col_dir / "metadata.json"
-            has_metadata = metadata_file.exists()
-            if has_metadata:
-                try:
-                    with open(metadata_file, 'r', encoding='utf-8-sig') as f:
-                        json.load(f)
-                except (json.JSONDecodeError, OSError):
-                    col_anomalies.append('metadata_illisible')
-                    anomalies_count += 1
-
-            # Noms de registres réellement présents dans scans/
-            scan_reg_names = set()
-            regs = []
-            if scans_dir.exists():
-                reg_dirs = [d for d in sorted(scans_dir.iterdir()) if d.is_dir()]
-                reg_total = len(reg_dirs)
-                for j, reg_dir in enumerate(reg_dirs, 1):
-                    yield {"type": "registre", "reg_current": j, "reg_total": reg_total}
-                    scan_reg_names.add(reg_dir.name)
-                    reg_known = reg_dir.name in known_regs
-                    if not reg_known:
-                        new_registres += 1
-
-                    pages = [
-                        f.name for f in reg_dir.iterdir()
-                        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-                    ]
-                    ocr_status = _count_ocr_xml(ocr_dir / reg_dir.name, len(pages))
-                    pagination = _diagnose_pagination(pages)
-
-                    reg_anomalies: List[str] = []
-                    if not pages:
-                        reg_anomalies.append('registre_vide')
-                    elif pagination['pattern'] is None:
-                        reg_anomalies.append('pagination_indetectable')
-                    anomalies_count += len(reg_anomalies)
-
-                    regs.append({
-                        "folder_name": reg_dir.name,
-                        "is_known": reg_known,
-                        "has_metadata": (reg_dir / "metadata.json").exists(),
-                        "has_ocr_folder": (ocr_dir / reg_dir.name).exists(),
-                        "pages_count": len(pages),
-                        "ocr_status": ocr_status,
-                        "anomalies": reg_anomalies,
-                        "pagination": pagination,
-                    })
-
-            # Registres listés dans le metadata mais absents du disque
-            for missing in sorted(known_regs - scan_reg_names):
-                regs.append({
-                    "folder_name": missing,
-                    "is_known": True,
-                    "has_metadata": False,
-                    "has_ocr_folder": (ocr_dir / missing).exists(),
-                    "pages_count": 0,
-                    "ocr_status": {},
-                    "anomalies": ['registre_absent_disque'],
-                    "pagination": None,
-                })
-                anomalies_count += 1
-
-            # Dossiers ocr/ orphelins (sans scans/<reg> correspondant)
-            if ocr_dir.exists():
-                for ocr_reg in sorted(ocr_dir.iterdir()):
-                    if ocr_reg.is_dir() and ocr_reg.name not in scan_reg_names:
-                        col_anomalies.append(f'ocr_orphelin:{ocr_reg.name}')
-                        anomalies_count += 1
-
-            # Sous-dossiers déposés directement sous la collection (hors scans/ et ocr/)
-            for sub in sorted(col_dir.iterdir()):
-                if not sub.is_dir() or sub.name in ('scans', 'ocr'):
-                    continue
-                if CollectionsService._SCAN_EXCLUDE.match(sub.name):
-                    continue
-                has_images = any(
-                    f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-                    for f in sub.iterdir()
-                )
-                if has_images:
-                    col_anomalies.append(f'registre_hors_scans:{sub.name}')
-                    anomalies_count += 1
-
-            report_cols.append({
-                "folder_name": col_dir.name,
-                "is_known": is_known,
-                "has_metadata": has_metadata,
-                "has_scans_folder": scans_dir.exists(),
-                "has_ocr_folder": ocr_dir.exists(),
-                "anomalies": col_anomalies,
-                "registres": regs,
-            })
-
-        yield {
-            "type": "report",
-            "report": {
-                "collections": report_cols,
-                "new_collections": new_collections,
-                "new_registres": new_registres,
-                "anomalies_count": anomalies_count,
-            },
-        }
+        snap = None
+        for event in CollectionsService._walk_iter():
+            if event.get('type') == 'snapshot':
+                snap = event['snapshot']
+            else:
+                yield event
+        scan_snapshot.save(snap)
+        yield {"type": "report", "report": CollectionsService.build_report(snap)}
 
     @staticmethod
-    def sync_all_collections() -> List[Dict[str, Any]]:
+    def sync_all_collections(token: Optional[str] = None) -> List[Dict[str, Any]]:
         """Synchronise tous les dossiers de data/collections ; les dossiers sans
         metadata.json sont bootstrappés par sync_collection_metadata (s'ils ont des scans)."""
         results: List[Dict[str, Any]] = []
-        for event in CollectionsService.sync_all_collections_iter():
+        for event in CollectionsService.sync_all_collections_iter(token):
             if event.get('type') == 'done':
                 results = event['results']
         return results
 
     @staticmethod
-    def sync_all_collections_iter():
+    def sync_all_collections_iter(token: Optional[str] = None):
         """Variante en flux de sync_all_collections : émet un événement de progression par
         collection ({'type': 'progress', 'current', 'total', 'name'}) puis un événement
-        final ({'type': 'done', 'results': [...]})."""
+        final ({'type': 'done', 'results': [...], 'summary': [...]}).
+
+        `token` est celui rendu par l'analyse. S'il désigne un instantané encore valable, la
+        synchronisation repart de ce que l'analyse a déjà lu et ne fait plus que des
+        écritures. Sinon elle reparcourt le disque, exactement comme avant l'instantané."""
+        started = time.time()
         collections_dir = CollectionsService.get_collections_dir()
         if not collections_dir.exists():
-            yield {"type": "done", "results": []}
+            yield {"type": "done", "results": [], "summary": []}
             return
+
+        snap = scan_snapshot.load(token, DATA_DIR)
+        log.info(f"Synchronisation démarrée instantané={'réutilisé' if snap else 'reconstruit'}")
 
         col_dirs = [
             d for d in sorted(collections_dir.iterdir())
@@ -957,15 +1164,45 @@ class CollectionsService:
         results: List[Dict[str, Any]] = []
         for idx, col_dir in enumerate(col_dirs, 1):
             yield {"type": "progress", "current": idx, "total": total, "name": col_dir.name}
+            # Une collection apparue depuis l'analyse n'est pas dans l'instantané : elle sera
+            # sondée à la volée, sans invalider le reste.
+            snap_entry = (snap.get('collections') or {}).get(col_dir.name) if snap else None
             # Relaie les événements 'registre' de la collection et capture son 'result'.
-            for event in CollectionsService.sync_collection_metadata_iter(col_dir.name):
+            for event in CollectionsService.sync_collection_metadata_iter(col_dir.name, snap_entry):
                 if event.get('type') == 'result':
                     if event['metadata']:
                         results.append(event['metadata'])
                 else:
                     yield event
 
-        yield {"type": "done", "results": results}
+        # L'instantané a été réaligné sur ce qui vient d'être écrit : on le persiste pour que
+        # le rapport puisse être rejoué ensuite sans retoucher au NAS.
+        summary: List[Dict[str, Any]] = []
+        if snap:
+            scan_snapshot.save(snap)
+            summary = CollectionsService.summary_from_snapshot(snap)
+
+        log.info(f"Synchronisation terminée collections={total} durée={time.time() - started:.1f}s")
+        yield {"type": "done", "results": results, "summary": summary}
+
+    @staticmethod
+    def sync_collection_with_token_iter(collection_id: str, token: Optional[str] = None):
+        """Synchronise **une** collection en repartant de l'instantané `token` s'il est
+        encore valable, puis le réaligne sur ce qui vient d'être écrit — de quoi rejouer
+        ensuite le rapport d'analyse sans relire le NAS."""
+        snap = scan_snapshot.load(token, DATA_DIR)
+        snap_entry = (snap.get('collections') or {}).get(collection_id) if snap else None
+        for event in CollectionsService.sync_collection_metadata_iter(collection_id, snap_entry):
+            yield event
+        if snap and snap_entry is not None:
+            scan_snapshot.save(snap)
+
+    @staticmethod
+    def report_from_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Rapport d'analyse rejoué depuis l'instantané, **sans aucun accès au NAS**.
+        `None` si l'instantané n'est plus utilisable : l'appelant doit relancer une analyse."""
+        snap = scan_snapshot.load(token, DATA_DIR)
+        return CollectionsService.build_report(snap) if snap else None
 
 class RegistresService:
     @staticmethod

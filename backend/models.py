@@ -220,6 +220,9 @@ class ScanReport(BaseModel):
     new_collections: int
     new_registres: int
     anomalies_count: int = 0
+    # Identifie le parcours disque qui a produit ce rapport. Le client le représente à la
+    # synchronisation, qui repart alors de ce qui a déjà été lu au lieu de tout reparcourir.
+    token: str = ""
 
 class CollectionStatsTotals(BaseModel):
     registres_count: int = 0

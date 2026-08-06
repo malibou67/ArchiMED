@@ -2,7 +2,7 @@ import json
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import List
+from typing import List, Optional
 from models import CollectionMetadata, CollectionCreate, CollectionUpdate, ScanReport, CollectionStatsResponse
 from services import CollectionsService
 from stats_service import CollectionStatsService
@@ -26,6 +26,18 @@ def scan_filesystem():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/scan/report", response_model=ScanReport)
+def scan_report(token: str):
+    """Rejoue le rapport d'analyse à partir de l'instantané `token`, **sans toucher au NAS**.
+
+    Sert à rafraîchir le rapport après avoir synchronisé une collection depuis le dialogue :
+    inutile de reparcourir tout le partage pour refléter ce qu'on vient d'écrire. 409 si
+    l'instantané n'est plus utilisable, auquel cas le client relance une analyse complète."""
+    report = CollectionsService.report_from_token(token)
+    if report is None:
+        raise HTTPException(status_code=409, detail="Instantané d'analyse expiré")
+    return report
+
 @router.get("/scan/stream")
 def scan_filesystem_stream():
     """Même analyse que /scan, mais en flux NDJSON : une ligne JSON de progression par
@@ -41,21 +53,24 @@ def scan_filesystem_stream():
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 @router.post("/sync-all", response_model=List[CollectionMetadata])
-def sync_all_collections():
+def sync_all_collections(token: Optional[str] = None):
     """Synchronise toutes les collections (reconstruit la liste des registres depuis le filesystem)"""
     try:
-        return CollectionsService.sync_all_collections()
+        return CollectionsService.sync_all_collections(token)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/sync-all/stream")
-def sync_all_collections_stream():
+def sync_all_collections_stream(token: Optional[str] = None):
     """Même synchronisation que /sync-all, mais en flux NDJSON : une ligne JSON de
     progression par collection ({"type":"progress","current","total","name"}) puis une
-    ligne finale ({"type":"done","results":[...]})."""
+    ligne finale ({"type":"done","results":[...],"summary":[...]}).
+
+    `token` est celui rendu par l'analyse : s'il désigne un instantané encore valable, la
+    synchronisation ne relit pas le NAS et se contente d'écrire."""
     def gen():
         try:
-            for event in CollectionsService.sync_all_collections_iter():
+            for event in CollectionsService.sync_all_collections_iter(token):
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as e:
             yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
@@ -131,13 +146,16 @@ def sync_collection(collection_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/{collection_id}/sync/stream")
-def sync_collection_stream(collection_id: str):
+def sync_collection_stream(collection_id: str, token: Optional[str] = None):
     """Même synchronisation que /{collection_id}/sync, mais en flux NDJSON : une ligne
     JSON de progression par registre ({"type":"registre","reg_current","reg_total"})
-    puis une ligne finale ({"type":"result","metadata":{...}})."""
+    puis une ligne finale ({"type":"result","metadata":{...}}).
+
+    `token` est celui rendu par l'analyse : s'il désigne un instantané encore valable, la
+    synchronisation repart de ce qui a déjà été lu."""
     def gen():
         try:
-            for event in CollectionsService.sync_collection_metadata_iter(collection_id):
+            for event in CollectionsService.sync_collection_with_token_iter(collection_id, token):
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as e:
             yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"

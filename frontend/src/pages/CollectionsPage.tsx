@@ -624,19 +624,17 @@ export default function CollectionsPage() {
     }
   };
 
+  // Le flux de synchronisation renvoie déjà les métadonnées de toutes les collections et la
+  // couverture de transcription : inutile de recharger l'une puis l'autre derrière, ce qui
+  // faisait reparcourir le NAS deux fois de plus pour des données qu'on venait de recevoir.
   const handleSyncAll = async () => {
     setSyncing(true);
     setSyncProgress(null);
     try {
-      await collectionsApi.syncAllStream(setSyncProgress);
-      await loadCollections();
-      // Rafraîchit la couverture de transcription affichée dans le tableau.
-      setTranscLoading(true);
-      try {
-        setSummary(await transcriptionsApi.getSummary());
-      } finally {
-        setTranscLoading(false);
-      }
+      const { results, summary } = await collectionsApi.syncAllStream(scanReport?.token, setSyncProgress);
+      setCollections(results);
+      setSummary(summary);
+      setError(null);
       // Synchronisation terminée : on ferme le dialog sans relancer de scan.
       setScanOpen(false);
       setScanReport(null);
@@ -653,13 +651,23 @@ export default function CollectionsPage() {
   // Passe par le flux NDJSON : le ProgressPanel affiche l'avancement par registre (état
   // syncing/syncProgress partagé avec « Synchroniser tout »).
   const handleSyncFromScan = async (folderName: string) => {
+    const token = scanReport?.token;
     setSyncing(true);
     setSyncProgress({ current: 1, total: 1, name: folderName });
     setScanSyncingFolder(folderName);
     try {
-      await collectionsApi.syncStream(folderName, setSyncProgress);
+      await collectionsApi.syncStream(folderName, token, setSyncProgress);
       await loadCollections();
-      const report = await collectionsApi.scan();
+      // Le rapport est rejoué depuis l'instantané de l'analyse, qui vient d'être réaligné
+      // sur ce qu'on a écrit. Synchroniser une collection ne coûte donc plus une analyse
+      // complète de toutes les autres. Sans instantané exploitable, on la refait.
+      let report: ScanReport;
+      try {
+        if (!token) throw new Error('pas d\'instantané');
+        report = await collectionsApi.scanReport(token);
+      } catch {
+        report = await collectionsApi.scan();
+      }
       setScanReport(report);
     } catch (err) {
       setError(t('errors.syncCollection'));

@@ -167,6 +167,9 @@ export type ScanReport = {
   new_collections: number;
   new_registres: number;
   anomalies_count: number;
+  // Identifie le parcours disque qui a produit ce rapport. Représenté à la synchronisation,
+  // il lui évite de reparcourir le NAS pour relire ce que l'analyse vient de lire.
+  token: string;
 }
 
 // Événement de progression émis par le flux d'analyse (une collection traitée) ;
