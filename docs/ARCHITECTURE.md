@@ -66,7 +66,7 @@ ArchiMED/
 │   └── requirements-dev.txt # Test-only dependencies (pytest)
 ├── frontend/
 │   ├── src/
-│   │   ├── api/            # API clients (collections, registres, models, ocr, indexes, tasks, settings, system, transcriptions)
+│   │   ├── api/            # API clients (collections, registres, models, ocr, indexes, tasks, settings, system)
 │   │   ├── components/     # Layout + shared UI, plus components/stats/ and components/ocr/
 │   │   ├── context/        # React contexts (Loading, Header, Tasks)
 │   │   ├── pages/          # Application pages

@@ -27,12 +27,10 @@ import enIndexes from './locales/en/indexes.json';
 import frIndexes from './locales/fr/indexes.json';
 import enTasks from './locales/en/tasks.json';
 import frTasks from './locales/fr/tasks.json';
-import enTranscriptions from './locales/en/transcriptions.json';
-import frTranscriptions from './locales/fr/transcriptions.json';
 
 export const resources = {
-  en: { common: enCommon, settings: enSettings, search: enSearch, collections: enCollections, stats: enStats, ocr: enOcr, indexes: enIndexes, tasks: enTasks, transcriptions: enTranscriptions },
-  fr: { common: frCommon, settings: frSettings, search: frSearch, collections: frCollections, stats: frStats, ocr: frOcr, indexes: frIndexes, tasks: frTasks, transcriptions: frTranscriptions },
+  en: { common: enCommon, settings: enSettings, search: enSearch, collections: enCollections, stats: enStats, ocr: enOcr, indexes: enIndexes, tasks: enTasks },
+  fr: { common: frCommon, settings: frSettings, search: frSearch, collections: frCollections, stats: frStats, ocr: frOcr, indexes: frIndexes, tasks: frTasks },
 } as const;
 
 export const SUPPORTED_LANGUAGES = ['en', 'fr'] as const;

@@ -13,7 +13,7 @@ asynchrone, donc pas de `<Suspense>` à prévoir).
 Un fichier JSON par namespace dans `locales/en/` et `locales/fr/` :
 
 `common` (nav, layout, composants partagés, actions) · `settings` · `search` · `collections` ·
-`stats` · `ocr` · `indexes` · `tasks` · `transcriptions`
+`stats` · `ocr` · `indexes` · `tasks`
 
 Ajouter un namespace veut dire ajouter les **deux** fichiers JSON, puis les importer et les
 déclarer dans `resources` (`index.ts`).

@@ -98,34 +98,6 @@ export type RegistreUpdate = {
   };
 }
 
-export type TranscriptionInfo = {
-  collection_id: string;
-  registre_id: string;
-  model_name: string;
-  file_name: string;
-  file_path: string;
-  has_content: boolean;
-}
-
-export type TranscriptionsStats = {
-  total: number;
-  by_collection: Record<string, number>;
-  by_model: Record<string, number>;
-}
-
-export type TranscriptionsSummaryRegistre = {
-  registre_id: string;
-  counts: Record<string, number>;  // model -> nb fichiers
-}
-
-export type TranscriptionsSummary = {
-  collection_id: string;
-  models: string[];
-  registres: TranscriptionsSummaryRegistre[];
-  totals: Record<string, number>;
-  grand_total: number;
-}
-
 export type OcrModelStatus = {
   pages_done: number;
   pages_total: number;

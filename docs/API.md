@@ -45,8 +45,13 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `POST /api/ocr/missing` — Pages still lacking a transcription for a model (optional scope)
 
 ## Transcriptions
+No screen calls these: the UI reads the `ocr_status` already published in each collection's
+metadata instead of walking `ocr/`. They are kept for scripting and external callers.
+
 - `GET /api/transcriptions/` — List all transcriptions, with optional `collection_id` / `registre_id` filters
-- `GET /api/transcriptions/summary` — Quick summary by collection/register/model
+- `GET /api/transcriptions/summary` — Quick summary by collection/register/model. Counts the xml
+  files on disk, so it stays exact even for files copied in outside the application; the
+  collection stats endpoint uses it internally
 - `GET /api/transcriptions/stats` — Aggregated totals by collection and by model
 
 ## Search indexes
