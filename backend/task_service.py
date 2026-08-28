@@ -62,6 +62,16 @@ REFUSED = 'refused'
 # Clés volatiles / lourdes exclues des réponses API.
 _HIDDEN = ('pages', 'page_states', 'index_registres', 'payload', 'cancel', 'last_write', 'heartbeat')
 
+# Clés écrites **à part**, une fois pour toutes, dans `<id>.pages.json`.
+#
+# `pages` est fixé à l'enfilage et ne bouge plus, mais il pesait dans chaque écriture de la
+# tâche — or `_save_throttled` écrit jusqu'à une fois par seconde pendant toute l'exécution.
+# Sur une tâche de 50 000 pages c'était ~5 Mo de JSON poussés sur le partage chaque seconde,
+# des heures durant, pour ne rafraîchir que trois compteurs. Le fichier chaud ne garde donc
+# que l'état qui change ; `page_states` (des entiers, deux ordres de grandeur plus léger) y
+# reste car c'est le point de reprise et il doit rester atomique avec les compteurs.
+_SIDECAR = ('pages',)
+
 
 class TaskConflict(Exception):
     """Levée par `enqueue` quand le scope demandé est déjà occupé par un autre poste."""
@@ -93,6 +103,20 @@ class TaskService:
     _merged_cache_ts: float = 0.0
     _MERGED_TTL = 1.0
 
+    # Contenu des sidecars déjà lus, par id → (mtime, taille, valeurs). Le détail par page est
+    # interrogé toutes les 2 s tant que le panneau est déplié, y compris pour une tâche d'un
+    # autre poste (qui passe par le disque) : sans ce cache on relirait des Mo à chaque sondage.
+    _sidecar_cache: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
+    # Le panneau n'affiche qu'une tâche à la fois : garder plus que les dernières consultées
+    # ferait de ce cache le nouveau gouffre mémoire, à la place de celui qu'on vient de boucher.
+    _SIDECAR_CACHE_MAX = 4
+
+    # Fichiers de tâche déjà analysés, par nom → (mtime, taille, contenu). Le TTL d'une seconde
+    # ci-dessus dit *quand* relire le dossier, celui-ci dit *quoi* y relire : sans lui, les deux
+    # sondages du frontend reparsaient tout l'historique — jusqu'à `HISTORY_CAP` tâches — toutes
+    # les deux secondes, dans le process qui fait tourner l'OCR.
+    _file_cache: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
+
     # ── Enregistrement des runners ────────────────────────────────────
     @staticmethod
     def register(task_type: str, runner: Callable[[Dict[str, Any]], None],
@@ -113,32 +137,77 @@ class TaskService:
         return TaskService._dir() / f"{task_id}.json"
 
     @staticmethod
-    def _save(task: Dict[str, Any]) -> None:
-        """Écriture **atomique** (tmp + os.replace) du fichier de tâche.
+    def _sidecar_file(task_id: str) -> Path:
+        return TaskService._dir() / f"{task_id}.pages.json"
+
+    @staticmethod
+    def _write_atomic(path: Path, data: Dict[str, Any]) -> bool:
+        """Écrit un JSON de tâche de façon **atomique** (tmp + `os.replace`). `False` si l'écriture
+        a échoué (partage injoignable) — l'appelant décide s'il journalise.
 
         Le fichier est relu en boucle par les autres postes (`_merged_tasks`, `_lock_is_stale`) :
         une écriture en place exposerait un JSON tronqué, et un `JSONDecodeError` fait passer un
         verrou bien vivant pour obsolète — donc volable. Même motif que
         `IndexesService._save_index_meta`. Le tmp est nommé par thread pour que le superviseur et
         le runner ne se marchent pas dessus."""
-        data = {k: v for k, v in task.items() if k not in ('cancel', 'last_write')}
-        path = TaskService._file(task['id'])
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with TaskService._io_lock:
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except OSError:
             try:
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False)
-                os.replace(tmp, path)
-            except OSError as e:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    @staticmethod
+    def _read_sidecar(task_id: str) -> Dict[str, Any]:
+        """Clés lourdes d'une tâche, depuis `<id>.pages.json`. Vide si le fichier n'existe pas
+        (tâche d'avant la séparation : ses `pages` sont restées dans le fichier principal)."""
+        path = TaskService._sidecar_file(task_id)
+        try:
+            stat = path.stat()
+        except OSError:
+            TaskService._sidecar_cache.pop(task_id, None)
+            return {}
+        cached = TaskService._sidecar_cache.get(task_id)
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        TaskService._sidecar_cache[task_id] = (stat.st_mtime_ns, stat.st_size, data)
+        while len(TaskService._sidecar_cache) > TaskService._SIDECAR_CACHE_MAX:
+            TaskService._sidecar_cache.pop(next(iter(TaskService._sidecar_cache)))
+        return data
+
+    @staticmethod
+    def _save(task: Dict[str, Any]) -> None:
+        """Persiste la tâche : l'état changeant dans `<id>.json`, les clés `_SIDECAR` à part.
+
+        Le sidecar n'est écrit que s'il manque : son contenu est figé à l'enfilage, le réécrire
+        à chaque battement ne ferait que recopier les mêmes mégaoctets sur le partage."""
+        task_id = task['id']
+        data = {k: v for k, v in task.items()
+                if k not in ('cancel', 'last_write') and k not in _SIDECAR}
+        heavy = {k: task[k] for k in _SIDECAR if k in task}
+        with TaskService._io_lock:
+            if heavy and not TaskService._sidecar_file(task_id).exists():
+                TaskService._write_atomic(TaskService._sidecar_file(task_id), heavy)
+            # L'horloge de modification de Windows n'avance que par pas de ~15 ms : deux
+            # écritures rapprochées de même taille sont indiscernables pour `_read_task_file`.
+            # Nos propres écritures, elles, sont connues — on invalide plutôt que de parier.
+            TaskService._file_cache.pop(f"{task_id}.json", None)
+            if not TaskService._write_atomic(TaskService._file(task_id), data):
                 # Appelé chaque seconde par le superviseur : un NAS qui décroche produirait
                 # une entrée par seconde, d'où l'étranglement.
-                log_throttled(log, logging.WARNING, f"save:{task['id']}",
-                              "Échec d'écriture du fichier de tâche "
-                              + kv(id=task['id'], err=e))
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                log_throttled(log, logging.WARNING, f"save:{task_id}",
+                              "Échec d'écriture du fichier de tâche " + kv(id=task_id))
 
     @staticmethod
     def _save_throttled(task: Dict[str, Any]) -> None:
@@ -151,16 +220,24 @@ class TaskService:
             TaskService._save(task)
 
     @staticmethod
-    def _load_disk(task_id: str) -> Optional[Dict[str, Any]]:
-        """Relit l'état d'une tâche depuis le disque (peut appartenir à un autre poste)."""
+    def _load_disk(task_id: str, heavy: bool = True) -> Optional[Dict[str, Any]]:
+        """Relit l'état d'une tâche depuis le disque (peut appartenir à un autre poste).
+
+        `heavy=False` laisse les clés lourdes de côté : vérifier un statut ou la vivacité d'un
+        verrou n'a que faire de la liste des pages, et la relire tirerait des mégaoctets du
+        partage à chaque passage du superviseur. Les tâches d'avant la séparation les portent
+        encore en ligne : le sidecar absent laisse alors la valeur du fichier principal intacte."""
         f = TaskService._file(task_id)
         if not f.exists():
             return None
         try:
             with open(f, 'r', encoding='utf-8-sig') as fh:
-                return json.load(fh)
+                task = json.load(fh)
         except (OSError, json.JSONDecodeError):
             return None
+        if heavy:
+            task.update(TaskService._read_sidecar(task_id))
+        return task
 
     # ── Appartenance / vivacité (multi-PC) ────────────────────────────
     @staticmethod
@@ -194,15 +271,22 @@ class TaskService:
             base = dict(TaskService._merged_cache)
         else:
             base = {}
+            seen = set()
             for f in TaskService._dir().glob("*.json"):
-                try:
-                    with open(f, 'r', encoding='utf-8-sig') as fh:
-                        t = json.load(fh)
-                except (OSError, json.JSONDecodeError):
+                if f.name.endswith('.pages.json'):
+                    continue   # rien ici n'a besoin des pages : `_HIDDEN` les écarte de l'API
+                seen.add(f.name)
+                t = TaskService._read_task_file(f)
+                if t is None:
                     continue
                 tid = t.get('id')
                 if tid:
                     base[tid] = t
+            # Une tâche supprimée depuis un autre poste ne repassera plus jamais par `stat` :
+            # sans ce balayage son contenu resterait au chaud jusqu'à l'arrêt du serveur.
+            for name in list(TaskService._file_cache):
+                if name not in seen:
+                    del TaskService._file_cache[name]
             TaskService._merged_cache = dict(base)
             TaskService._merged_cache_ts = now
         with TaskService._lock:
@@ -210,6 +294,26 @@ class TaskService:
                 if TaskService._is_owned(t):
                     base[tid] = t
         return base
+
+    @staticmethod
+    def _read_task_file(path: Path) -> Optional[Dict[str, Any]]:
+        """Contenu d'un fichier de tâche, réanalysé seulement s'il a changé depuis la dernière
+        lecture. `os.stat` coûte un aller-retour, `json.load` en coûte des milliers."""
+        try:
+            stat = path.stat()
+        except OSError:
+            TaskService._file_cache.pop(path.name, None)
+            return None
+        cached = TaskService._file_cache.get(path.name)
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+        TaskService._file_cache[path.name] = (stat.st_mtime_ns, stat.st_size, data)
+        return data
 
     @staticmethod
     def _invalidate_merged() -> None:
@@ -223,7 +327,9 @@ class TaskService:
         if not full:
             errs = task.get('errors') or []
             out['errors'] = errs[:5]
-            out['errors_truncated'] = max(0, len(errs) - 5)
+            # Le nombre d'échecs fait foi, pas la longueur de la liste : celle-ci est plafonnée
+            # à la source (`ocr_service.ERRORS_KEPT`) et sous-estimerait une tâche très ratée.
+            out['errors_truncated'] = max(0, max(task.get('failed') or 0, len(errs)) - 5)
         return out
 
     # ── Accès ─────────────────────────────────────────────────────────
@@ -368,7 +474,7 @@ class TaskService:
         tid = info.get('task_id')
         if not tid:
             return True
-        disk = TaskService._load_disk(tid)
+        disk = TaskService._load_disk(tid, heavy=False)
         if disk is None:
             return True
         st = disk.get('status')
@@ -605,7 +711,7 @@ class TaskService:
                 if not t or t['status'] != 'queued':
                     q.pop(0)
                     continue
-                disk = TaskService._load_disk(cand)
+                disk = TaskService._load_disk(cand, heavy=False)
                 if disk is None:
                     q.pop(0)
                     TaskService._tasks.pop(cand, None)   # supprimée à distance
@@ -838,13 +944,16 @@ class TaskService:
 
     @staticmethod
     def _unlink_task(task_id: str) -> None:
-        """Supprime le fichier de la tâche et la commande éventuellement en attente pour elle
-        (sinon un marqueur orphelin survivrait à la tâche qu'il visait)."""
-        for path in (TaskService._file(task_id), TaskService._control_file(task_id)):
+        """Supprime les fichiers de la tâche (état + clés lourdes) et la commande éventuellement
+        en attente pour elle (sinon un marqueur orphelin survivrait à la tâche qu'il visait)."""
+        for path in (TaskService._file(task_id), TaskService._sidecar_file(task_id),
+                     TaskService._control_file(task_id)):
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+        TaskService._sidecar_cache.pop(task_id, None)
+        TaskService._file_cache.pop(f"{task_id}.json", None)
 
     @staticmethod
     def _prune_history() -> None:
@@ -900,11 +1009,16 @@ class TaskService:
             TaskService._migrate_legacy_ocr_jobs(tasks_dir)
 
             for f in tasks_dir.glob("*.json"):
+                if f.name.endswith('.pages.json'):
+                    continue   # sidecar : recollé avec sa tâche, jamais chargé pour lui-même
                 try:
                     with open(f, 'r', encoding='utf-8-sig') as fh:
                         task = json.load(fh)
                 except (OSError, json.JSONDecodeError):
                     continue
+                if task.get('id'):
+                    # Sans quoi une tâche reprise après redémarrage repartirait sans ses pages.
+                    task.update(TaskService._read_sidecar(task['id']))
                 task.setdefault('cancel', False)
                 task.setdefault('type', 'ocr')
                 # Ne marquer interrompue QUE nos propres tâches : une tâche `running` d'un autre

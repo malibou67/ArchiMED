@@ -5,6 +5,7 @@ reprise). Ce module fournit le runner `run_ocr_task` (pipeline multiprocessing) 
 par page (`pages_slice`/`_page_status`), et délègue la file/le cycle de vie à TaskService.
 """
 import atexit
+import ctypes
 import os
 import threading
 import time
@@ -44,6 +45,31 @@ def _env_float(name: str, default: float) -> float:
 # Précision mixte (autocast + TF32) par défaut (env). Mesuré sans effet sur ce modèle (goulot
 # = post-traitement CPU). Surchargée par le réglage UI s'il est défini.
 MIXED_PRECISION = os.getenv('OCR_MIXED_PRECISION', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+# Période de la trace « Charge OCR » (empreinte mémoire des workers), en secondes. 0 = muet.
+STATS_INTERVAL = _env_int('OCR_STATS_INTERVAL', 60)
+
+# ── Usure des workers sur les tâches longues ──────────────────────────────────────
+# Un worker qui enchaîne des milliers de pages ne rend jamais ce qu'il a pris : l'allocateur
+# CUDA de PyTorch garde ses blocs (il ne les rend au pilote que sur `empty_cache()`) et les
+# fragmente au fil de scans de tailles inégales. Quand la VRAM sature, le pilote NVIDIA déborde
+# en mémoire système : le GPU affiche 100 % mais le débit s'effondre et **toute la machine**
+# devient lente. D'où deux garde-fous, l'un radical et l'autre continu :
+#   - renouveler les workers toutes les N pages : le seul moyen sûr de tout rendre, y compris
+#     la fragmentation du tas Python que `gc` ne récupère pas ;
+#   - purger le cache CUDA périodiquement, pour que les workers ne s'affament pas entre deux
+#     recyclages.
+# Le recyclage coûte un rechargement des modèles (~1-3 s) : à 100 pages de plusieurs secondes,
+# moins de 1 % du temps de la tâche. 0 désactive.
+MAX_TASKS_PER_CHILD = 100
+EMPTY_CACHE_EVERY = _env_int('OCR_EMPTY_CACHE_EVERY', 20)
+
+# Pages en échec détaillées gardées dans la tâche. La liste est resérialisée à **chaque**
+# écriture : sans plafond, une panne durable (partage coupé en pleine tâche) la fait grossir
+# page après page et rend chaque sauvegarde plus lente que la précédente. Le compte exact reste
+# dans `failed`, et le journal garde le détail de toutes les pages, pas seulement des 200
+# premières.
+ERRORS_KEPT = 200
 
 
 # Budget VRAM par worker CUDA (Go) et marge réservée (bureau + pics de segmentation).
@@ -115,6 +141,17 @@ def effective_mixed() -> bool:
     if stored is not None:
         return bool(stored)
     return MIXED_PRECISION
+
+
+def effective_max_tasks_per_child() -> int:
+    """Pages traitées par un worker avant recyclage. 0 = jamais (comportement d'avant)."""
+    stored = SettingsService.get().get('ocr_max_tasks_per_child')
+    if stored is not None:
+        try:
+            return max(0, int(stored))
+        except (TypeError, ValueError):
+            pass
+    return max(0, _env_int('OCR_MAX_TASKS_PER_CHILD', MAX_TASKS_PER_CHILD))
 
 
 def effective_pool_min_pages() -> int:
@@ -206,11 +243,100 @@ def _write_xml_atomic(out_path: Path, xml: str) -> None:
             delay *= 2
 
 
+# ── Mesure de l'empreinte mémoire (diagnostic des tâches longues) ─────────────────
+# Sur une tâche de plusieurs dizaines de milliers de pages, ce qui ralentit la machine n'est
+# pas le débit de l'OCR mais la mémoire que les workers ne rendent jamais. Ces mesures sont
+# la seule façon de voir la dérive : elles ne doivent donc jamais faire échouer une page.
+class _MemoryCounters(ctypes.Structure):
+    """`PROCESS_MEMORY_COUNTERS` de psapi. On passe par ctypes plutôt que d'ajouter `psutil` :
+    une dépendance de plus dans le build gelé pour une ligne de journal ne se justifie pas."""
+    _fields_ = [('cb', ctypes.c_ulong),
+                ('PageFaultCount', ctypes.c_ulong),
+                ('PeakWorkingSetSize', ctypes.c_size_t),
+                ('WorkingSetSize', ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                ('PagefileUsage', ctypes.c_size_t),
+                ('PeakPagefileUsage', ctypes.c_size_t)]
+
+
+def _bind_rss_probe():
+    """Lie les deux appels psapi une fois pour toutes, ou rend `None` si l'OS ne les offre pas.
+
+    Les signatures sont **obligatoires** : sans `restype`, `GetCurrentProcess()` (qui rend le
+    pseudo-handle -1) repasse par un `int` 32 bits et l'appel échoue en ERROR_INVALID_HANDLE."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        return kernel32.GetCurrentProcess, psapi.GetProcessMemoryInfo
+    except (AttributeError, OSError):
+        return None
+
+
+_RSS_PROBE = _bind_rss_probe()
+
+
+def _process_rss_mb() -> Optional[int]:
+    """Mémoire résidente du process courant, en Mo. `None` hors Windows ou en cas d'échec."""
+    if _RSS_PROBE is None:
+        return None
+    current_process, memory_info = _RSS_PROBE
+    try:
+        counters = _MemoryCounters()
+        counters.cb = ctypes.sizeof(_MemoryCounters)
+        if not memory_info(current_process(), ctypes.byref(counters), counters.cb):
+            return None
+        return int(counters.WorkingSetSize // (1024 * 1024))
+    except Exception:
+        return None
+
+
 # ── Workers multiprocessing (fonctions au niveau module → picklables sous Windows) ──
 _W_SEG = None
 _W_OCR = None
 _W_DEVICE = 'cpu'
 _W_MIXED = False
+_W_PAGES = 0        # pages traitées par CE worker (chaque process a sa copie)
+
+
+def _release_worker_memory() -> None:
+    """Rend périodiquement au pilote les blocs que l'allocateur CUDA garde en cache.
+
+    PyTorch ne libère jamais ces blocs de lui-même : il les recycle. C'est efficace pour un
+    process court, ruineux pour quatre workers qui se partagent une carte pendant des heures —
+    chacun tient son plus haut pic pour toujours. Le recyclage des workers reste le vrai
+    remède ; ceci évite juste qu'ils s'affament entre deux recyclages. `empty_cache` synchronise
+    le device, d'où l'espacement plutôt qu'un appel à chaque page."""
+    if _W_DEVICE != 'cuda' or EMPTY_CACHE_EVERY <= 0 or _W_PAGES % EMPTY_CACHE_EVERY:
+        return
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _worker_stats() -> Dict[str, Any]:
+    """Empreinte du worker, jointe au résultat de chaque page pour que le parent la journalise.
+
+    `memory_reserved` est ce que PyTorch tient auprès du pilote, `memory_allocated` ce qu'il en
+    utilise vraiment : c'est l'écart entre les deux, et la montée du premier, qui trahissent le
+    cache CUDA qui enfle. Les deux sont des lectures de compteurs, sans synchronisation GPU."""
+    stats: Dict[str, Any] = {'pid': os.getpid(), 'n': _W_PAGES, 'rss': _process_rss_mb()}
+    if _W_DEVICE == 'cuda':
+        try:
+            import torch
+            stats['vram_res'] = int(torch.cuda.memory_reserved() // (1024 * 1024))
+            stats['vram_alloc'] = int(torch.cuda.memory_allocated() // (1024 * 1024))
+        except Exception:
+            pass
+    return stats
 
 
 def _ocr_worker_init(seg_model_id: str, ocr_model_id: str, device: str, threads: int, mixed: bool) -> None:
@@ -236,9 +362,16 @@ def _ocr_worker_init(seg_model_id: str, ocr_model_id: str, device: str, threads:
 
 
 def _ocr_worker_page(task):
-    """Traite une page dans un worker : segmentation → reconnaissance → PAGE XML écrit."""
+    """Traite une page dans un worker : segmentation → reconnaissance → PAGE XML écrit.
+
+    Retourne `(index, collection, libellé, ok, erreur, stats)` — les stats servent la trace
+    « Charge OCR » côté parent et sont jointes aux deux issues, échec compris : un worker qui
+    dérive échoue souvent *avant* de rendre sa page."""
+    global _W_PAGES
     idx, col, reg, img_name, ocr_model_id = task
     label = f"{reg}/{img_name}"
+    _W_PAGES += 1
+    im = None
     try:
         from PIL import Image
         from kraken import blla, rpred, serialization
@@ -249,15 +382,55 @@ def _ocr_worker_page(task):
         out_dir = collections_root / col / "ocr" / reg / ocr_model_id
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / (Path(img_name).stem + ".xml")
-        im = Image.open(img_path).convert('RGB')
+        # `convert` détache une nouvelle image : sans le `with`, le handle du fichier source
+        # ne se referme qu'au passage du compteur de références — sur un partage SMB c'est un
+        # handle réseau tenu ouvert pour rien, des dizaines de milliers de fois.
+        with Image.open(img_path) as src:
+            im = src.convert('RGB')
         bounds = blla.segment(im, model=_W_SEG, device=_W_DEVICE, autocast=_W_MIXED)
         preds = list(rpred.rpred(_W_OCR, im, bounds))
         results = dataclasses.replace(bounds, lines=preds, imagename=str(img_path))
         xml = serialization.serialize(results=results, image_size=im.size, template='pagexml')
         _write_xml_atomic(out_path, xml)
-        return (idx, col, label, True, None)
+        return (idx, col, label, True, None, _worker_stats())
     except Exception as e:
-        return (idx, col, label, False, str(e))
+        return (idx, col, label, False, str(e), _worker_stats())
+    finally:
+        if im is not None:
+            im.close()
+        _release_worker_memory()
+
+
+def _log_worker_load(task, worker_stats: Dict[int, Dict[str, Any]], in_flight: int,
+                     last_log: float) -> float:
+    """Trace périodique de l'empreinte des workers. Retourne la date de la dernière écriture.
+
+    C'est la courbe qui dit si un worker dérive : VRAM réservée qui monte sans jamais redescendre
+    → le pilote NVIDIA déborde en mémoire système et c'est toute la machine qui ralentit, pas
+    seulement l'OCR. Une ligne par minute au plus : le journal tourne à 5 Mo, on ne le remplit
+    pas avec de la métrique."""
+    if STATS_INTERVAL <= 0:
+        return last_log
+    now = time.time()
+    if now - last_log < STATS_INTERVAL:
+        return last_log
+    detail = ' | '.join(
+        f"pid={st['pid']} n={st['n']}"
+        + (f" rss={st['rss']}Mo" if st.get('rss') is not None else '')
+        + (f" vram={st['vram_res']}/{st['vram_alloc']}Mo" if 'vram_res' in st else '')
+        for st in sorted(worker_stats.values(), key=lambda st: st['pid']))
+    log.info("Charge OCR " + kv(
+        id=task['id'],
+        restantes=task['total'] - task['processed'] - task['failed'],
+        en_vol=in_flight, workers=detail))
+    return now
+
+
+def _record_error(task: Dict[str, Any], label: str, err: Any) -> None:
+    """Note une page en échec dans la tâche, sans laisser la liste enfler indéfiniment."""
+    errors = task['errors']
+    if len(errors) < ERRORS_KEPT:
+        errors.append({'page': label, 'error': str(err) if err is not None else None})
 
 
 class NoPagesToProcess(Exception):
@@ -315,70 +488,83 @@ class OcrService:
 
     # ── Détail par page (utilisé par /api/tasks/{id}/pages) ───────────
     @staticmethod
-    def _page_status(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """État de chaque page. En parallèle les pages se terminent dans le désordre, donc
-        on s'appuie sur `page_states` (aligné sur `pages`) : 0=à faire, 1=faite, 2=échec,
-        3=en cours. Repli sur une déduction par ordre si `page_states` absent."""
-        pages = task.get('pages') or []
-        errors = task.get('errors') or []
-        error_by_label = {e.get('page'): e.get('error') for e in errors}
-        states = task.get('page_states')
+    def _page_codes(task: Dict[str, Any]) -> List[str]:
+        """Statut de chaque page, par position, sans construire un objet par page.
 
-        result: List[Dict[str, Any]] = []
+        En parallèle les pages se terminent dans le désordre, donc on s'appuie sur `page_states`
+        (aligné sur `pages`) : 0=à faire, 1=faite, 2=échec, 3=en cours. Repli sur une déduction
+        par ordre si `page_states` est absent (tâches antérieures à ce champ)."""
+        pages = task.get('pages') or []
+        states = task.get('page_states')
         if isinstance(states, list) and len(states) == len(pages):
             names = {0: 'pending', 1: 'done', 2: 'failed', 3: 'current'}
-            for i, p in enumerate(pages):
-                label = f"{p['registre']}/{p['page']}"
-                st = names.get(states[i], 'pending')
-                item: Dict[str, Any] = {'page': label, 'status': st}
-                if st == 'failed':
-                    item['error'] = error_by_label.get(label)
-                result.append(item)
-            return result
+            return [names.get(st, 'pending') for st in states]
 
+        failed_labels = {e.get('page') for e in (task.get('errors') or [])}
         attempted = task.get('processed', 0) + task.get('failed', 0)
         running = task.get('status') == 'running'
         current = task.get('current')
+        codes: List[str] = []
         for i, p in enumerate(pages):
             label = f"{p['registre']}/{p['page']}"
             if i < attempted:
-                st = 'failed' if label in error_by_label else 'done'
+                codes.append('failed' if label in failed_labels else 'done')
             elif running and (label == current or i == attempted):
-                st = 'current'
+                codes.append('current')
             else:
-                st = 'pending'
-            item = {'page': label, 'status': st}
-            if st == 'failed':
-                item['error'] = error_by_label.get(label)
-            result.append(item)
-        return result
+                codes.append('pending')
+        return codes
+
+    @staticmethod
+    def _page_item(pages: List[Dict[str, str]], codes: List[str],
+                   error_by_label: Dict[str, Any], i: int) -> Dict[str, Any]:
+        """Ligne d'affichage d'une page."""
+        label = f"{pages[i]['registre']}/{pages[i]['page']}"
+        item: Dict[str, Any] = {'page': label, 'status': codes[i]}
+        if codes[i] == 'failed':
+            item['error'] = error_by_label.get(label)
+        return item
+
+    @staticmethod
+    def _page_status(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """État de chaque page, en entier. Réservé aux usages qui ont besoin de tout
+        (`failed_pages`) : pour l'affichage paginé, passer par `pages_slice`."""
+        pages = task.get('pages') or []
+        codes = OcrService._page_codes(task)
+        error_by_label = {e.get('page'): e.get('error') for e in (task.get('errors') or [])}
+        return [OcrService._page_item(pages, codes, error_by_label, i) for i in range(len(pages))]
+
+    # Statuts retenus par chaque filtre de l'API (`all` = pas de filtre).
+    _FILTERS = {'done': ('done',), 'failed': ('failed',), 'todo': ('pending', 'current')}
 
     @staticmethod
     def pages_slice(task: Dict[str, Any], status_filter: str = 'all', offset: int = 0, limit: int = 100) -> Dict[str, Any]:
-        """Tranche paginée de l'état des pages d'une tâche OCR."""
-        full = OcrService._page_status(task)
+        """Tranche paginée de l'état des pages d'une tâche OCR.
+
+        Le panneau est resondé toutes les 2 secondes tant qu'il est déplié, dans le process qui
+        fait tourner l'OCR : on ne construit donc que les cent lignes demandées. Les comptes se
+        lisent directement sur les codes, et le filtre travaille sur des index."""
+        pages = task.get('pages') or []
+        codes = OcrService._page_codes(task)
         counts = {
-            'all': len(full),
-            'done': sum(1 for p in full if p['status'] == 'done'),
-            'failed': sum(1 for p in full if p['status'] == 'failed'),
-            'todo': sum(1 for p in full if p['status'] in ('pending', 'current')),
+            'all': len(codes),
+            'done': codes.count('done'),
+            'failed': codes.count('failed'),
+            'todo': codes.count('pending') + codes.count('current'),
         }
-        if status_filter == 'done':
-            items = [p for p in full if p['status'] == 'done']
-        elif status_filter == 'failed':
-            items = [p for p in full if p['status'] == 'failed']
-        elif status_filter == 'todo':
-            items = [p for p in full if p['status'] in ('pending', 'current')]
-        else:
-            items = full
+        wanted = OcrService._FILTERS.get(status_filter)
+        indices: Any = range(len(codes)) if wanted is None else [
+            i for i, code in enumerate(codes) if code in wanted]
         offset = max(0, offset)
         limit = max(1, min(limit, 500))
+        error_by_label = {e.get('page'): e.get('error') for e in (task.get('errors') or [])}
         return {
-            'total': len(items),
+            'total': len(indices),
             'offset': offset,
             'limit': limit,
             'counts': counts,
-            'items': items[offset:offset + limit],
+            'items': [OcrService._page_item(pages, codes, error_by_label, i)
+                      for i in indices[offset:offset + limit]],
         }
 
     # ── Relance des pages en échec ────────────────────────────────────
@@ -605,25 +791,60 @@ class OcrService:
             except Exception as e:
                 states[i] = 2
                 task['failed'] += 1
-                task['errors'].append({'page': label, 'error': str(e)})
-                # `errors` est plafonné à l'affichage et disparaît avec la tâche purgée :
-                # le journal est la seule trace durable des pages en échec.
+                _record_error(task, label, e)
+                # `errors` est plafonné et disparaît avec la tâche purgée : le journal est la
+                # seule trace durable des pages en échec.
                 log.warning("Page en échec " + kv(registre=reg, page=img_name, err=e))
             on_page_done(col, reg)
             TaskService._save_throttled(task)
 
     @staticmethod
     def _process_pool(task, touched, todo, seg_model_id, ocr_model_id, device, workers,
-                      threads, mixed, on_page_done) -> None:
+                      threads, mixed, max_tasks_per_child, on_page_done) -> None:
         """Traitement parallèle : un pool de process traite les pages en concurrence
         (le post-traitement CPU, goulot réel, s'étale sur les cœurs). Les pages se terminent
-        dans le désordre → on note l'état par index dans page_states."""
-        from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+        dans le désordre → on note l'état par index dans page_states.
 
+        Le pool est **renouvelé** tous les `max_tasks_per_child` pages par worker : c'est ce qui
+        empêche une tâche de plusieurs dizaines de milliers de pages de ralentir la machine
+        entière (voir `MAX_TASKS_PER_CHILD`). Voir `_run_pool_batch` pour le pourquoi de ce
+        découpage plutôt que du paramètre standard."""
         states = task['page_states']
         by_index = {i: p for i, p in todo}
         tasks = [(i, p['collection'], p['registre'], p['page'], ocr_model_id) for i, p in todo]
+        # `last_log` est partagé entre les lots (la trace garde sa cadence d'une ligne par
+        # minute), mais les mesures elles-mêmes sont remises à zéro à chaque pool : les pids du
+        # lot précédent n'existent plus, et les cumuler ferait grossir la ligne sans fin.
+        progress: Dict[str, Any] = {'stats': {}, 'last_log': time.time()}
 
+        per_pool = max(1, max_tasks_per_child * workers) if max_tasks_per_child > 0 else len(tasks)
+        for start in range(0, len(tasks), per_pool):
+            if OcrService._stop_requested(task):
+                break
+            OcrService._run_pool_batch(
+                task, touched, states, by_index, tasks[start:start + per_pool],
+                seg_model_id, ocr_model_id, device, workers, threads, mixed,
+                on_page_done, progress)
+
+    @staticmethod
+    def _run_pool_batch(task, touched, states, by_index, batch, seg_model_id, ocr_model_id,
+                        device, workers, threads, mixed, on_page_done, progress) -> None:
+        """Traite un lot dans un pool neuf, puis rend les process — donc leur VRAM et leur tas.
+
+        On renouvelle le pool nous-mêmes au lieu de passer `max_tasks_per_child` à
+        `ProcessPoolExecutor` : ce paramètre **bloque le pool**. Quand un worker atteint son
+        quota et sort, `_adjust_process_count()` commence par consommer un jeton du sémaphore
+        des workers libres — jeton posté par chaque page déjà rendue — et repart sans avoir
+        engendré le remplaçant. Après quelques pages, le pool n'a plus un seul process et
+        l'attente est éternelle. Reproduit ici sur 8 pages : les deux workers sortent à leur
+        quota, `restantes=4 en_vol=4`, plus rien ne bouge.
+
+        Le prix de ce découpage est une barrière par lot (les traînards finissent pendant que
+        les autres attendent) plus un rechargement des modèles : quelques secondes par lot de
+        plusieurs centaines de pages."""
+        from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+
+        progress['stats'] = {}   # workers du lot précédent : ces process n'existent plus
         executor = ProcessPoolExecutor(
             max_workers=workers,
             initializer=_ocr_worker_init,
@@ -631,8 +852,25 @@ class OcrService:
         )
         with _POOLS_LOCK:
             _ACTIVE_POOLS.add(executor)
+        # Soumission par fenêtre glissante plutôt qu'en bloc : `wait()` est O(n) sur les futures
+        # en vol (il les trie et prend le verrou de chacune) et on l'appelle chaque seconde —
+        # avec 50 000 pages soumises d'emblée, c'est du CPU brûlé à ne rien faire, et 50 000
+        # `_WorkItem` retenus dans l'exécuteur. Quelques pages d'avance par worker suffisent à ce
+        # qu'aucun ne se retrouve à sec. La reprise, elle, reste pilotée par `page_states`.
+        remaining = iter(batch)
+        window = max(8, workers * 4)
+
+        def _fill(in_flight: set) -> None:
+            """Complète la fenêtre. `wait` rebinde l'ensemble à chaque tour, d'où le paramètre."""
+            while len(in_flight) < window:
+                try:
+                    in_flight.add(executor.submit(_ocr_worker_page, next(remaining)))
+                except StopIteration:
+                    return
+
         try:
-            pending = {executor.submit(_ocr_worker_page, t) for t in tasks}
+            pending: set = set()
+            _fill(pending)
             # Attente par tranches d'une seconde plutôt que `as_completed` : sinon la demande
             # d'arrêt n'est vue qu'au retour d'une page, soit une minute ou plus par gros scan.
             while pending:
@@ -640,7 +878,8 @@ class OcrService:
                     break
                 done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
                 for fut in done:
-                    idx, col, label, ok, err = fut.result()
+                    idx, col, label, ok, err, stats = fut.result()
+                    progress['stats'][stats['pid']] = stats
                     if ok:
                         states[idx] = 1
                         touched.add((col, by_index[idx]['registre']))
@@ -648,25 +887,32 @@ class OcrService:
                     else:
                         states[idx] = 2
                         task['failed'] += 1
-                        task['errors'].append({'page': label, 'error': err})
+                        _record_error(task, label, err)
                         log.warning("Page en échec " + kv(
                             registre=by_index[idx]['registre'], page=by_index[idx]['page'], err=err))
                     task['current'] = label
                     on_page_done(col, by_index[idx]['registre'])
                 if done:
+                    _fill(pending)
                     TaskService._save_throttled(task)
+                    progress['last_log'] = _log_worker_load(
+                        task, progress['stats'], len(pending), progress['last_log'])
         finally:
             # `shutdown` annule les pages en file mais laisse les workers finir celle qu'ils
             # ont commencée : sur un arrêt demandé on tue, sinon « Annuler » laisse le GPU
             # occupé pendant des minutes (et la tâche suivante démarre par-dessus).
-            if OcrService._stop_requested(task):
+            stopping = OcrService._stop_requested(task)
+            if stopping:
                 killed = _kill_pool(executor)
                 if killed:
                     log.info("Arrêt demandé " + kv(workers_interrompus=killed))
             with _POOLS_LOCK:
                 _ACTIVE_POOLS.discard(executor)
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
+                # Lot terminé normalement : on **attend** la sortie des workers, sinon le pool
+                # du lot suivant démarrerait pendant que l'ancien tient encore sa VRAM — deux
+                # jeux de workers à la fois, exactement la saturation qu'on cherche à éviter.
+                executor.shutdown(wait=not stopping, cancel_futures=True)
             except Exception:
                 pass  # pool déjà tué : rien à attendre
 
@@ -766,6 +1012,7 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
             'workers': workers,
             'threads': effective_threads(),
             'mixed_precision': effective_mixed() and device == 'cuda',
+            'max_tasks_per_child': effective_max_tasks_per_child(),
             'checked_at': datetime.now().isoformat(),
         }
         if cap_reason:
@@ -780,6 +1027,7 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
             workers=workers, workers_demandés=requested if cap_reason else None,
             bridage=cap_reason, threads=task['preflight']['threads'],
             précision_mixte=task['preflight']['mixed_precision'],
+            recyclage=task['preflight']['max_tasks_per_child'] or 'aucun',
             kraken=(pre.get('kraken') or {}).get('version'),
             torch=(pre.get('torch') or {}).get('version')))
 
@@ -804,6 +1052,7 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
         workers = task['preflight']['workers']
         threads = task['preflight']['threads']
         mixed = task['preflight']['mixed_precision']
+        max_tasks_per_child = task['preflight']['max_tasks_per_child']
 
         if workers <= 1 or len(todo) < effective_pool_min_pages():
             task['preflight']['mode'] = 'sequential'
@@ -813,7 +1062,8 @@ def run_ocr_task(task: Dict[str, Any]) -> None:
             task['preflight']['mode'] = 'parallel'
             try:
                 OcrService._process_pool(task, touched, todo, seg_model_id, ocr_model_id,
-                                         device, workers, threads, mixed, on_page_done)
+                                         device, workers, threads, mixed,
+                                         max_tasks_per_child, on_page_done)
             except Exception as pool_err:
                 if task['cancel']:
                     raise
