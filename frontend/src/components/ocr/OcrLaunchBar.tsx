@@ -17,6 +17,8 @@ function fmtEstimate(seconds: number): string {
 
 interface OcrLaunchBarProps {
   selectedCount: number;
+  /** Registres distincts couverts par la sélection (unité de verrou côté backend). */
+  selectedRegistreCount: number;
   segModelName: string | null;
   ocrModelName: string | null;
   estimateSeconds: number | null;
@@ -37,7 +39,7 @@ interface OcrLaunchBarProps {
 /** Barre de lancement : récapitulatif de la sélection, estimation de durée,
  * progression inline de la tâche OCR en cours (avec pause / reprise), bouton « Lancer ». */
 export default function OcrLaunchBar({
-  selectedCount, segModelName, ocrModelName, estimateSeconds,
+  selectedCount, selectedRegistreCount, segModelName, ocrModelName, estimateSeconds,
   activeOcr, pausingOcr, launching, canLaunch, disabledReason, envChip,
   onLaunch, onClearSelection, onPauseOcr, onResumeOcr,
 }: OcrLaunchBarProps) {
@@ -46,7 +48,10 @@ export default function OcrLaunchBar({
 
   const recap = selectedCount > 0
     ? [
-        t('launchBar.selected', { count: selectedCount }),
+        t('launchBar.selected', {
+          count: selectedCount,
+          registres: t('registres', { count: selectedRegistreCount }),
+        }),
         segModelName && t('launchBar.seg', { name: segModelName }),
         ocrModelName && t('launchBar.ocr', { name: ocrModelName }),
         estimateSeconds != null && fmtEstimate(estimateSeconds),

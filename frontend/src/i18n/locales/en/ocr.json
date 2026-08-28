@@ -120,9 +120,16 @@
     "missingOnly_other": "Transcribe the {{count}} missing pages only",
     "confirm": "Run again and overwrite"
   },
+  "launchOverlay": {
+    "checking": "Checking existing transcriptions…",
+    "checkingProgress": "Registre {{done}} / {{total}}",
+    "creating": "Creating the OCR task…",
+    "creatingDetail_one": "{{count}} page — preparation can take several minutes, do not close the window.",
+    "creatingDetail_other": "{{count}} pages — preparation can take several minutes, do not close the window."
+  },
   "launchBar": {
-    "selected_one": "{{count}} page selected",
-    "selected_other": "{{count}} pages selected",
+    "selected_one": "{{count}} page selected in {{registres}}",
+    "selected_other": "{{count}} pages selected in {{registres}}",
     "seg": "Seg: {{name}}",
     "ocr": "OCR: {{name}}",
     "noneSelected": "No page selected",

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import {
   Typography,
   Box,
+  Backdrop,
   CircularProgress,
   Alert,
   Checkbox,
@@ -219,7 +220,15 @@ export default function OcrPage() {
   const busyLabel = (from: string) =>
     from ? t('tree.busyOn', { machine: from }) : t('tree.busyHere');
 
-  const [launching, setLaunching] = useState(false);
+  // Création de la tâche : 'checking' = sondage des transcriptions existantes (un appel par
+  // registre), 'creating' = POST /api/ocr/run (le backend vérifie chaque image sur le disque).
+  // Sur des dizaines de milliers de pages les deux durent, d'où l'overlay bloquant.
+  const [launchPhase, setLaunchPhase] = useState<null | 'checking' | 'creating'>(null);
+  const launching = launchPhase !== null;
+  // Avancement du sondage, registre par registre (seul repère pendant la phase 'checking').
+  const [launchProgress, setLaunchProgress] = useState({ done: 0, total: 0 });
+  // Pages effectivement envoyées, pour le détail de l'overlay pendant la phase 'creating'.
+  const [launchPageCount, setLaunchPageCount] = useState(0);
   const [pausingOcr, setPausingOcr] = useState(false);
   const [queuedNotice, setQueuedNotice] = useState<number | null>(null);
   // Pages que le backend a écartées faute d'image sur le disque (registre modifié depuis
@@ -360,7 +369,8 @@ export default function OcrPage() {
     const pages = keys.map(parsePageKey).filter((p): p is OcrPageRef => p !== null);
     if (pages.length === 0 || !selectedSegModel || !selectedOcrModel) return;
     try {
-      setLaunching(true);
+      setLaunchPageCount(pages.length);
+      setLaunchPhase('creating');
       setError(null);
       // `total` et non `pages.length` : le backend écarte les pages dont l'image n'existe pas.
       const task = await ocrApi.run(selectedSegModel, selectedOcrModel, pages);
@@ -372,7 +382,7 @@ export default function OcrPage() {
       setError(err?.response?.data?.detail || t('errors.launch'));
       console.error(err);
     } finally {
-      setLaunching(false);
+      setLaunchPhase(null);
     }
   };
 
@@ -429,6 +439,13 @@ export default function OcrPage() {
     }
     return counts;
   }, [selectedPages]);
+
+  // Registres distincts couverts par la sélection : les clés « collection/registre/ » du compteur
+  // ci-dessus (celles de collection n'ont qu'un slash) — inutile de reparcourir les pages.
+  const selectedRegistreCount = useMemo(
+    () => [...selectionCounts.keys()].filter((k) => k.indexOf('/') !== k.lastIndexOf('/')).length,
+    [selectionCounts],
+  );
 
   const getRegCheckState = (colId: string, reg: RegistreSummary) => {
     const total = matchingTotal(reg);
@@ -538,7 +555,8 @@ export default function OcrPage() {
   const requestLaunch = async () => {
     const keys = [...selectedPages];
     setError(null);
-    setLaunching(true);
+    setLaunchProgress({ done: 0, total: 0 });
+    setLaunchPhase('checking');
     try {
       // On ne sonde que les registres dont les métadonnées annoncent au moins une page faite :
       // sur une grosse sélection, cela évite un aller-retour réseau par registre vierge.
@@ -552,7 +570,10 @@ export default function OcrPage() {
         else byReg.set(rKey, [{ ref, key }]);
       }
       const done: string[] = [];
+      let checked = 0;
+      setLaunchProgress({ done: 0, total: byReg.size });
       for (const [, entries] of byReg) {
+        setLaunchProgress({ done: ++checked, total: byReg.size });
         const { collection: cKey, registre: folder } = entries[0].ref;
         const reg = collections.find((c) => colKey(c) === cKey)
           ?.registres?.find((r) => r.folder_name === folder);
@@ -572,7 +593,7 @@ export default function OcrPage() {
       setError(err?.response?.data?.detail || t('errors.launch'));
       console.error(err);
     } finally {
-      setLaunching(false);
+      setLaunchPhase(null);
     }
   };
 
@@ -1201,6 +1222,7 @@ export default function OcrPage() {
       {/* ─── Barre de lancement ─── */}
       <OcrLaunchBar
         selectedCount={selectedPages.size}
+        selectedRegistreCount={selectedRegistreCount}
         segModelName={models.find((m) => m.id === selectedSegModel)?.name ?? null}
         ocrModelName={models.find((m) => m.id === selectedOcrModel)?.name ?? null}
         estimateSeconds={estimateSeconds}
@@ -1246,6 +1268,30 @@ export default function OcrPage() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* ─── Création de la tâche : overlay bloquant ───
+          Sur des dizaines de milliers de pages, le sondage des transcriptions puis la
+          vérification des images côté backend prennent longtemps : sans overlay, la page
+          paraît inerte et l'utilisateur reclique. */}
+      <Backdrop
+        open={launching}
+        sx={{ zIndex: (theme) => theme.zIndex.modal + 1, color: '#fff', flexDirection: 'column', gap: 2 }}
+      >
+        <CircularProgress color="inherit" />
+        <Typography variant="h6">
+          {t(launchPhase === 'checking' ? 'launchOverlay.checking' : 'launchOverlay.creating')}
+        </Typography>
+        <Typography variant="body2" sx={{ opacity: 0.85, textAlign: 'center', px: 2 }}>
+          {launchPhase === 'checking'
+            ? (launchProgress.total > 0
+                ? t('launchOverlay.checkingProgress', {
+                    done: fmtNum(launchProgress.done),
+                    total: fmtNum(launchProgress.total),
+                  })
+                : '')
+            : t('launchOverlay.creatingDetail', { count: launchPageCount })}
+        </Typography>
+      </Backdrop>
 
     </Box>
   );

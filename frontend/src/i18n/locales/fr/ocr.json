@@ -120,9 +120,16 @@
     "missingOnly_other": "Ne transcrire que les {{count}} pages manquantes",
     "confirm": "Relancer et écraser"
   },
+  "launchOverlay": {
+    "checking": "Vérification des transcriptions existantes…",
+    "checkingProgress": "Registre {{done}} / {{total}}",
+    "creating": "Création de la tâche OCR…",
+    "creatingDetail_one": "{{count}} page — la préparation peut prendre plusieurs minutes, ne fermez pas la fenêtre.",
+    "creatingDetail_other": "{{count}} pages — la préparation peut prendre plusieurs minutes, ne fermez pas la fenêtre."
+  },
   "launchBar": {
-    "selected_one": "{{count}} page sélectionnée",
-    "selected_other": "{{count}} pages sélectionnées",
+    "selected_one": "{{count}} page sélectionnée dans {{registres}}",
+    "selected_other": "{{count}} pages sélectionnées dans {{registres}}",
     "seg": "Seg : {{name}}",
     "ocr": "OCR : {{name}}",
     "noneSelected": "Aucune page sélectionnée",
