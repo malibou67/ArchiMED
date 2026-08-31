@@ -17,12 +17,15 @@
     "threadsPerWorker": "Threads per worker",
     "threadsHint": "Keep it at 1: too many threads × workers saturates the CPU and slows everything down.",
     "poolThreshold": "Parallelization threshold (pages)",
-    "poolThresholdHint": "Below this number of pages, OCR stays sequential (starting the pool isn't worth it).",
-    "indexingTitle": "Indexing",
-    "indexWorkers": "Indexing workers",
-    "indexWorkersHint": "XML files read in parallel while an index is built (recommended: {{recommended}} of {{cpu}}). Does not use the GPU.",
-    "indexPoolThreshold": "Parallelisation threshold (XML)",
-    "indexPoolThresholdHint": "Below this number of files, indexing stays sequential (starting the pool is not worth it)."
+    "poolThresholdHint": "Below this number of pages, OCR stays sequential (starting the pool isn't worth it)."
+  },
+  "indexing": {
+    "title": "Indexing performance",
+    "description": "Building an index reads and parses the XML produced by the OCR. That work is spread over several processes; it does not use the GPU.",
+    "workers": "Indexing workers",
+    "workersHint": "XML files read in parallel (recommended: {{recommended}} of {{cpu}}). Past a few concurrent reads it is the network share that limits, not the CPU.",
+    "threshold": "Parallelisation threshold (XML)",
+    "thresholdHint": "Below this number of files, indexing stays sequential (starting the processes is not worth it)."
   },
   "system": {
     "title": "System",

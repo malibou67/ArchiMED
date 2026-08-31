@@ -22,6 +22,7 @@ import {
 import {
   Memory as MemoryIcon,
   Speed as SpeedIcon,
+  ManageSearch as IndexIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
   CheckCircle as CheckCircleIcon,
@@ -366,42 +367,6 @@ export default function SettingsPage() {
                       </Typography>
                     </Box>
                   </Stack>
-
-                  {/* L'indexation a son propre pool : elle lit et analyse les XML de l'OCR, sans
-                      toucher au GPU. Ses réglages n'ont donc rien à voir avec ceux du dessus. */}
-                  <Divider textAlign="left" sx={{ pt: 0.5 }}>
-                    <Typography variant="caption" color="text.secondary">{t('performance.indexingTitle')}</Typography>
-                  </Divider>
-                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-                    <Box sx={{ flex: 1 }}>
-                      <TextField
-                        type="number"
-                        size="small"
-                        fullWidth
-                        label={t('performance.indexWorkers')}
-                        value={indexWorkers}
-                        onChange={(e) => setIndexWorkers(Math.max(1, Math.min(cpu, parseInt(e.target.value || '1', 10))))}
-                        inputProps={{ min: 1, max: cpu }}
-                      />
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                        {t('performance.indexWorkersHint', { recommended: data?.system.recommended_index_workers ?? 1, cpu })}
-                      </Typography>
-                    </Box>
-                    <Box sx={{ flex: 1 }}>
-                      <TextField
-                        type="number"
-                        size="small"
-                        fullWidth
-                        label={t('performance.indexPoolThreshold')}
-                        value={indexPoolMin}
-                        onChange={(e) => setIndexPoolMin(Math.max(1, Math.min(5000, parseInt(e.target.value || '1', 10))))}
-                        inputProps={{ min: 1, max: 5000 }}
-                      />
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                        {t('performance.indexPoolThresholdHint')}
-                      </Typography>
-                    </Box>
-                  </Stack>
                 </Stack>
               </Collapse>
             </Paper>
@@ -465,6 +430,52 @@ export default function SettingsPage() {
           )}
         </Grid>
       </Grid>
+
+      {/* ── Performance indexation ──
+          Carte à part, et pas un repli de la carte OCR : l'indexation a son propre pool, qui
+          lit et analyse les XML sans jamais toucher au GPU. Rangé sous « Performance OCR »,
+          le réglage était introuvable. */}
+      {loading ? <Box sx={{ mt: 2 }}><SectionSkeleton lines={3} /></Box> : (
+        <Paper variant="outlined" sx={{ p: 2, mt: 2 }}>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+            <IndexIcon color="action" />
+            <Typography variant="subtitle1" fontWeight={600}>{t('indexing.title')}</Typography>
+          </Stack>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+            {t('indexing.description')}
+          </Typography>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+            <Box sx={{ flex: 1 }}>
+              <TextField
+                type="number"
+                size="small"
+                fullWidth
+                label={t('indexing.workers')}
+                value={indexWorkers}
+                onChange={(e) => setIndexWorkers(Math.max(1, Math.min(cpu, parseInt(e.target.value || '1', 10))))}
+                inputProps={{ min: 1, max: cpu }}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                {t('indexing.workersHint', { recommended: data?.system.recommended_index_workers ?? 1, cpu })}
+              </Typography>
+            </Box>
+            <Box sx={{ flex: 1 }}>
+              <TextField
+                type="number"
+                size="small"
+                fullWidth
+                label={t('indexing.threshold')}
+                value={indexPoolMin}
+                onChange={(e) => setIndexPoolMin(Math.max(1, Math.min(5000, parseInt(e.target.value || '1', 10))))}
+                inputProps={{ min: 1, max: 5000 }}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                {t('indexing.thresholdHint')}
+              </Typography>
+            </Box>
+          </Stack>
+        </Paper>
+      )}
 
       {/* ── Ce poste (identité multi-PC) ── */}
       <Paper variant="outlined" sx={{ p: 2, mt: 2 }}>

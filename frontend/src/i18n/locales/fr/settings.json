@@ -17,12 +17,15 @@
     "threadsPerWorker": "Threads par worker",
     "threadsHint": "À laisser à 1 : trop de threads × workers sature le CPU et ralentit tout.",
     "poolThreshold": "Seuil de parallélisation (pages)",
-    "poolThresholdHint": "En dessous de ce nombre de pages, l'OCR reste séquentiel (le démarrage du pool ne vaut pas le coup).",
-    "indexingTitle": "Indexation",
-    "indexWorkers": "Workers d'indexation",
-    "indexWorkersHint": "Lectures de XML en parallèle pendant la génération d'un index (recommandé : {{recommended}} sur {{cpu}}). N'utilise pas le GPU.",
-    "indexPoolThreshold": "Seuil de parallélisation (XML)",
-    "indexPoolThresholdHint": "En dessous de ce nombre de fichiers, l'indexation reste séquentielle (le démarrage du pool ne vaut pas le coup)."
+    "poolThresholdHint": "En dessous de ce nombre de pages, l'OCR reste séquentiel (le démarrage du pool ne vaut pas le coup)."
+  },
+  "indexing": {
+    "title": "Performance indexation",
+    "description": "La génération d'un index lit et analyse les XML produits par l'OCR. Ce travail est réparti sur plusieurs process ; il n'utilise pas le GPU.",
+    "workers": "Workers d'indexation",
+    "workersHint": "Fichiers XML lus en parallèle (recommandé : {{recommended}} sur {{cpu}}). Au-delà de quelques lectures simultanées, c'est le partage réseau qui limite, pas le processeur.",
+    "threshold": "Seuil de parallélisation (XML)",
+    "thresholdHint": "En dessous de ce nombre de fichiers, l'indexation reste séquentielle (démarrer les process ne vaut pas le coup)."
   },
   "system": {
     "title": "Système",
