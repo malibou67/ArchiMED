@@ -64,7 +64,12 @@ REQUESTED = 'requested'
 REFUSED = 'refused'
 
 # Clés volatiles / lourdes exclues des réponses API.
-_HIDDEN = ('pages', 'page_states', 'index_registres', 'payload', 'cancel', 'last_write', 'heartbeat')
+#
+# `heartbeat` n'y est PAS : c'est la seule date qui dit quand le poste propriétaire a écrit son
+# avancement sur le partage. Le front en a besoin pour dater le dernier relevé d'une tâche
+# distante — sans elle, une tâche qui tourne ailleurs paraît figée entre deux battements.
+# `last_write` reste caché : c'est le `time.time()` brut du throttle, sans sens hors de ce process.
+_HIDDEN = ('pages', 'page_states', 'index_registres', 'payload', 'cancel', 'last_write')
 
 # Clés écrites **à part**, une fois pour toutes, dans `<id>.pages.json`.
 #

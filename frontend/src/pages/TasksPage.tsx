@@ -103,6 +103,17 @@ const isOwned = (t: Task) => t.owned !== false;
 
 const PAGE_SIZE = 50;
 
+// Cadence à laquelle un autre poste écrit son avancement sur le partage
+// (backend : `task_service.SUPERVISOR_INTERVAL`). Notre polling à 2 s n'y change rien : c'est
+// cette période-là qui borne la fraîcheur d'une tâche distante.
+const REMOTE_REPORT_INTERVAL_MS = 5000;
+// Un relevé peut arriver en retard (NAS lent, page OCR longue) sans que rien n'aille mal :
+// on ne s'alarme qu'au-delà de deux périodes et un peu.
+const REMOTE_LATE_MS = 12000;
+// Au-delà, le backend déclare la tâche morte et son verrou récupérable
+// (`task_service.HEARTBEAT_STALE`).
+const REMOTE_STALE_MS = 60000;
+
 const HEADER_CELL = {
   fontWeight: 700,
   fontSize: '0.7rem',
@@ -110,6 +121,45 @@ const HEADER_CELL = {
   color: 'text.secondary',
   textTransform: 'uppercase',
 } as const;
+
+// ── Fraîcheur des données d'une tâche tournant sur un autre poste ──
+//
+// Une tâche distante n'est pas suivie en direct : son poste écrit son avancement sur le partage
+// par battements. Entre deux, la ligne ne bouge pas et on croit qu'il ne se passe rien.
+// L'anneau se remplit sur la période de relevé attendue — c'est lui qui donne le signal « ça
+// tourne » — et le texte donne l'âge **réel** du dernier battement, ce qui dénonce aussi un
+// poste qui s'est tu au lieu d'égrener une seconde mensongère.
+function RemoteHeartbeat({ heartbeat, now }: { heartbeat: string; now: number }) {
+  const { t: tr } = useTranslation('tasks');
+  const parsed = Date.parse(heartbeat);
+  if (Number.isNaN(parsed)) return null;
+  // `max(0, …)` : l'horloge de l'autre poste peut être un peu en avance sur la nôtre.
+  const age = Math.max(0, now - parsed);
+  const stale = age >= REMOTE_STALE_MS;
+  const late = age >= REMOTE_LATE_MS;
+  const next = Math.ceil(Math.max(0, REMOTE_REPORT_INTERVAL_MS - age) / 1000);
+
+  const label = stale ? tr('remote.unreachable', { age: fmtDuration(age) })
+    : late ? tr('remote.silent', { age: fmtDuration(age) })
+      : `${tr('remote.reported', { age: fmtDuration(age) })} · ${next > 0 ? tr('remote.next', { sec: next }) : tr('remote.nextSoon')}`;
+
+  return (
+    <Tooltip title={tr('remote.tooltip')} arrow>
+      <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, mt: 0.25, cursor: 'default' }}>
+        <CircularProgress
+          size={11}
+          thickness={7}
+          variant="determinate"
+          value={Math.min(100, (age / REMOTE_REPORT_INTERVAL_MS) * 100)}
+          color={stale ? 'error' : late ? 'warning' : 'primary'}
+        />
+        <Typography variant="caption" sx={{ fontSize: '0.65rem', color: stale ? 'error.main' : late ? 'warning.main' : 'text.secondary' }}>
+          {label}
+        </Typography>
+      </Box>
+    </Tooltip>
+  );
+}
 
 // ── Environnement détecté au préflight d'une tâche OCR ──
 function PreflightChips({ preflight }: { preflight: TaskPreflight }) {
@@ -513,6 +563,11 @@ export default function TasksPage() {
                     {owned && (
                       <Chip size="small" label={tr('thisMachine')} color="primary" variant="outlined" sx={{ height: 18, fontSize: '0.65rem', mt: 0.25 }} />
                     )}
+                    {/* Seulement `running` : le heartbeat n'est rafraîchi que pour les tâches en
+                        cours du poste propriétaire. Sur une tâche distante en attente ou en pause,
+                        ce poste n'écrit rien — un décompte y monterait sans fin et crierait à la
+                        panne là où il n'y a, par construction, rien à rafraîchir. */}
+                    {!owned && isRunning(t) && t.heartbeat && <RemoteHeartbeat heartbeat={t.heartbeat} now={now} />}
                   </TableCell>
 
                   {/* Statut */}

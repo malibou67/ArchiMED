@@ -48,6 +48,14 @@
   "elapsed": "écoulé {{dur}}",
   "remaining": " · reste ~{{dur}}",
   "duration": "durée {{dur}}",
+  "remote": {
+    "reported": "relevé il y a {{age}}",
+    "next": "prochain dans {{sec}} s",
+    "nextSoon": "prochain imminent",
+    "silent": "poste silencieux depuis {{age}}",
+    "unreachable": "poste injoignable depuis {{age}}",
+    "tooltip": "Les tâches d'un autre poste ne sont pas suivies en direct : ce poste écrit son avancement sur le partage toutes les 5 s environ. La progression avance donc par paliers, même quand tout se passe bien."
+  },
   "retryError": "Impossible de relancer les pages en échec.",
   "actions": {
     "pausing": "Mise en pause…",

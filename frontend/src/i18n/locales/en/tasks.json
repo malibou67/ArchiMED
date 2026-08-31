@@ -48,6 +48,14 @@
   "elapsed": "elapsed {{dur}}",
   "remaining": " · ~{{dur}} left",
   "duration": "duration {{dur}}",
+  "remote": {
+    "reported": "reported {{age}} ago",
+    "next": "next in {{sec}} s",
+    "nextSoon": "next due now",
+    "silent": "machine silent for {{age}}",
+    "unreachable": "machine unreachable for {{age}}",
+    "tooltip": "Tasks from another machine are not tracked live: that machine writes its progress to the share about every 5 s. Progress therefore advances in steps, even when everything is fine."
+  },
   "retryError": "Could not retry the failed pages.",
   "actions": {
     "pausing": "Pausing…",

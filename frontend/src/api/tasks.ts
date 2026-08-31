@@ -72,6 +72,10 @@ export interface Task {
   machine_label?: string;
   operator?: string;
   owned?: boolean;   // true si la tâche a été lancée sur CE poste
+  // Dernier relevé écrit par le poste propriétaire (ISO **naïf**, horloge de CE poste-là).
+  // Rafraîchi toutes les ~5 s tant que la tâche est en cours ; figé sur les autres statuts —
+  // c'est ce qui date les données d'une tâche distante.
+  heartbeat?: string;
 }
 
 // Réponse des endpoints de contrôle (annuler / mettre en pause / reprendre).
