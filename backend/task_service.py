@@ -49,6 +49,10 @@ HEARTBEAT_STALE = 60.0
 # Période de réveil du superviseur (heartbeat + commandes distantes). Très en deçà de
 # HEARTBEAT_STALE pour garder une marge confortable sur un NAS lent.
 SUPERVISOR_INTERVAL = 5.0
+# Le balayage de rattrapage de la file tourne à chaque cycle du superviseur, mais il ne
+# consulte le partage qu'au plus toutes les RECONCILE_DISK_INTERVAL secondes : la passe en
+# mémoire est gratuite, énumérer `data/tasks/` coûte un aller-retour par fichier.
+RECONCILE_DISK_INTERVAL = 30.0
 
 # Commandes acceptées dans la boîte aux lettres inter-postes.
 CONTROL_ACTIONS = ('cancel', 'pause', 'resume')
@@ -71,6 +75,15 @@ _HIDDEN = ('pages', 'page_states', 'index_registres', 'payload', 'cancel', 'last
 # que l'état qui change ; `page_states` (des entiers, deux ordres de grandeur plus léger) y
 # reste car c'est le point de reprise et il doit rester atomique avec les compteurs.
 _SIDECAR = ('pages',)
+
+
+class TaskUnavailable(Exception):
+    """Levée par `enqueue` quand la tâche n'a pas pu être écrite sur le partage.
+
+    Sans elle, l'interface annonçait une tâche créée qui n'existait que dans la mémoire de ce
+    poste : invisible des autres postes, perdue au premier redémarrage, et silencieuse dans le
+    journal (l'échec d'écriture y est étranglé à une entrée par minute). Elle réservait au
+    passage son scope partout, au bénéfice d'une tâche fantôme."""
 
 
 class TaskConflict(Exception):
@@ -117,6 +130,9 @@ class TaskService:
     # les deux secondes, dans le process qui fait tourner l'OCR.
     _file_cache: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
 
+    # Horodatage (monotone) du dernier balayage ayant relu le partage (`_adopt_orphan_queued`).
+    _last_reconcile_disk: float = 0.0
+
     # ── Enregistrement des runners ────────────────────────────────────
     @staticmethod
     def register(task_type: str, runner: Callable[[Dict[str, Any]], None],
@@ -127,10 +143,23 @@ class TaskService:
 
     # ── Persistance ───────────────────────────────────────────────────
     @staticmethod
-    def _dir() -> Path:
-        d = Path(DATA_DIR) / "tasks"
-        d.mkdir(parents=True, exist_ok=True)
+    def _ensure_dir(d: Path) -> Path:
+        """Crée le dossier si possible, sans jamais faire échouer l'appelant.
+
+        Ce `mkdir` est un confort de premier démarrage, rejoué à chaque accès. Sur un partage
+        momentanément injoignable il lève `OSError` — remontée telle quelle, elle traversait le
+        `finally` de `_execute` et laissait la file à l'arrêt jusqu'au redémarrage du poste. Les
+        lectures et écritures qui suivent ont chacune leur garde et leur repli : c'est à elles
+        de constater l'indisponibilité, pas à ce `mkdir`."""
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         return d
+
+    @staticmethod
+    def _dir() -> Path:
+        return TaskService._ensure_dir(Path(DATA_DIR) / "tasks")
 
     @staticmethod
     def _file(task_id: str) -> Path:
@@ -156,7 +185,9 @@ class TaskService:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp, path)
             return True
-        except OSError:
+        except (OSError, TypeError, ValueError):
+            # `TypeError`/`ValueError` : un champ non sérialisable ajouté par un runner. Laisser
+            # remonter l'exception depuis le `finally` de `_execute` bloquerait la lane.
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
@@ -187,8 +218,10 @@ class TaskService:
         return data
 
     @staticmethod
-    def _save(task: Dict[str, Any]) -> None:
+    def _save(task: Dict[str, Any]) -> bool:
         """Persiste la tâche : l'état changeant dans `<id>.json`, les clés `_SIDECAR` à part.
+        Retourne le succès de l'écriture du fichier principal (le sidecar, figé, n'est pas
+        critique) — seul `enqueue` s'en sert, les autres appelants n'ont rien à en faire.
 
         Le sidecar n'est écrit que s'il manque : son contenu est figé à l'enfilage, le réécrire
         à chaque battement ne ferait que recopier les mêmes mégaoctets sur le partage."""
@@ -208,6 +241,8 @@ class TaskService:
                 # une entrée par seconde, d'où l'étranglement.
                 log_throttled(log, logging.WARNING, f"save:{task_id}",
                               "Échec d'écriture du fichier de tâche " + kv(id=task_id))
+                return False
+        return True
 
     @staticmethod
     def _save_throttled(task: Dict[str, Any]) -> None:
@@ -220,24 +255,42 @@ class TaskService:
             TaskService._save(task)
 
     @staticmethod
-    def _load_disk(task_id: str, heavy: bool = True) -> Optional[Dict[str, Any]]:
-        """Relit l'état d'une tâche depuis le disque (peut appartenir à un autre poste).
+    def _probe_disk(task_id: str, heavy: bool = True) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """`(présent, contenu)` — l'état d'une tâche sur le disque (elle peut appartenir à un
+        autre poste), en distinguant le fichier **absent** (tâche réellement supprimée, ici ou
+        depuis un autre poste) du fichier **présent mais illisible** (partage qui hoquette,
+        écriture concurrente, JSON tronqué). Même convention que `services._read_json_probe`.
+
+        `_dispatch` et `_lock_is_stale` ne peuvent pas se contenter d'un `None` : le premier en
+        déduisait une suppression et retirait le candidat de la file — définitivement, puisque
+        rien ne repassait jamais dessus ; le second en déduisait une tâche morte et rendait son
+        verrou volable. Un aller-retour SMB manqué suffisait donc à condamner une tâche en
+        attente, ou à lancer le même OCR sur deux postes.
 
         `heavy=False` laisse les clés lourdes de côté : vérifier un statut ou la vivacité d'un
         verrou n'a que faire de la liste des pages, et la relire tirerait des mégaoctets du
         partage à chaque passage du superviseur. Les tâches d'avant la séparation les portent
         encore en ligne : le sidecar absent laisse alors la valeur du fichier principal intacte."""
         f = TaskService._file(task_id)
-        if not f.exists():
-            return None
         try:
             with open(f, 'r', encoding='utf-8-sig') as fh:
                 task = json.load(fh)
+        except FileNotFoundError:
+            # Windows mappe aussi `ERROR_BAD_NETPATH` sur `ENOENT` : un partage injoignable est
+            # indiscernable d'un fichier effacé, sauf à demander si son dossier, lui, répond.
+            # Un `stat` de plus, sur le seul chemin rare.
+            return (False, None) if TaskService._dir().is_dir() else (True, None)
         except (OSError, json.JSONDecodeError):
-            return None
+            return (True, None)
         if heavy:
             task.update(TaskService._read_sidecar(task_id))
-        return task
+        return (True, task)
+
+    @staticmethod
+    def _load_disk(task_id: str, heavy: bool = True) -> Optional[Dict[str, Any]]:
+        """Relit l'état d'une tâche depuis le disque. `None` si elle est absente **ou**
+        illisible : les appelants qui doivent séparer les deux cas passent par `_probe_disk`."""
+        return TaskService._probe_disk(task_id, heavy)[1]
 
     # ── Appartenance / vivacité (multi-PC) ────────────────────────────
     @staticmethod
@@ -438,9 +491,7 @@ class TaskService:
     # ── Verrous de scope (filet anti-course à l'exécution) ────────────
     @staticmethod
     def _locks_dir() -> Path:
-        d = Path(DATA_DIR) / "locks"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return TaskService._ensure_dir(Path(DATA_DIR) / "locks")
 
     @staticmethod
     def _lock_path(key: str) -> Path:
@@ -474,9 +525,13 @@ class TaskService:
         tid = info.get('task_id')
         if not tid:
             return True
-        disk = TaskService._load_disk(tid, heavy=False)
+        présent, disk = TaskService._probe_disk(tid, heavy=False)
         if disk is None:
-            return True
+            # Fichier illisible ≠ tâche disparue. Déclarer le verrou obsolète sur un simple
+            # hoquet du partage le rendait volable : deux postes lançaient alors le même OCR
+            # dans le même dossier de sortie. Dans le doute le verrou est tenu — au pire il
+            # faudra attendre un `HEARTBEAT_STALE` de plus, une fois le fichier relisible.
+            return not présent
         st = disk.get('status')
         if st in TERMINAL:
             return True
@@ -542,9 +597,7 @@ class TaskService:
     # ── Boîte aux lettres de commandes (contrôle inter-postes) ────────
     @staticmethod
     def _control_dir() -> Path:
-        d = TaskService._dir() / "control"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return TaskService._ensure_dir(TaskService._dir() / "control")
 
     @staticmethod
     def _control_file(task_id: str) -> Path:
@@ -618,7 +671,8 @@ class TaskService:
     # ── Superviseur (heartbeat + commandes distantes) ─────────────────
     @staticmethod
     def _supervisor() -> None:
-        """Boucle de fond : preuve de vie des tâches en cours de CE poste + commandes reçues.
+        """Boucle de fond : preuve de vie des tâches en cours de CE poste, commandes reçues,
+        et rattrapage de la file (`_reconcile_queues`).
 
         Le heartbeat ne peut pas dépendre de `_save_throttled` : celui-ci n'est appelé qu'entre
         deux pages OCR (parfois > 60 s sur CPU) et jamais pendant le préflight (import torch,
@@ -637,11 +691,97 @@ class TaskService:
                 if running:
                     TaskService._invalidate_merged()
                 TaskService._drain_control()
+                TaskService._reconcile_queues()
             except Exception:
                 # Un superviseur ne doit jamais mourir — mais il ne doit pas non plus remplir
                 # le journal à raison d'une entrée toutes les 5 s si la panne est durable.
                 log_throttled(log, logging.ERROR, 'supervisor',
                               "Échec du cycle superviseur", exc_info=True)
+
+    @staticmethod
+    def _reconcile_queues() -> None:
+        """Rattrapage périodique des files d'attente. **Seul mécanisme non événementiel.**
+
+        `_dispatch` n'est appelée que par quatre événements : création, fin d'exécution, reprise,
+        démarrage du poste. Si l'un d'eux passe à travers — fichier momentanément illisible sur
+        le partage, écriture perdue, exception inattendue — plus personne ne démarre la tâche en
+        attente : elle reste « en attente de démarrage » indéfiniment et garde son scope réservé
+        pour tous les postes, jusqu'au redémarrage du backend. Ce balayage est le filet.
+
+        Coût : une passe en mémoire à chaque cycle. Le partage n'est consulté que si une lane est
+        libre alors que sa file est vide — c'est-à-dire seulement quand notre vue en mémoire
+        n'explique plus rien — et au plus toutes les `RECONCILE_DISK_INTERVAL` secondes."""
+        à_lancer: List[str] = []
+        mémoire_muette = False
+        with TaskService._lock:
+            # Les runners enregistrés font foi sur les types qui existent : `_tasks` et `_queue`
+            # sont justement ce dont on se méfie ici, et un poste dont la mémoire a été vidée
+            # n'aurait plus aucun type à balayer — donc aucune chance de réadopter ses orphelines.
+            types = set(TaskService._runners)
+            types.update(t.get('type') for t in TaskService._tasks.values() if t.get('type'))
+            types.update(TaskService._queue)
+            types.update(TaskService._active)
+            for ttype in types:
+                if TaskService._active.get(ttype) is not None:
+                    continue
+                # File reconstruite depuis la source qui fait foi : nos tâches `queued`. L'ordre
+                # déjà en place est conservé (FIFO), les manquantes sont ajoutées par ancienneté
+                # — même règle qu'au démarrage (`load_on_startup`).
+                attendues = {tid for tid, t in TaskService._tasks.items()
+                             if t.get('type') == ttype and t.get('status') == 'queued'
+                             and TaskService._is_owned(t)}
+                avant = TaskService._queue.get(ttype) or []
+                ids = [tid for tid in avant if tid in attendues]
+                ids += sorted(attendues.difference(ids),
+                              key=lambda tid: TaskService._tasks[tid].get('created_at') or '')
+                if ids != avant:
+                    TaskService._queue[ttype] = ids
+                    log.warning("File d'attente reconstruite " + kv(
+                        type=ttype, avant=len(avant), après=len(ids)))
+                if ids:
+                    à_lancer.append(ttype)
+                else:
+                    mémoire_muette = True
+        if mémoire_muette:
+            # Hors du verrou : lit le partage.
+            à_lancer.extend(TaskService._adopt_orphan_queued())
+        for ttype in dict.fromkeys(à_lancer):
+            TaskService._dispatch(ttype)
+
+    @staticmethod
+    def _adopt_orphan_queued() -> List[str]:
+        """Réintègre les tâches `queued` de CE poste présentes sur le partage mais absentes de
+        notre mémoire (état perdu par un incident, ou par une version antérieure du moteur).
+        Retourne les types à relancer.
+
+        On ne touche **jamais** aux tâches d'un autre poste : sa file n'est démarrée que par lui.
+        Une tâche réadoptée repasse par `_claim_locks` comme n'importe quelle autre — si son
+        scope a été pris entre-temps, elle échouera proprement au lieu de doubler une sortie."""
+        maintenant = time.monotonic()
+        if maintenant - TaskService._last_reconcile_disk < RECONCILE_DISK_INTERVAL:
+            return []
+        TaskService._last_reconcile_disk = maintenant
+        types: List[str] = []
+        # `_merged_tasks` a son cache d'une seconde, et `_read_task_file` ne réanalyse que les
+        # fichiers dont la taille ou la date a bougé : rien de neuf n'est relu ici.
+        merged = TaskService._merged_tasks()
+        with TaskService._lock:
+            for tid, vue in merged.items():
+                if vue.get('status') != 'queued' or not TaskService._is_owned(vue):
+                    continue
+                ttype = vue.get('type')
+                if not ttype or tid in TaskService._tasks:
+                    continue
+                task = TaskService._load_disk(tid)   # avec ses pages : c'est le point de reprise
+                if task is None or task.get('status') != 'queued':
+                    continue
+                task.setdefault('cancel', False)
+                TaskService._tasks[tid] = task
+                TaskService._queue.setdefault(ttype, []).append(tid)
+                types.append(ttype)
+                log.warning("Tâche en attente réadoptée depuis le partage " + kv(
+                    type=ttype, id=tid, label=task.get('label')))
+        return types
 
     @staticmethod
     def _start_supervisor() -> None:
@@ -655,7 +795,9 @@ class TaskService:
     @staticmethod
     def enqueue(task_type: str, label: str, fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Crée une tâche `queued` et démarre la lane de ce type si elle est libre.
-        Lève `TaskConflict` si le scope demandé est déjà occupé par un autre poste."""
+
+        Lève `TaskConflict` si le scope demandé est déjà occupé par un autre poste, et
+        `TaskUnavailable` si le partage n'a pas accepté l'écriture de la tâche."""
         TaskService._ensure_loaded()
         fields = fields or {}
         conflict = TaskService.find_conflict(task_type, fields)
@@ -688,8 +830,18 @@ class TaskService:
         with TaskService._lock:
             TaskService._tasks[task_id] = task
             TaskService._queue.setdefault(task_type, []).append(task_id)
-            TaskService._save(task)
+            enregistrée = TaskService._save(task)
             TaskService._invalidate_merged()
+            if not enregistrée:
+                # Une tâche que le partage n'a pas acceptée n'existe pour personne d'autre : la
+                # garder en file ferait réserver son scope sur tous les postes au bénéfice d'un
+                # fantôme, et l'interface annoncerait une création qui n'a pas eu lieu.
+                TaskService._tasks.pop(task_id, None)
+                TaskService._queue[task_type].remove(task_id)
+                log.error("Création abandonnée : écriture impossible " + kv(
+                    type=task_type, id=task_id, label=label))
+                raise TaskUnavailable(
+                    "Le dossier partagé est injoignable : la tâche n'a pas pu être enregistrée.")
             TaskService._prune_history()
         log.info("Tâche créée " + kv(type=task_type, id=task_id, label=label))
         TaskService._dispatch(task_type)
@@ -697,9 +849,26 @@ class TaskService:
 
     @staticmethod
     def _dispatch(task_type: str) -> None:
-        """Démarre la prochaine tâche en attente de ce type si la lane est libre. Relit le
-        disque avant de lancer : une tâche annulée/supprimée à distance (autre poste) est
-        ignorée."""
+        """Démarre la prochaine tâche en attente de ce type si la lane est libre.
+
+        **Ne lève jamais** : elle est appelée depuis le `finally` de `_execute`, où la moindre
+        exception (partage injoignable, JSON récalcitrant) laissait la file à l'arrêt jusqu'au
+        redémarrage du poste. Le balayage du superviseur réessaiera au cycle suivant."""
+        try:
+            TaskService._dispatch_next(task_type)
+        except Exception:
+            log_throttled(log, logging.ERROR, f'dispatch:{task_type}',
+                          "Échec du démarrage de la file " + kv(type=task_type), exc_info=True)
+
+    @staticmethod
+    def _dispatch_next(task_type: str) -> None:
+        """Relit le disque avant de lancer : une tâche annulée ou supprimée depuis un autre
+        poste est écartée. Mais un candidat n'est **jamais** évincé sur un simple échec de
+        lecture : on ne sait alors rien de son sort, et l'évincer le condamnait pour de bon —
+        son fichier restait `queued` sur le partage, l'interface affichait « en attente » sans
+        fin, et le scope demeurait réservé sur tous les postes. On laisse donc le candidat en
+        tête de file et on rend la main : `_reconcile_queues` réessaiera dans les secondes qui
+        suivent."""
         with TaskService._lock:
             if TaskService._active.get(task_type) is not None:
                 return
@@ -711,14 +880,23 @@ class TaskService:
                 if not t or t['status'] != 'queued':
                     q.pop(0)
                     continue
-                disk = TaskService._load_disk(cand, heavy=False)
+                présent, disk = TaskService._probe_disk(cand, heavy=False)
+                if disk is None and présent:
+                    log_throttled(log, logging.WARNING, f'illisible:{cand}',
+                                  "Fichier de tâche illisible, démarrage reporté " + kv(
+                                      type=task_type, id=cand, label=t.get('label')))
+                    return
                 if disk is None:
                     q.pop(0)
-                    TaskService._tasks.pop(cand, None)   # supprimée à distance
+                    TaskService._tasks.pop(cand, None)
+                    log.info("Tâche supprimée à distance, retirée de la file " + kv(
+                        type=task_type, id=cand, label=t.get('label')))
                     continue
                 if disk.get('status') != 'queued':
                     q.pop(0)
-                    t['status'] = disk.get('status')     # annulée à distance
+                    t['status'] = disk.get('status')     # annulée / reprise à distance
+                    log.info("Tâche non démarrée, statut changé à distance " + kv(
+                        type=task_type, id=cand, statut=disk.get('status')))
                     continue
                 tid = q.pop(0)
                 break
@@ -728,12 +906,21 @@ class TaskService:
             TaskService._active[task_type] = tid
             t['status'] = 'running'
             t['started_at'] = datetime.now().isoformat()
-            t['heartbeat'] = datetime.now().isoformat()
+            t['heartbeat'] = t['started_at']
             TaskService._save(t)
             TaskService._invalidate_merged()
-
-        log.info("Démarrage " + kv(type=task_type, id=tid, label=t.get('label')))
-        threading.Thread(target=TaskService._execute, args=(tid,), daemon=True).start()
+            log.info("Démarrage " + kv(type=task_type, id=tid, label=t.get('label')))
+            # Démarrage sous le verrou : le bloc y fait déjà les E/S du `_save`, et sortir du
+            # verrou rouvrait une fenêtre où la lane est prise sans que personne ne l'exécute.
+            try:
+                threading.Thread(target=TaskService._execute, args=(tid,), daemon=True).start()
+            except Exception:
+                TaskService._active[task_type] = None
+                t['status'] = 'queued'
+                t['started_at'] = None
+                q.insert(0, tid)
+                TaskService._save(t)
+                raise
 
     @staticmethod
     def _elapsed(task: Dict[str, Any]) -> Optional[str]:
@@ -756,9 +943,32 @@ class TaskService:
         return f"{seconds}s"
 
     @staticmethod
+    def _release_lane(task_type: str, task_id: str) -> None:
+        """Rend la lane et enchaîne sur la tâche suivante. Ne libère que si elle nous appartient
+        encore : le balayage du superviseur a pu la dégripper et démarrer autre chose."""
+        with TaskService._lock:
+            if TaskService._active.get(task_type) == task_id:
+                TaskService._active[task_type] = None
+            TaskService._invalidate_merged()
+        TaskService._dispatch(task_type)
+
+    @staticmethod
     def _execute(task_id: str) -> None:
-        task = TaskService._tasks[task_id]
-        ttype = task['type']
+        """Exécute la tâche puis libère la lane — **quoi qu'il arrive**.
+
+        La lecture de la tâche était hors du `try` : un `KeyError` y laissait `_active` occupé
+        pour de bon, et toutes les tâches suivantes de ce type restaient « en attente de
+        démarrage » indéfiniment, scope réservé compris. Tout ce qui suit la prise de la lane
+        est donc gardé."""
+        with TaskService._lock:
+            task = TaskService._tasks.get(task_id)
+            ttype = (task or {}).get('type') or next(
+                (k for k, v in TaskService._active.items() if v == task_id), None)
+        if task is None:
+            log.error("Tâche introuvable au démarrage, lane libérée " + kv(id=task_id, type=ttype))
+            if ttype:
+                TaskService._release_lane(ttype, task_id)
+            return
         try:
             # Filet anti-course : si un autre poste a démarré le même scope entre la création
             # et ici, on échoue proprement au lieu de corrompre la sortie partagée.
@@ -775,20 +985,24 @@ class TaskService:
             task['status'] = 'error'
             task['error'] = str(e)
         finally:
-            TaskService._release_locks(task)
-            task['pause'] = False
-            summary = kv(type=ttype, id=task_id, statut=task['status'],
-                         durée=TaskService._elapsed(task), traitées=task.get('processed'),
-                         échecs=task.get('failed'), err=task.get('error'))
-            log.log(logging.ERROR if task['status'] == 'error' else logging.INFO, "Fin " + summary)
-            if task['status'] in TERMINAL:
-                task['finished_at'] = datetime.now().isoformat()
-            task['current'] = None
-            TaskService._save(task)
-            with TaskService._lock:
-                TaskService._active[ttype] = None
-                TaskService._invalidate_merged()
-            TaskService._dispatch(ttype)
+            try:
+                TaskService._release_locks(task)
+                task['pause'] = False
+                summary = kv(type=ttype, id=task_id, statut=task['status'],
+                             durée=TaskService._elapsed(task), traitées=task.get('processed'),
+                             échecs=task.get('failed'), err=task.get('error'))
+                log.log(logging.ERROR if task['status'] == 'error' else logging.INFO,
+                        "Fin " + summary)
+                if task['status'] in TERMINAL:
+                    task['finished_at'] = datetime.now().isoformat()
+                task['current'] = None
+                TaskService._save(task)
+            except Exception:
+                log.error("Échec de la finalisation " + kv(type=ttype, id=task_id), exc_info=True)
+            finally:
+                # Hors du `try` ci-dessus : une lane jamais rendue bloque toutes les tâches
+                # suivantes de ce type, ce qui est bien pire qu'une finalisation ratée.
+                TaskService._release_lane(ttype, task_id)
 
     @staticmethod
     def _logged(action: str, task_id: str, result: str) -> str:

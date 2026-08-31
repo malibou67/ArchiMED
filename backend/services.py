@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Any
@@ -94,8 +95,13 @@ def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 
     Ces fichiers sont relus en boucle par les autres postes du NAS : une écriture en place
     les expose à lire un contenu tronqué, ce que `_read_json_retry` ne peut pas rattraper
-    puisque le fichier reste tronqué."""
-    tmp = path.with_name(path.name + '.tmp')
+    puisque le fichier reste tronqué.
+
+    Le temporaire est nommé par process et par thread (même motif que
+    `TaskService._write_atomic`) : avec un nom fixe, deux postes publiant l'`ocr_status` de
+    registres **différents** d'une même collection — cas parfaitement autorisé — écrivaient
+    dans le même `.tmp`, d'où un `os.replace` d'un fichier à moitié écrit par l'autre."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -543,7 +549,7 @@ class CollectionsService:
         else:
             entry.pop('ocr_status', None)
 
-        tmp = metadata_file.with_name(metadata_file.name + '.tmp')
+        tmp = metadata_file.with_name(f"{metadata_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -1537,7 +1543,7 @@ class IndexesService:
         exposerait un fichier tronqué. Le motif tmp + `os.replace` garantit qu'un lecteur voit
         toujours l'ancien OU le nouveau fichier complet (cf. `_save_checkpoint`)."""
         metadata_file = IndexesService.get_indexes_dir() / index_id / "metadata.json"
-        tmp = metadata_file.with_name(metadata_file.name + '.tmp')
+        tmp = metadata_file.with_name(f"{metadata_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -1891,7 +1897,7 @@ class IndexesService:
         def _save_checkpoint() -> None:
             # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
             # laisser un checkpoint tronqué (la reprise après interruption s'y appuie).
-            tmp = checkpoint_file.with_name(checkpoint_file.name + '.tmp')
+            tmp = checkpoint_file.with_name(f"{checkpoint_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             try:
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,

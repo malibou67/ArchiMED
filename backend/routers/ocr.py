@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 from ocr_service import OcrService, NoPagesToProcess
-from task_service import TaskConflict
+from task_service import TaskConflict, TaskUnavailable
 
 router = APIRouter()
 
@@ -44,6 +44,8 @@ def run_ocr(request: OcrRunRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except TaskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/done")

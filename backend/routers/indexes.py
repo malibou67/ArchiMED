@@ -8,7 +8,7 @@ from models import (
 from services import IndexesService
 from stats_service import IndexStatsService
 from index_runner import enqueue_index
-from task_service import TaskConflict
+from task_service import TaskConflict, TaskUnavailable
 
 router = APIRouter()
 
@@ -32,6 +32,8 @@ def generate_index(data: IndexCreate):
         return enqueue_index({"name": data.name, "sources": [s.model_dump() for s in data.sources]})
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except TaskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -60,6 +62,8 @@ def regenerate_index(
         return enqueue_index(index_id=index_id, full=full)
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except TaskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -336,6 +340,8 @@ def update_index(index_id: str, data: IndexUpdate):
             enqueue_index(index_id=index_id, full=True)
         except TaskConflict as e:
             raise HTTPException(status_code=409, detail=str(e))
+        except TaskUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     return IndexesService.get_index(index_id)

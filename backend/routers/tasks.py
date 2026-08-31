@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from task_service import TaskService, TaskConflict, REQUESTED, APPLIED
+from task_service import TaskService, TaskConflict, TaskUnavailable, REQUESTED, APPLIED
 from ocr_service import OcrService, NoPagesToProcess
 from services import IndexesService
 
@@ -81,6 +81,8 @@ def retry_failed_pages(task_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except TaskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     return {
         "task": new_task,
         "source_task_id": task_id,
