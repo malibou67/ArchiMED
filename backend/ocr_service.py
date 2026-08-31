@@ -4,7 +4,6 @@ L'OCR est un **type de tâche** géré par le moteur générique `TaskService` (
 reprise). Ce module fournit le runner `run_ocr_task` (pipeline multiprocessing) + le détail
 par page (`pages_slice`/`_page_status`), et délègue la file/le cycle de vie à TaskService.
 """
-import atexit
 import ctypes
 import os
 import threading
@@ -14,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional, Tuple
 
+import pool_registry
 from app_logging import get_logger, kv
 from services import DATA_DIR, ModelsService, CollectionsService, RegistresService
 from settings_service import SettingsService
@@ -165,38 +165,11 @@ def effective_pool_min_pages() -> int:
 
 
 # ── Arrêt des pools ───────────────────────────────────────────────────────────────
-# `ProcessPoolExecutor.shutdown()` ne sait pas interrompre une page déjà commencée : il
-# laisse chaque worker finir la sienne (plusieurs minutes quand le GPU est chargé), et un
-# `os._exit()` — ce que fait « Quitter » dans la barre système — les rend carrément
-# orphelins : ils continuent à occuper GPU et RAM longtemps après. On garde donc la main sur
-# les pools vivants pour pouvoir les tuer à l'annulation, à la pause et à la fermeture.
-_ACTIVE_POOLS: set = set()
-_POOLS_LOCK = threading.Lock()
-
-
-def _kill_pool(executor) -> int:
-    """Tue les process d'un pool et retourne le nombre tué. Les pages en cours sont
-    abandonnées : leur état reste 0 (à faire), la reprise les refera — et l'écriture des
-    PAGE-XML étant atomique, aucun fichier tronqué ne peut passer pour une page faite."""
-    killed = 0
-    for proc in list(getattr(executor, '_processes', {}).values()):
-        try:
-            if proc.is_alive():
-                proc.kill()
-                killed += 1
-        except Exception:
-            pass
-    return killed
-
-
-def kill_active_pools() -> int:
-    """Tue tous les pools OCR encore vivants de ce process (fermeture de l'application)."""
-    with _POOLS_LOCK:
-        pools = list(_ACTIVE_POOLS)
-    return sum(_kill_pool(ex) for ex in pools)
-
-
-atexit.register(kill_active_pools)
+# Le registre vit dans `pool_registry` : l'indexation y inscrit aussi ses pools, et elle ne
+# peut pas importer ce module-ci (cycle via settings_service → services). Réexportés sous
+# leurs anciens noms pour les appelants d'ici.
+_kill_pool = pool_registry.kill_pool
+kill_active_pools = pool_registry.kill_active_pools
 
 
 # ── Écriture des PAGE-XML ─────────────────────────────────────────────────────────
@@ -850,8 +823,7 @@ class OcrService:
             initializer=_ocr_worker_init,
             initargs=(seg_model_id, ocr_model_id, device, threads, bool(mixed)),
         )
-        with _POOLS_LOCK:
-            _ACTIVE_POOLS.add(executor)
+        pool_registry.add(executor)
         # Soumission par fenêtre glissante plutôt qu'en bloc : `wait()` est O(n) sur les futures
         # en vol (il les trie et prend le verrou de chacune) et on l'appelle chaque seconde —
         # avec 50 000 pages soumises d'emblée, c'est du CPU brûlé à ne rien faire, et 50 000
@@ -906,8 +878,7 @@ class OcrService:
                 killed = _kill_pool(executor)
                 if killed:
                     log.info("Arrêt demandé " + kv(workers_interrompus=killed))
-            with _POOLS_LOCK:
-                _ACTIVE_POOLS.discard(executor)
+            pool_registry.discard(executor)
             try:
                 # Lot terminé normalement : on **attend** la sortie des workers, sinon le pool
                 # du lot suivant démarrerait pendant que l'ancien tient encore sa VRAM — deux

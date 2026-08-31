@@ -5,6 +5,8 @@ export interface SettingsEffective {
   ocr_threads_per_worker: number;
   ocr_mixed_precision: boolean;
   ocr_pool_min_pages: number;
+  index_workers: number;
+  index_pool_min_pages: number;
 }
 
 export interface SettingsStored {
@@ -12,6 +14,8 @@ export interface SettingsStored {
   ocr_threads_per_worker?: number;
   ocr_mixed_precision?: boolean;
   ocr_pool_min_pages?: number;
+  index_workers?: number;
+  index_pool_min_pages?: number;
 }
 
 export interface SettingsSystem {
@@ -21,6 +25,8 @@ export interface SettingsSystem {
   gpu_max_workers: number | null;
   gpu_vram_gb: number | null;
   recommended_workers: number;
+  // L'indexation n'utilise pas le GPU : seuls les cœurs (et le NAS) la bornent.
+  recommended_index_workers: number;
   ram_total_gb: number | null;
   disk_free_gb: number | null;
 }
@@ -36,6 +42,8 @@ export interface SettingsUpdate {
   ocr_threads_per_worker?: number | null;
   ocr_mixed_precision?: boolean | null;
   ocr_pool_min_pages?: number | null;
+  index_workers?: number | null;
+  index_pool_min_pages?: number | null;
 }
 
 export const settingsApi = {

@@ -175,13 +175,14 @@ if __name__ == "__main__":
     def _on_quit(icon, item):
         log.info("Arrêt demandé depuis la zone de notification")
         icon.stop()
-        # os._exit saute les handlers atexit : sans ce nettoyage, les workers d'un OCR en
-        # cours survivent à la fermeture et continuent d'occuper le GPU.
+        # os._exit saute les handlers atexit : sans ce nettoyage, les workers d'un OCR ou
+        # d'une indexation en cours survivent à la fermeture et continuent d'occuper le GPU
+        # et le CPU.
         try:
-            import ocr_service
-            ocr_service.kill_active_pools()
+            import pool_registry
+            pool_registry.kill_active_pools()
         except Exception as e:
-            log.error(f"Échec de l'arrêt des workers OCR : {e}")
+            log.error(f"Échec de l'arrêt des workers : {e}")
         logging.shutdown()
         os._exit(0)
 

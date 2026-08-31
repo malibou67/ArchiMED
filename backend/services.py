@@ -12,6 +12,8 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 from rapidfuzz import fuzz as _fuzz
 
+import index_worker
+import pool_registry
 import scan_snapshot
 
 # `logging` de la stdlib, pas `app_logging` : celui-ci importe DATA_DIR d'ici, l'inverse
@@ -1309,6 +1311,59 @@ class RegistresService:
         current_meta['collection_id'] = collection_id
         return current_meta
 
+# ── Réglages du pool d'indexation : UI (settings.json) > variable d'env > défaut ──────
+# Même hiérarchie que les réglages OCR (cf. `ocr_service.effective_workers`). `SettingsService`
+# est importé à l'appel : il importe DATA_DIR d'ici, l'inverse en tête de module créerait un
+# cycle.
+
+# Sous ce nombre de pages, l'indexation reste séquentielle. 200 et non 3 (valeur OCR) : ici
+# une page coûte des millisecondes, pas des secondes — engendrer des process Windows ne se
+# rentabilise qu'à partir de quelques centaines de fichiers.
+INDEX_POOL_MIN_PAGES = 200
+
+
+def adaptive_default_index_workers(cores: int) -> int:
+    """Laisse un cœur libre (la machine doit rester utilisable), plafonné à 8.
+
+    Le plafond n'est pas celui du CPU mais celui du NAS : au-delà de quelques lectures SMB
+    concurrentes, c'est le partage qui sature et les workers supplémentaires n'attendent
+    plus qu'ensemble."""
+    return max(2, min(8, cores - 1))
+
+
+def effective_index_workers() -> int:
+    from settings_service import SettingsService
+    cores = os.cpu_count() or 1
+    stored = SettingsService.get().get('index_workers')
+    if stored is not None:
+        try:
+            return max(1, min(int(stored), cores))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv('ARCHIMED_INDEX_WORKERS')
+    if raw and raw.strip():
+        try:
+            return max(1, min(int(raw), cores))
+        except (TypeError, ValueError):
+            pass
+    return min(adaptive_default_index_workers(cores), cores)
+
+
+def effective_index_pool_min_pages() -> int:
+    from settings_service import SettingsService
+    stored = SettingsService.get().get('index_pool_min_pages')
+    if stored is not None:
+        try:
+            return max(1, min(int(stored), 5000))
+        except (TypeError, ValueError):
+            pass
+    try:
+        raw = int(os.getenv('ARCHIMED_INDEX_POOL_MIN_PAGES', str(INDEX_POOL_MIN_PAGES)))
+    except (TypeError, ValueError):
+        raw = INDEX_POOL_MIN_PAGES
+    return max(1, min(raw, 5000))
+
+
 class IndexesService:
     @staticmethod
     def get_indexes_dir():
@@ -2083,7 +2138,164 @@ class IndexesService:
             last_checkpoint_at = time.monotonic()
             last_checkpoint_done = len(done_registres)
             failed_pages = 0   # XML illisibles : comptés ici, journalisés en fin de run
-            for src, reg_dir, xml_files, reg_key, reg_state in registre_tasks:
+
+            # Reste à faire, mis à plat en jobs de page pour le pool. Chaque job porte son
+            # propre indice : le pool rend les pages dans le désordre, et c'est cet indice qui
+            # les remet à leur place dans leur registre.
+            todo = [(i, t) for i, t in enumerate(registre_tasks) if t[3] not in done_registres]
+            jobs: List[tuple] = []            # (indice du job, chemin, nom de page namespacé)
+            job_reg: List[int] = []           # indice du job → indice du registre
+            reg_start: Dict[int, int] = {}    # indice du registre → indice de son premier job
+            for ri, (src, _rd, xml_files, _rk, _st) in todo:
+                prefix = f"{src['key']}{SEP}"
+                reg_start[ri] = len(jobs)
+                for x in xml_files:
+                    jobs.append((len(jobs), str(x), f"{prefix}{x.stem}"))
+                    job_reg.append(ri)
+
+            workers = effective_index_workers()
+            # En dessous du seuil, engendrer des process coûte plus cher que le travail lui-même.
+            use_pool = workers > 1 and len(jobs) >= effective_index_pool_min_pages()
+
+            if use_pool:
+                # Lecture et analyse des XML dans un pool de process. Un pool de threads ne
+                # masquerait que la latence SMB : `ET.parse` et le nettoyage des mots sont du
+                # Python qui tient le GIL, et c'est l'autre moitié du coût.
+                from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+                executor = None
+                try:
+                    executor = ProcessPoolExecutor(max_workers=workers)
+                except Exception as e:
+                    # Une indexation ne doit jamais échouer parce que le pool n'a pas démarré.
+                    log.warning("Pool d'indexation indisponible, repli séquentiel : %s", e)
+                    use_pool = False
+
+            if use_pool:
+                pool_registry.add(executor)
+                log.info("Indexation parallèle : workers=%d pages=%d", workers, len(jobs))
+                # Les pages rendues attendent ici, et ne sont fusionnées que registre complet,
+                # **dans l'ordre du disque** : celui des fichiers à l'intérieur d'un registre
+                # (les emplacements de `slots`), et celui des registres entre eux (`order` /
+                # `frontier`). `mots_uniques` reçoit donc ses occurrences exactement dans
+                # l'ordre du chemin séquentiel — un index parallèle est identique à un index
+                # séquentiel, à l'octet près.
+                # Ce qui est retenu reste borné : la soumission par fenêtre glissante suit
+                # l'ordre des jobs, donc le pool ne peut pas prendre plus d'une fenêtre
+                # d'avance sur le registre en tête de file.
+                slots: Dict[int, List] = {ri: [None] * len(registre_tasks[ri][2]) for ri, _t in todo}
+                remaining = {ri: len(registre_tasks[ri][2]) for ri, _t in todo}
+                order = [ri for ri, _t in todo]
+                frontier = 0
+                # Calculés une fois : la ligne annonce le registre de la dernière page rentrée,
+                # sans attendre qu'un registre entier soit bouclé (le premier peut durer).
+                reg_labels = {ri: IndexesService._source_label(t[1].name, t[0]) for ri, t in todo}
+                submitted = iter(jobs)
+                # Soumission par fenêtre glissante plutôt qu'en bloc : `wait()` est O(n) sur les
+                # futures en vol et on l'appelle chaque seconde. Quelques pages d'avance par
+                # worker suffisent à ce qu'aucun ne se retrouve à sec.
+                window = max(16, workers * 4)
+                stopping = False      # pool à tuer plutôt qu'à attendre
+                broken = False        # pool cassé en cours de route → repli séquentiel
+                draining = False      # pause demandée : on ne réalimente plus la fenêtre
+                label = None
+                last_page = None
+
+                def _fill(in_flight: set) -> None:
+                    """Complète la fenêtre. `wait` rebinde l'ensemble à chaque tour, d'où le paramètre."""
+                    while len(in_flight) < window:
+                        try:
+                            in_flight.add(executor.submit(index_worker.extract_page, next(submitted)))
+                        except StopIteration:
+                            return
+
+                try:
+                    pending: set = set()
+                    _fill(pending)
+                    # Attente par tranches d'une seconde plutôt que `as_completed` : l'annulation
+                    # est vue en une seconde au lieu d'attendre le retour d'une page. C'est aussi
+                    # bien plus fin que les 200 fichiers du chemin séquentiel.
+                    while pending:
+                        if _cancelled():
+                            stopping = True
+                            IndexesService._discard_staging(staging_file)
+                            return 'cancelled'
+                        # La pause reste aux bornes de registre : le checkpoint ne sait pas
+                        # décrire un registre à moitié traité, et la reprise le réindexerait en
+                        # double. On laisse donc rentrer ce qui est en vol, sans réalimenter.
+                        if not draining and _paused():
+                            draining = True
+                        done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                        completed = False   # un registre vient d'être bouclé → publication forcée
+                        for fut in done:
+                            idx, page_name, pairs, ok = fut.result()
+                            ri = job_reg[idx]
+                            slots[ri][idx - reg_start[ri]] = (page_name, pairs, ok)
+                            remaining[ri] -= 1
+                            processed += 1
+                            label = reg_labels[ri]
+                            last_page = page_name
+                        # Fusion des registres devenus complets, en tête de file d'abord : un
+                        # registre terminé avant son prédécesseur attend son tour, sinon ses
+                        # occurrences passeraient devant dans `mots_uniques`.
+                        while frontier < len(order) and remaining[order[frontier]] == 0:
+                            ri = order[frontier]
+                            frontier += 1
+                            _s, _rd, _xf, reg_key, reg_state = registre_tasks[ri]
+                            for pn, prs, page_ok in slots.pop(ri):
+                                if not page_ok:
+                                    failed_pages += 1
+                                for mot, coords in prs:
+                                    total_words += 1
+                                    mots_uniques.setdefault(mot, []).append(f"{pn} - {coords}")
+                            done_registres.add(reg_key)
+                            done_state[reg_key] = reg_state
+                            completed = True
+                            # Le checkpoint n'est écrit qu'entre registres complets : il ne
+                            # reflète jamais un registre à moitié traité (cohérent avec le saut
+                            # via done_registres à la reprise).
+                            now = time.monotonic()
+                            if (now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S
+                                    and len(done_registres) > last_checkpoint_done):
+                                _save_checkpoint()
+                                last_checkpoint_at = now
+                                last_checkpoint_done = len(done_registres)
+                        if done:
+                            if not draining:
+                                _fill(pending)
+                            if not _publish(processed, total_xml, label, last_page, force=completed):
+                                stopping = True
+                                IndexesService._discard_staging(staging_file)
+                                return 'cancelled'
+                    if draining:
+                        _save_checkpoint()
+                        return 'paused'
+                except Exception as e:
+                    # Pool cassé en cours de route (worker tué, mémoire, PyInstaller) : les
+                    # registres déjà fusionnés sont acquis, le reste se refait en séquentiel.
+                    log.warning("Pool d'indexation interrompu, repli séquentiel : %s", e)
+                    stopping = True
+                    broken = True
+                finally:
+                    if stopping:
+                        # `shutdown` laisse les workers finir la page commencée ; sur un arrêt
+                        # demandé on tue, sinon « Annuler » attend encore le partage réseau.
+                        pool_registry.kill_pool(executor)
+                    pool_registry.discard(executor)
+                    try:
+                        executor.shutdown(wait=not stopping, cancel_futures=True)
+                    except Exception:
+                        pass
+                if broken:
+                    # Les pages des registres non fusionnés n'ont rien laissé dans l'index :
+                    # la progression se recalcule depuis les seuls registres acquis.
+                    use_pool = False
+                    processed = sum(len(xf) for _s, _rd, xf, rk, _st in registre_tasks
+                                    if rk in done_registres)
+
+            # Chemin séquentiel : petits lots (sous le seuil), et repli quand le pool n'a pas
+            # pu servir. Les registres déjà acquis par le pool sont sautés comme à une reprise.
+            sequential = () if use_pool else registre_tasks
+            for src, reg_dir, xml_files, reg_key, reg_state in sequential:
                 if reg_key in done_registres:
                     continue
                 if _cancelled():
@@ -2243,21 +2455,11 @@ class IndexesService:
         except OSError:
             pass
 
-    @staticmethod
-    def _extraire_rectangle(coords: str) -> str:
-        points = [tuple(map(int, c.split(','))) for c in coords.split()]
-        x_min = min(p[0] for p in points)
-        x_max = max(p[0] for p in points)
-        y_min = min(p[1] for p in points)
-        y_max = max(p[1] for p in points)
-        return f"({x_min}, {y_min}), ({x_max}, {y_max})"
-
-    @staticmethod
-    def _nettoyer_texte(texte: str) -> List[str]:
-        for char in ['&quot', '?', '¬', ':', '(', ')', ',', '.', '_', ';', '█', '/', '+', '*', '--']:
-            texte = texte.replace(char, ' ')
-        texte = texte.replace('  ', ' ').replace("&#x27", "'").lower()
-        return [mot.strip('-') for mot in texte.split() if mot.isalpha()]
+    # Les deux helpers d'extraction vivent dans `index_worker` : les process du pool les
+    # exécutent, et ce module-ci est trop lourd à réimporter dans chaque worker. Gardés ici
+    # en délégation, seule forme sous laquelle le reste du code les connaît.
+    _extraire_rectangle = staticmethod(index_worker.extraire_rectangle)
+    _nettoyer_texte = staticmethod(index_worker.nettoyer_texte)
 
     @staticmethod
     def _process_xml(xml_path: Path, mots_uniques: Dict, total_words: int,
@@ -2266,25 +2468,17 @@ class IndexesService:
 
         `ok=False` signale une page perdue (XML tronqué, lecture réseau interrompue, format
         inattendu). L'échec reste silencieux ici — la boucle appelante en tient le compte et
-        le journalise une fois en fin de run, plutôt que d'inonder le journal page par page."""
-        import xml.etree.ElementTree as ET
-        try:
-            tree = ET.parse(xml_path)
-            root = tree.getroot()
-            ns = {'ns': 'http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15'}
-            page_name = f"{page_prefix}{xml_path.stem}"
-            for ligne in root.findall(".//ns:TextLine", ns):
-                for mot_element in ligne.findall(".//ns:Word", ns):
-                    texte_unicode = mot_element.find("ns:TextEquiv/ns:Unicode", ns)
-                    if texte_unicode is not None and texte_unicode.text:
-                        coords_elem = mot_element.find("ns:Coords", ns)
-                        mot_coords = IndexesService._extraire_rectangle(coords_elem.attrib['points']) if coords_elem is not None else ""
-                        for mot in IndexesService._nettoyer_texte(texte_unicode.text):
-                            total_words += 1
-                            mots_uniques.setdefault(mot, []).append(f"{page_name} - {mot_coords}")
-        except Exception:
-            return total_words, False
-        return total_words, True
+        le journalise une fois en fin de run, plutôt que d'inonder le journal page par page.
+
+        Chemin séquentiel de l'indexation (petits lots, repli quand le pool ne démarre pas).
+        L'extraction elle-même est celle du worker : un seul parcours PAGE-XML dans le dépôt,
+        donc aucune divergence possible entre le chemin séquentiel et le chemin parallèle."""
+        page_name = f"{page_prefix}{xml_path.stem}"
+        _idx, _page, pairs, ok = index_worker.extract_page((0, str(xml_path), page_name))
+        for mot, mot_coords in pairs:
+            total_words += 1
+            mots_uniques.setdefault(mot, []).append(f"{page_name} - {mot_coords}")
+        return total_words, ok
 
     STOP_WORDS = {
         'au', 'aux', 'avec', 'ce', 'ces', 'cet', 'cette', 'd', 'dans', 'de',

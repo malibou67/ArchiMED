@@ -10,7 +10,8 @@ from typing import Dict, Any
 
 from services import DATA_DIR
 
-ALLOWED_KEYS = {'ocr_workers', 'ocr_threads_per_worker', 'ocr_mixed_precision', 'ocr_pool_min_pages'}
+ALLOWED_KEYS = {'ocr_workers', 'ocr_threads_per_worker', 'ocr_mixed_precision', 'ocr_pool_min_pages',
+                'index_workers', 'index_pool_min_pages'}
 
 
 class SettingsService:

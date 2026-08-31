@@ -922,7 +922,11 @@ export default function IndexesPage() {
               </TableHead>
               <TableBody>
                 {visibleIndexes.map((index) => {
-                  const rebuild = !!index.build;                       // reconstruction (index encore consultable)
+                  // Reconstruction = un build par-dessus un index déjà consultable. Une
+                  // première génération porte elle aussi un marqueur `build`
+                  // (`init_index_new`), mais garde `status: 'generating'` — sans ce garde-fou
+                  // la ligne annonçait « Reconstruction… » dès le tout premier index.
+                  const rebuild = !!index.build && index.status !== 'generating';
                   const isRegenerating = regeneratingIds.has(index.id);
                   // « Démarrage… » : le POST d'enfilage est parti, la tâche n'existe pas encore.
                   const isGenerating = index.status === 'generating' || rebuild || isRegenerating;

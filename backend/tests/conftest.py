@@ -18,6 +18,17 @@ import services  # noqa: E402  (doit suivre l'ajout au sys.path)
 PAGE_NS = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
 
 
+@pytest.fixture(autouse=True)
+def _sequential_indexing(monkeypatch):
+    """Épingle l'indexation sur son chemin séquentiel par défaut.
+
+    Le pool de process n'exécute pas `IndexesService._process_xml` : les tests qui l'espionnent
+    (empreintes incrémentales, granularité de l'annulation) décriraient sinon un chemin qui ne
+    passe plus par là, et le résultat dépendrait du nombre de cœurs de la machine. Le pool a ses
+    propres tests, qui lèvent explicitement cette épingle (`test_index_pool.py`)."""
+    monkeypatch.setenv('ARCHIMED_INDEX_WORKERS', '1')
+
+
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):
     """Isole DATA_DIR dans un dossier temporaire (relu à chaque appel dans services)."""

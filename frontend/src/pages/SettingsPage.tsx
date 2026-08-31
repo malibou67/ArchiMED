@@ -100,6 +100,8 @@ export default function SettingsPage() {
   const [workers, setWorkers] = useState(4);
   const [threads, setThreads] = useState(1);
   const [poolMin, setPoolMin] = useState(3);
+  const [indexWorkers, setIndexWorkers] = useState(4);
+  const [indexPoolMin, setIndexPoolMin] = useState(200);
   const [advanced, setAdvanced] = useState(false);
   const [citeOpen, setCiteOpen] = useState(false);
 
@@ -122,6 +124,8 @@ export default function SettingsPage() {
     setWorkers(Math.min(d.stored.ocr_workers ?? d.system.recommended_workers, d.system.max_workers));
     setThreads(d.effective.ocr_threads_per_worker);
     setPoolMin(d.effective.ocr_pool_min_pages);
+    setIndexWorkers(Math.min(d.effective.index_workers, d.system.cpu_count));
+    setIndexPoolMin(d.effective.index_pool_min_pages);
   };
 
   useEffect(() => {
@@ -168,6 +172,8 @@ export default function SettingsPage() {
     (auto ? data.stored.ocr_workers != null : workers !== data.effective.ocr_workers)
     || threads !== data.effective.ocr_threads_per_worker
     || poolMin !== data.effective.ocr_pool_min_pages
+    || indexWorkers !== data.effective.index_workers
+    || indexPoolMin !== data.effective.index_pool_min_pages
   );
 
   const save = async () => {
@@ -178,6 +184,8 @@ export default function SettingsPage() {
         ocr_workers: auto ? null : workers,
         ocr_threads_per_worker: threads,
         ocr_pool_min_pages: poolMin,
+        index_workers: indexWorkers,
+        index_pool_min_pages: indexPoolMin,
       });
       applyData(res);
       setSnack(t('snack.saved'));
@@ -197,6 +205,8 @@ export default function SettingsPage() {
         ocr_threads_per_worker: null,
         ocr_mixed_precision: null,
         ocr_pool_min_pages: null,
+        index_workers: null,
+        index_pool_min_pages: null,
       });
       applyData(res);
       setSnack(t('snack.defaultsRestored'));
@@ -353,6 +363,42 @@ export default function SettingsPage() {
                       />
                       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
                         {t('performance.poolThresholdHint')}
+                      </Typography>
+                    </Box>
+                  </Stack>
+
+                  {/* L'indexation a son propre pool : elle lit et analyse les XML de l'OCR, sans
+                      toucher au GPU. Ses réglages n'ont donc rien à voir avec ceux du dessus. */}
+                  <Divider textAlign="left" sx={{ pt: 0.5 }}>
+                    <Typography variant="caption" color="text.secondary">{t('performance.indexingTitle')}</Typography>
+                  </Divider>
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                    <Box sx={{ flex: 1 }}>
+                      <TextField
+                        type="number"
+                        size="small"
+                        fullWidth
+                        label={t('performance.indexWorkers')}
+                        value={indexWorkers}
+                        onChange={(e) => setIndexWorkers(Math.max(1, Math.min(cpu, parseInt(e.target.value || '1', 10))))}
+                        inputProps={{ min: 1, max: cpu }}
+                      />
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                        {t('performance.indexWorkersHint', { recommended: data?.system.recommended_index_workers ?? 1, cpu })}
+                      </Typography>
+                    </Box>
+                    <Box sx={{ flex: 1 }}>
+                      <TextField
+                        type="number"
+                        size="small"
+                        fullWidth
+                        label={t('performance.indexPoolThreshold')}
+                        value={indexPoolMin}
+                        onChange={(e) => setIndexPoolMin(Math.max(1, Math.min(5000, parseInt(e.target.value || '1', 10))))}
+                        inputProps={{ min: 1, max: 5000 }}
+                      />
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                        {t('performance.indexPoolThresholdHint')}
                       </Typography>
                     </Box>
                   </Stack>

@@ -8,6 +8,7 @@ from services import DATA_DIR
 from settings_service import SettingsService
 from system_checks import check_requirements
 import ocr_service
+import services
 
 router = APIRouter()
 
@@ -18,6 +19,8 @@ class SettingsUpdate(BaseModel):
     ocr_threads_per_worker: Optional[int] = None
     ocr_mixed_precision: Optional[bool] = None
     ocr_pool_min_pages: Optional[int] = None
+    index_workers: Optional[int] = None
+    index_pool_min_pages: Optional[int] = None
 
 
 def _total_ram_gb() -> Optional[float]:
@@ -74,6 +77,8 @@ def _payload() -> dict:
             "ocr_threads_per_worker": ocr_service.effective_threads(),
             "ocr_mixed_precision": ocr_service.effective_mixed(),
             "ocr_pool_min_pages": ocr_service.effective_pool_min_pages(),
+            "index_workers": services.effective_index_workers(),
+            "index_pool_min_pages": services.effective_index_pool_min_pages(),
         },
         "system": {
             "cpu_count": cores,
@@ -81,6 +86,8 @@ def _payload() -> dict:
             "gpu_max_workers": gpu_cap,
             "gpu_vram_gb": cuda.get('vram_gb') if cuda.get('ok') else None,
             "recommended_workers": min(recommended, gpu_cap) if gpu_cap else recommended,
+            # L'indexation ne touche pas au GPU : seuls les cœurs (et le NAS) la bornent.
+            "recommended_index_workers": min(services.adaptive_default_index_workers(cores), cores),
             "ram_total_gb": _total_ram_gb(),
             "disk_free_gb": _disk_free_gb(),
         },
@@ -116,6 +123,18 @@ def update_settings(update: SettingsUpdate):
         if not isinstance(p, int) or p < 1:
             raise HTTPException(status_code=400, detail="ocr_pool_min_pages doit être un entier ≥ 1.")
         partial['ocr_pool_min_pages'] = min(p, 50)
+
+    if 'index_workers' in partial and partial['index_workers'] is not None:
+        w = partial['index_workers']
+        if not isinstance(w, int) or w < 1:
+            raise HTTPException(status_code=400, detail="index_workers doit être un entier ≥ 1.")
+        partial['index_workers'] = min(w, cores)  # borné au nb de cœurs
+
+    if 'index_pool_min_pages' in partial and partial['index_pool_min_pages'] is not None:
+        p = partial['index_pool_min_pages']
+        if not isinstance(p, int) or p < 1:
+            raise HTTPException(status_code=400, detail="index_pool_min_pages doit être un entier ≥ 1.")
+        partial['index_pool_min_pages'] = min(p, 5000)
 
     SettingsService.update(partial)
     return _payload()
