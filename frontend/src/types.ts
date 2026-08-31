@@ -168,6 +168,10 @@ export type IndexProgress = {
   total: number;
   current_registre?: string;
   current_page?: string;   // page (XML) en cours de lecture
+  // Étape préparatoire en cours, avant que le décompte de pages n'ait un sens : parcours des
+  // registres ('scanning') puis relecture de l'index existant ('loading'). Sur un gros index
+  // ces deux étapes durent, et la ligne resterait sinon muette pendant tout ce temps.
+  phase?: 'scanning' | 'loading';
 }
 
 // Une brique d'un index : un modèle OCR d'une collection.
@@ -187,7 +191,9 @@ export type IndexSourceInfo = {
 
 // Progression d'une (re)construction en cours (l'index reste consultable pendant).
 export type IndexBuild = {
-  status: 'generating' | 'error';
+  // 'interrupted' : plus aucune tâche ne s'occupe de cette reconstruction (arrêt brutal,
+  // tâche supprimée ou purgée). L'index précédent reste intact ; à reprendre ou à abandonner.
+  status: 'generating' | 'error' | 'interrupted';
   progress?: IndexProgress;
   error?: string;
 }

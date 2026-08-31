@@ -1615,6 +1615,45 @@ class IndexesService:
             except OSError:
                 pass
 
+    @staticmethod
+    def abort_build(index_id: str) -> str:
+        """Abandonne une génération **sans jamais détruire un index utilisable**.
+
+        La décision se prend sur l'état du disque, pas sur un champ de tâche : `index_is_new`
+        est figé à l'enfilage et peut mentir (tâche purgée, reprise après redémarrage, tâche
+        d'un autre poste). Seul `index.json` fait foi — s'il est là, un index consultable
+        existe et seule la reconstruction en cours est abandonnée.
+
+        Retourne 'cleared' (index conservé), 'deleted' (index partiel jamais terminé) ou
+        'missing' (rien à abandonner)."""
+        index_dir = IndexesService.get_indexes_dir() / index_id
+        if not index_dir.exists():
+            return 'missing'
+        if (index_dir / "index.json").exists():
+            IndexesService.clear_build(index_id)
+            return 'cleared'
+        IndexesService.delete_index(index_id)
+        return 'deleted'
+
+    @staticmethod
+    def fail_build(index_id: str, message: str) -> None:
+        """Échec d'une génération : retire le marqueur `build` et note l'erreur.
+
+        Sans cela un index reste affiché « en reconstruction » indéfiniment — la tâche, elle,
+        est terminée en erreur, donc plus rien ne rafraîchit la ligne et la seule action
+        offerte devenait l'annulation. L'index précédent reste 'ready' et consultable ; seule
+        une première génération (pas d'index.json) passe en 'error'."""
+        meta = IndexesService.get_index(index_id)
+        if meta is None:
+            return
+        has_index = (IndexesService.get_indexes_dir() / index_id / "index.json").exists()
+        meta['build'] = None
+        meta['progress'] = None
+        meta['error'] = message
+        if not has_index:
+            meta['status'] = 'error'
+        IndexesService._save_index_meta(index_id, meta)
+
     # ── Mise à jour incrémentale : empreintes et purge ────────────────────────
     @staticmethod
     def _scan_registre_xml(model_dir: Path) -> tuple:
@@ -1769,7 +1808,7 @@ class IndexesService:
     @staticmethod
     def generate_index(index_id: str, on_progress=None,
                        should_cancel=None, should_pause=None,
-                       *, full: bool = False, on_plan=None) -> str:
+                       *, full: bool = False, on_plan=None, on_scan=None) -> str:
         """Construit l'index multi-sources à partir des XML OCR.
         Retourne 'done' | 'cancelled' | 'paused'.
 
@@ -1793,6 +1832,9 @@ class IndexesService:
         page en cours de lecture),
         `on_plan(skipped_labels, base_pages)` annonce les registres conservés et leurs pages, hors
         de la progression publiée (qui ne décrit que le travail de ce run),
+        `on_scan(registres, total_pages)` livre la liste des registres à la fin de la première
+        passe — elle n'est plus calculée à l'enfilage, qui devait sinon parcourir tout le
+        partage avant de répondre à la requête,
         `should_cancel()` arrête définitivement, `should_pause()` met en pause via checkpoint."""
         SEP = IndexesService.SOURCE_SEP
         index_dir = IndexesService.get_indexes_dir() / index_id
@@ -1801,121 +1843,144 @@ class IndexesService:
         checkpoint_file = index_dir / "checkpoint.json"
         final_file = index_dir / "index.json"
 
-        with open(metadata_file, 'r', encoding='utf-8-sig') as f:
-            metadata = json.load(f)
+        # Le cache de vocabulaire garde une copie complète de l'index en RAM (plusieurs
+        # centaines de Mo) : la reconstruction la rend périmée et la mémoire va manquer.
+        IndexesService._vocab_cache.pop(index_id, None)
 
-        # Reconstruction (index déjà prêt) vs première génération : détermine si l'on peut
-        # conserver l'index précédent en cas d'échec/annulation.
-        is_new = not final_file.exists()
-        sources_info: List[Dict[str, Any]] = metadata.get('sources') or []
-
-        def _save_meta() -> bool:
-            return IndexesService._save_index_meta(index_id, metadata)
-
-        def _set_progress(processed: int, total: int, current: Optional[str],
-                          page: Optional[str] = None) -> None:
-            metadata.setdefault('build', {})['status'] = 'generating'
-            metadata['build']['progress'] = {
-                "processed": processed, "total": total, "current_registre": current,
-                "current_page": page,
-            }
-
-        def _cancelled() -> bool:
-            return (should_cancel is not None and should_cancel()) or not index_dir.exists()
-
-        def _paused() -> bool:
-            return should_pause is not None and should_pause()
-
-        def _report(processed: int, total: int, current: Optional[str],
-                    page: Optional[str] = None) -> None:
-            if on_progress is not None:
-                try:
-                    on_progress(processed, total, current, page)
-                except Exception:
-                    pass
-
-        last_publish = 0.0
-        # Pages acquises hors de ce run (registres conservés par la mise à jour incrémentale).
-        # Elles sortent de la progression publiée : une mise à jour de 30 pages sur un index de
-        # 25 000 doit afficher « 12 / 30 », pas « 24 982 / 25 000 » — barre déjà pleine et ETA
-        # absurde. Les appelants raisonnent en compteurs absolus, `_publish` retranche la base.
-        base = 0
-
-        def _publish(processed: int, total: int, current: Optional[str],
-                     page: Optional[str] = None, *, force: bool = False) -> bool:
-            """Publie l'avancement (metadata.json + tâche). Retourne False si l'index a disparu,
-            ce que les appelants traitent comme une annulation.
-
-            Throttlé à ~1/s : la boucle interne appelle à chaque page, et `_save_meta` réécrit
-            tout le metadata (la liste, elle, ne le relit que toutes les 2 s). `force=True` aux
-            bornes de registre, où la publication doit être exacte."""
-            nonlocal last_publish
-            now = time.monotonic()
-            if not force and now - last_publish < 1.0:
-                return True
-            last_publish = now
-            _set_progress(processed - base, total - base, current, page)
-            if not _save_meta():
-                return False
-            _report(processed - base, total - base, current, page)
-            return True
-
-        # État, repris d'un checkpoint si l'indexation avait été mise en pause.
-        mots_uniques: Dict[str, List[str]] = {}
-        total_words = 0
-        done_registres: set = set()          # clés "key::registre"
-        done_state: Dict[str, Dict] = {}     # empreintes des registres réellement indexés
-        resumed = False
-        mode = 'full'
-        cp_skipped: Optional[set] = None     # base du run d'origine, à la reprise
-        if checkpoint_file.exists():
-            try:
-                with open(checkpoint_file, 'r', encoding='utf-8-sig') as f:
-                    cp = json.load(f)
-                # Un checkpoint sans 'mode' vient d'une version antérieure : traité comme 'full'.
-                cp_mode = cp.get('mode', 'full')
-                # Une reconstruction complète explicite ne doit pas hériter des registres qu'une
-                # mise à jour incrémentale interrompue avait marqués « déjà indexés » : elle serait
-                # silencieusement dégradée en incrémental (mark_rebuild ne purge pas le checkpoint).
-                if not (full and cp_mode == 'incremental'):
-                    mots_uniques = cp.get('words', {})
-                    total_words = cp.get('total_words', 0)
-                    done_registres = set(cp.get('done_registres', []))
-                    done_state = cp.get('done_state', {}) or {}
-                    # Base du run d'origine : la reprise doit repartir de la même barre de
-                    # progression (même total), pas d'un total rétréci au travail restant.
-                    # Absente d'un checkpoint hérité → on retombe sur `done_registres`.
-                    if cp.get('skipped') is not None:
-                        cp_skipped = set(cp['skipped'])
-                    resumed = True
-                    mode = cp_mode
-            except (OSError, json.JSONDecodeError):
-                pass   # checkpoint illisible : on repart de zéro (reconstruction complète)
-
-        base_registres: set = set()   # registres conservés : la base de progression de ce run
-
-        def _save_checkpoint() -> None:
-            # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
-            # laisser un checkpoint tronqué (la reprise après interruption s'y appuie).
-            tmp = checkpoint_file.with_name(f"{checkpoint_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-            try:
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,
-                               "done_registres": sorted(done_registres),
-                               "skipped": sorted(base_registres),
-                               "done_state": done_state}, f, ensure_ascii=False)
-                os.replace(tmp, checkpoint_file)
-            except OSError:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
+        # Le `try` couvre **tout** le corps, préparation comprise : une exception dans la
+        # lecture du metadata ou du checkpoint laissait auparavant le marqueur `build` en
+        # place pour toujours.
         try:
+            with open(metadata_file, 'r', encoding='utf-8-sig') as f:
+                metadata = json.load(f)
+
+            sources_info: List[Dict[str, Any]] = metadata.get('sources') or []
+
+            def _save_meta() -> bool:
+                return IndexesService._save_index_meta(index_id, metadata)
+
+            def _set_progress(processed: int, total: int, current: Optional[str],
+                              page: Optional[str] = None, phase: Optional[str] = None) -> None:
+                metadata.setdefault('build', {})['status'] = 'generating'
+                metadata['build']['progress'] = {
+                    "processed": processed, "total": total, "current_registre": current,
+                    "current_page": page,
+                    # Étape préparatoire en cours ('scanning' | 'loading'), avant que le
+                    # décompte de pages n'ait un sens. Sans elle la ligne restait plusieurs
+                    # dizaines de secondes sur une barre muette.
+                    "phase": phase,
+                }
+
+            def _cancelled() -> bool:
+                return (should_cancel is not None and should_cancel()) or not index_dir.exists()
+
+            def _paused() -> bool:
+                return should_pause is not None and should_pause()
+
+            def _report(processed: int, total: int, current: Optional[str],
+                        page: Optional[str] = None) -> None:
+                if on_progress is not None:
+                    try:
+                        on_progress(processed, total, current, page)
+                    except Exception:
+                        pass
+
+            last_publish = 0.0
+            # Pages acquises hors de ce run (registres conservés par la mise à jour incrémentale).
+            # Elles sortent de la progression publiée : une mise à jour de 30 pages sur un index de
+            # 25 000 doit afficher « 12 / 30 », pas « 24 982 / 25 000 » — barre déjà pleine et ETA
+            # absurde. Les appelants raisonnent en compteurs absolus, `_publish` retranche la base.
+            base = 0
+
+            def _publish(processed: int, total: int, current: Optional[str],
+                         page: Optional[str] = None, *, force: bool = False,
+                         phase: Optional[str] = None) -> bool:
+                """Publie l'avancement (metadata.json + tâche). Retourne False si l'index a disparu,
+                ce que les appelants traitent comme une annulation.
+
+                Throttlé à ~1/s : la boucle interne appelle à chaque page, et `_save_meta` réécrit
+                tout le metadata (la liste, elle, ne le relit que toutes les 2 s). `force=True` aux
+                bornes de registre, où la publication doit être exacte.
+
+                Un échec d'écriture n'est **pas** une annulation : `_save_index_meta` retourne False
+                sur n'importe quel OSError persistant (hoquet du partage, antivirus qui tient le
+                fichier). Le traiter comme une disparition de l'index faisait supprimer un index
+                neuf pour une écriture ratée. Seul le dossier disparu compte ; la publication
+                suivante réessaiera."""
+                nonlocal last_publish
+                now = time.monotonic()
+                if not force and now - last_publish < 1.0:
+                    return True
+                last_publish = now
+                _set_progress(processed - base, total - base, current, page, phase)
+                if not _save_meta() and not index_dir.exists():
+                    return False
+                # Une phase préparatoire ne décrit que la ligne d'index : elle n'a pas de
+                # compteur de pages à donner, et le remonter à la tâche écraserait les siens
+                # par des zéros (barre et ETA repartis de rien à chaque jalon).
+                if phase is None:
+                    _report(processed - base, total - base, current, page)
+                return True
+
+            # État, repris d'un checkpoint si l'indexation avait été mise en pause.
+            mots_uniques: Dict[str, List[str]] = {}
+            total_words = 0
+            done_registres: set = set()          # clés "key::registre"
+            done_state: Dict[str, Dict] = {}     # empreintes des registres réellement indexés
+            resumed = False
+            mode = 'full'
+            cp_skipped: Optional[set] = None     # base du run d'origine, à la reprise
+            if checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, 'r', encoding='utf-8-sig') as f:
+                        cp = json.load(f)
+                    # Un checkpoint sans 'mode' vient d'une version antérieure : traité comme 'full'.
+                    cp_mode = cp.get('mode', 'full')
+                    # Une reconstruction complète explicite ne doit pas hériter des registres qu'une
+                    # mise à jour incrémentale interrompue avait marqués « déjà indexés » : elle serait
+                    # silencieusement dégradée en incrémental (mark_rebuild ne purge pas le checkpoint).
+                    if not (full and cp_mode == 'incremental'):
+                        mots_uniques = cp.get('words', {})
+                        total_words = cp.get('total_words', 0)
+                        done_registres = set(cp.get('done_registres', []))
+                        done_state = cp.get('done_state', {}) or {}
+                        # Base du run d'origine : la reprise doit repartir de la même barre de
+                        # progression (même total), pas d'un total rétréci au travail restant.
+                        # Absente d'un checkpoint hérité → on retombe sur `done_registres`.
+                        if cp.get('skipped') is not None:
+                            cp_skipped = set(cp['skipped'])
+                        resumed = True
+                        mode = cp_mode
+                except (OSError, json.JSONDecodeError):
+                    pass   # checkpoint illisible : on repart de zéro (reconstruction complète)
+
+            base_registres: set = set()   # registres conservés : la base de progression de ce run
+
+            def _save_checkpoint() -> None:
+                # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
+                # laisser un checkpoint tronqué (la reprise après interruption s'y appuie).
+                tmp = checkpoint_file.with_name(f"{checkpoint_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                try:
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,
+                                   "done_registres": sorted(done_registres),
+                                   "skipped": sorted(base_registres),
+                                   "done_state": done_state}, f, ensure_ascii=False)
+                    os.replace(tmp, checkpoint_file)
+                except OSError:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
             # Première passe : lister (source, registre) et compter le total de XML.
             # Chaque tâche porte sa source pour namespacer pages et registres. L'empreinte de
             # chaque registre est relevée ici, au moment où ses fichiers sont figés : elle décrit
             # donc exactement ce qui sera indexé, même si des XML arrivent pendant le build.
+            # Sur des dizaines de milliers de XML ce parcours dure, sur un partage réseau
+            # surtout : on l'annonce avant de s'y engager.
+            if not _publish(0, 0, None, force=True, phase='scanning'):
+                return 'cancelled'
             sources_sig = IndexesService._sources_signature(sources_info)
             registre_tasks: List[tuple] = []   # (src, reg_dir, xml_files, reg_key, reg_state)
             current_state: Dict[str, Dict] = {}
@@ -1941,6 +2006,17 @@ class IndexesService:
                     current_state[reg_key] = reg_state
                     total_xml += len(xml_files)
 
+            # La liste des registres n'est plus calculée à l'enfilage (qui devait sinon
+            # parcourir tout le partage avant de répondre) : on la livre ici, où elle vient
+            # d'être établie, pour le détail de la tâche.
+            if on_scan is not None:
+                try:
+                    on_scan([{"name": IndexesService._source_label(rd.name, s),
+                              "key": s['key'], "registre": rd.name, "pages": len(xf)}
+                             for s, rd, xf, _rk, _st in registre_tasks], total_xml)
+                except Exception:
+                    pass
+
             if resumed:
                 # Un registre a pu disparaître du disque pendant la pause : ses pages resteraient
                 # dans l'index alors qu'il n'est plus listé (registres_count sur-compterait).
@@ -1963,6 +2039,10 @@ class IndexesService:
                     deleted = set(previous) - set(current_state)
                     to_remove = IndexesService._expand_prefix_conflicts(
                         stale | deleted, current_state.keys())
+                    # Relecture de l'index existant : sur un gros index c'est une longue
+                    # attente muette (plusieurs centaines de Mo de JSON), à annoncer.
+                    if not _publish(0, 0, None, force=True, phase='loading'):
+                        return 'cancelled'
                     words = IndexesService._load_existing_words(final_file, sources_info)
                     if words is not None:
                         mots_uniques = words
@@ -2002,6 +2082,7 @@ class IndexesService:
             CHECKPOINT_THROTTLE_S = 60.0
             last_checkpoint_at = time.monotonic()
             last_checkpoint_done = len(done_registres)
+            failed_pages = 0   # XML illisibles : comptés ici, journalisés en fin de run
             for src, reg_dir, xml_files, reg_key, reg_state in registre_tasks:
                 if reg_key in done_registres:
                     continue
@@ -2017,8 +2098,20 @@ class IndexesService:
                     return 'cancelled'
 
                 page_prefix = f"{src['key']}{SEP}"
-                for xml_file in xml_files:
-                    total_words = IndexesService._process_xml(xml_file, mots_uniques, total_words, page_prefix)
+                for n, xml_file in enumerate(xml_files):
+                    # Annulation en cours de registre : un registre pouvant compter plusieurs
+                    # centaines de pages, n'écouter qu'à ses bornes faisait attendre l'utilisateur
+                    # une minute ou plus, bouton grisé. Rien n'ayant été basculé (le staging est
+                    # jeté), s'arrêter au milieu est sans conséquence.
+                    # La *pause*, elle, reste aux bornes de registre : son checkpoint ne sait pas
+                    # décrire un registre à moitié traité, et la reprise le réindexerait en double.
+                    if n and n % 200 == 0 and _cancelled():
+                        IndexesService._discard_staging(staging_file)
+                        return 'cancelled'
+                    total_words, ok = IndexesService._process_xml(
+                        xml_file, mots_uniques, total_words, page_prefix)
+                    if not ok:
+                        failed_pages += 1
                     processed += 1
                     # Page par page (throttlé) : sans cela un gros registre fige la progression
                     # pendant toute sa durée.
@@ -2098,6 +2191,12 @@ class IndexesService:
             metadata["status"] = "ready"
             metadata["progress"] = None
             metadata["build"] = None
+            if failed_pages:
+                # Ces pages sont perdues pour l'index alors que leur registre est marqué
+                # indexé : la prochaine mise à jour incrémentale ne les reverra pas. Le
+                # journal est la seule chance de s'en apercevoir.
+                log.warning("Indexation : %d XML illisibles, ignorés (index %s)",
+                            failed_pages, index_id)
             metadata["stats"] = {
                 "total_unique_words": len(mots_uniques),
                 "total_word_occurrences": total_words,
@@ -2129,12 +2228,12 @@ class IndexesService:
             IndexesService._discard_staging(staging_file)
             if not index_dir.exists():
                 return 'cancelled'  # le dossier a été supprimé
+            # Le marqueur `build` doit tomber quoi qu'il arrive — y compris si l'exception est
+            # survenue avant la lecture du metadata. Sans cela la ligne restait « en
+            # reconstruction » indéfiniment alors que la tâche était terminée en erreur : plus
+            # rien ne la rafraîchissait, et la seule action offerte devenait l'annulation.
             # Reconstruction échouée : on conserve l'index précédent (toujours 'ready').
-            metadata["status"] = "error" if is_new else metadata.get("status", "ready")
-            metadata["progress"] = None
-            metadata["build"] = None
-            metadata["error"] = str(e)
-            _save_meta()
+            IndexesService.fail_build(index_id, str(e))
             raise
 
     @staticmethod
@@ -2161,7 +2260,13 @@ class IndexesService:
         return [mot.strip('-') for mot in texte.split() if mot.isalpha()]
 
     @staticmethod
-    def _process_xml(xml_path: Path, mots_uniques: Dict, total_words: int, page_prefix: str = "") -> int:
+    def _process_xml(xml_path: Path, mots_uniques: Dict, total_words: int,
+                     page_prefix: str = "") -> tuple:
+        """Indexe un XML PAGE. Retourne `(total_words, ok)`.
+
+        `ok=False` signale une page perdue (XML tronqué, lecture réseau interrompue, format
+        inattendu). L'échec reste silencieux ici — la boucle appelante en tient le compte et
+        le journalise une fois en fin de run, plutôt que d'inonder le journal page par page."""
         import xml.etree.ElementTree as ET
         try:
             tree = ET.parse(xml_path)
@@ -2178,8 +2283,8 @@ class IndexesService:
                             total_words += 1
                             mots_uniques.setdefault(mot, []).append(f"{page_name} - {mot_coords}")
         except Exception:
-            pass
-        return total_words
+            return total_words, False
+        return total_words, True
 
     STOP_WORDS = {
         'au', 'aux', 'avec', 'ce', 'ces', 'cet', 'cette', 'd', 'dans', 'de',
@@ -2359,6 +2464,12 @@ class IndexesService:
     # words = dict mot -> ["page - coords", ...] (sert au détail des pages d'un mot).
     # registres_map = folder -> {id, titre, periode} (sert aux statistiques).
     # Invalidé automatiquement quand index.json change (comparaison de mtime).
+    #
+    # **Borné à un seul index** : une entrée pèse en RAM plusieurs fois son poids sur disque
+    # (des centaines de Mo pour un gros index, l'essentiel en petites chaînes Python). Sans
+    # éviction, consulter successivement plusieurs index en épinglait autant de copies pour
+    # toute la vie du process — puis une indexation, qui reconstruit le même dictionnaire en
+    # mémoire, finissait de remplir la machine. On ne sert qu'un index à la fois.
     _vocab_cache: Dict[str, tuple] = {}
 
     @staticmethod
@@ -2398,6 +2509,7 @@ class IndexesService:
         base_entries.sort(key=lambda e: e["word"])
 
         total_unique = len(words)
+        IndexesService._vocab_cache.clear()   # un seul index en mémoire à la fois
         IndexesService._vocab_cache[index_id] = (mtime, total_unique, base_entries, words, registres_map)
         return total_unique, base_entries, words, registres_map
 

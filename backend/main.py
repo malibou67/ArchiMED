@@ -81,6 +81,9 @@ async def _on_startup():
         log.error(f"Dossier de données en lecture seule {kv(data=storage['data_dir'])}")
 
     TaskService.load_on_startup()
+    # Après la reprise seulement : les tâches interrompues viennent d'être rétablies, on ne
+    # signalera donc que les reconstructions dont plus aucune tâche ne s'occupe.
+    index_runner.reconcile_orphan_builds()
 
 
 @app.get("/health")

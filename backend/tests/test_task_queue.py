@@ -40,6 +40,7 @@ def tasks_dir(tmp_path, monkeypatch):
     TaskService._last_reconcile_disk = 0.0
     TaskService._runners = {}
     TaskService._cancel_hooks = {}
+    TaskService._error_hooks = {}
     # Pas de chargement disque ni de thread superviseur : les tests pilotent tout à la main.
     TaskService._loaded = True
     TaskService._supervisor_started = True
@@ -259,3 +260,65 @@ def test_verrou_illisible_reste_tenu(tasks_dir):
 
     (tasks_dir / 'tasks' / 'viv.json').unlink()
     assert TaskService._lock_is_stale(verrou) is True
+
+
+# ── Hooks de fin de vie ───────────────────────────────────────────────────
+
+
+def test_supprimer_une_tache_en_attente_joue_le_hook(tasks_dir):
+    """Une tâche supprimée avant d'avoir tourné a pu matérialiser quelque chose à l'enfilage :
+    un index marqué « en reconstruction », par exemple. Sans ce hook, plus rien ne le nettoyait
+    et sa ligne restait figée pour toujours."""
+    runner = Runner()
+    nettoyés = []
+    TaskService.register('ocr', runner, on_cancel=lambda t: nettoyés.append(t['id']))
+    a = _enfiler('A')                      # démarre et occupe la lane
+    b = _enfiler('B')                      # reste en attente
+    assert _attendre(lambda: runner.entré.is_set())
+
+    assert TaskService.delete(b['id']) is True
+    assert nettoyés == [b['id']]
+
+    runner.libère.set()
+
+
+def test_supprimer_une_tache_terminee_ne_joue_pas_le_hook(tasks_dir):
+    """Rien à abandonner : la tâche a déjà rendu son verdict, son nettoyage est fait."""
+    nettoyés = []
+    TaskService.register('ocr', Runner(), on_cancel=lambda t: nettoyés.append(t['id']))
+    _ecrire_tache(tasks_dir, 'finie', machine_identity.machine_id(), status='done')
+    TaskService.load_on_startup()
+
+    TaskService.delete('finie')
+    assert nettoyés == []
+
+
+def test_echec_avant_le_runner_joue_le_hook_derreur(tasks_dir):
+    """Un conflit de verrou (ou un runner absent) fait échouer la tâche **avant** son runner :
+    celui-ci n'a donc rien pu nettoyer de ce que l'enfilage avait laissé en place."""
+    échoués = []
+    TaskService.register('ocr', Runner(), on_error=lambda t: échoués.append(t['id']))
+    TaskService._runners.pop('ocr')        # plus de runner : l'exécution échoue d'emblée
+
+    tâche = _enfiler('A')
+
+    assert _attendre(lambda: échoués == [tâche['id']])
+    assert TaskService._tasks[tâche['id']]['status'] == 'error'
+
+
+def test_un_hook_qui_leve_ne_casse_pas_la_suppression(tasks_dir):
+    """La persistance de la tâche et la lane priment sur son nettoyage."""
+    runner = Runner()
+
+    def hook_cassé(task):
+        raise RuntimeError("partage injoignable")
+
+    TaskService.register('ocr', runner, on_cancel=hook_cassé)
+    _enfiler('A')
+    b = _enfiler('B')
+    assert _attendre(lambda: runner.entré.is_set())
+
+    assert TaskService.delete(b['id']) is True
+    assert b['id'] not in TaskService._tasks
+
+    runner.libère.set()

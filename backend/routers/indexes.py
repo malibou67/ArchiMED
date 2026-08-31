@@ -56,16 +56,32 @@ def regenerate_index(
     """Met à jour un index existant (mêmes sources) : seuls les registres nouveaux ou modifiés
     sont réindexés, sauf si `full=true`. L'index précédent reste consultable jusqu'au
     basculement atomique en fin de génération."""
-    if IndexesService.get_index(index_id) is None:
+    meta = IndexesService.get_index(index_id)
+    if meta is None:
         raise HTTPException(status_code=404, detail="Index non trouvé")
     try:
-        return enqueue_index(index_id=index_id, full=full)
+        return enqueue_index(index_id=index_id, full=full, meta=meta)
     except TaskConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     except TaskUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{index_id}/abort-build")
+def abort_index_build(index_id: str):
+    """Abandonne une génération en cours **sans détruire un index utilisable**.
+
+    Repli de l'annulation quand plus aucune tâche ne correspond à l'index (tâche purgée,
+    échouée avant d'atteindre son runner, ou perdue le temps d'un hoquet du partage). Le
+    frontend appelait jusqu'ici `DELETE /{index_id}`, qui effaçait tout le dossier — l'index
+    précédent, parfaitement valide, avec. Seul un index jamais terminé (pas d'index.json) est
+    supprimé ici."""
+    outcome = IndexesService.abort_build(index_id)
+    if outcome == 'missing':
+        raise HTTPException(status_code=404, detail="Index non trouvé")
+    return {"index_id": index_id, "outcome": outcome}
 
 
 @router.get("/available-models")

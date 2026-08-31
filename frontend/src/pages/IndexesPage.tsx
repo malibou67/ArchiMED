@@ -118,6 +118,18 @@ function StatusChip({ status }: { status: IndexMetadata['status'] }) {
 function IndexProgress({ progress, rebuild, locale }: { progress?: IndexProgressType; rebuild?: boolean; locale: string }) {
   const { t } = useTranslation('indexes');
   const p = progress;
+  // Étape préparatoire annoncée par le serveur (parcours des registres, relecture de l'index
+  // existant) : elle n'a pas de décompte, mais dure — la nommer vaut mieux qu'une barre muette.
+  if (p?.phase) {
+    return (
+      <Box>
+        <LinearProgress variant="indeterminate" color={rebuild ? 'info' : 'warning'} sx={{ height: 5, borderRadius: 3, mb: 0.5 }} />
+        <Typography variant="caption" color="text.disabled">
+          {t(`progress.phase.${p.phase}`)}
+        </Typography>
+      </Box>
+    );
+  }
   if (!p || (p.total === 0 && !p.current_registre)) {
     return (
       <Box>
@@ -579,6 +591,17 @@ export default function IndexesPage() {
 
   const { runningTasks, pausedTasks, interruptedTasks, queuedTasks, hasActivity, cancel: cancelTask, pause: pauseTask, resume: resumeTask, refresh: refreshTasks } = useTasks();
 
+  // Index dont une tâche d'indexation s'occupe encore, quel que soit son état. Un index marqué
+  // « en reconstruction » qui n'en fait pas partie est orphelin : plus rien ne le fera avancer.
+  const liveIndexTaskIds = useMemo(
+    () => new Set(
+      [...runningTasks, ...queuedTasks, ...pausedTasks, ...interruptedTasks]
+        .filter(t => t.type === 'index' && t.index_id)
+        .map(t => t.index_id as string),
+    ),
+    [runningTasks, queuedTasks, pausedTasks, interruptedTasks],
+  );
+
   // `rescan` : relire réellement les dossiers OCR au lieu des compteurs publiés. Réservé à une
   // action explicite de l'utilisateur (bouton Actualiser), car c'est plusieurs secondes.
   const loadUpdates = useCallback(async (rescan = false) => {
@@ -664,14 +687,18 @@ export default function IndexesPage() {
   };
 
   // `full` : réindexe tous les registres au lieu des seuls nouveaux/modifiés.
+  //
+  // La ligne bascule en « démarrage » AVANT l'appel : l'enfilage écrit sur le partage et la
+  // réponse peut tarder plusieurs secondes, pendant lesquelles le clic semblait sans effet.
+  // Le marqueur ne retombe qu'une fois la liste relue — l'index porte alors son `build` (ou
+  // a déjà fini), donc la ligne ne repasse jamais par un « Prêt » fugace.
   const handleRegenerate = async (index: IndexMetadata, full = false) => {
     setRegeneratingIds(prev => new Set([...prev, index.id]));
     setError(null); setSuccess(null);
     try {
       await indexesApi.regenerate(index.id, { full });
-      await refreshTasks();
-      await loadIndexes();
       setSuccess(t(full ? 'success.fullRebuildQueued' : 'success.updateQueued'));
+      await Promise.all([refreshTasks(), loadIndexes()]);
     } catch (e: any) {
       setError(e?.response?.data?.detail ?? t('errors.rebuild'));
     } finally {
@@ -681,6 +708,9 @@ export default function IndexesPage() {
 
   const handleCancelGeneration = async (indexId: string) => {
     setCancellingIds(prev => new Set(prev).add(indexId));   // retour visuel immédiat
+    // Une tâche a été priée de s'arrêter : l'arrêt est coopératif et prend plusieurs secondes,
+    // le retour visuel doit donc tenir jusqu'à ce qu'elle disparaisse (useEffect plus bas).
+    let attendLaTache = false;
     try {
       // Une indexation (en cours, en attente, en pause ou interrompue) = une tâche dont
       // index_id == cet index → on l'annule (le nettoyage index partiel/build est fait côté serveur).
@@ -688,15 +718,23 @@ export default function IndexesPage() {
         .find(t => t.type === 'index' && t.index_id === indexId);
       if (task) {
         await cancelTask(task.id);
+        attendLaTache = true;
       } else {
-        await indexesApi.delete(indexId);  // repli si aucune tâche associée
+        // Aucune tâche associée : reconstruction orpheline (tâche purgée, échouée avant son
+        // runner, ou perdue le temps d'un hoquet du partage). `abortBuild` retire le marqueur
+        // en CONSERVANT l'index précédent ; c'est `delete` — qui effaçait tout le dossier —
+        // qui était appelé ici, et une annulation faisait donc perdre l'index.
+        await indexesApi.abortBuild(indexId);
       }
       await loadIndexes();
       setSuccess(t('success.cancelled'));
     } catch {
       setError(t('errors.cancel'));
+      attendLaTache = false;
     } finally {
-      setCancellingIds(prev => { const s = new Set(prev); s.delete(indexId); return s; });
+      if (!attendLaTache) {
+        setCancellingIds(prev => { const s = new Set(prev); s.delete(indexId); return s; });
+      }
     }
   };
 
@@ -735,6 +773,17 @@ export default function IndexesPage() {
       return next.size === prev.size ? prev : next;
     });
   }, [runningTasks]);
+
+  // « Annulation… » tant que la tâche n'a pas disparu : l'annulation est coopérative et prend
+  // plusieurs secondes. Rendre la main aussitôt faisait recliquer l'utilisateur, et le second
+  // clic — la tâche ayant alors disparu — partait sur le repli.
+  useEffect(() => {
+    setCancellingIds(prev => {
+      if (!prev.size) return prev;
+      const next = new Set([...prev].filter(id => liveIndexTaskIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [liveIndexTaskIds]);
 
   const handleDeleteClick = (indexId: string) => { setIndexToDelete(indexId); setDeleteDialogOpen(true); };
 
@@ -874,18 +923,26 @@ export default function IndexesPage() {
               <TableBody>
                 {visibleIndexes.map((index) => {
                   const rebuild = !!index.build;                       // reconstruction (index encore consultable)
-                  const isGenerating = index.status === 'generating' || rebuild;
+                  const isRegenerating = regeneratingIds.has(index.id);
+                  // « Démarrage… » : le POST d'enfilage est parti, la tâche n'existe pas encore.
+                  const isGenerating = index.status === 'generating' || rebuild || isRegenerating;
                   const progress = index.build?.progress ?? index.progress;
                   const pausedTask = pausedTasks.find(t => t.type === 'index' && t.index_id === index.id);
                   const isPaused = !!pausedTask;
                   const interruptedTask = interruptedTasks.find(t => t.type === 'index' && t.index_id === index.id);
-                  const isInterrupted = isGenerating && !isPaused && !!interruptedTask;
+                  // Reconstruction orpheline : le marqueur `build` est là mais plus aucune tâche
+                  // ne s'en occupe (arrêt brutal, tâche supprimée, échec avant son runner). La
+                  // ligne restait alors figée sur « Reconstruction… » indéfiniment, sans que rien
+                  // ne la rafraîchisse — on l'annonce pour ce qu'elle est : à reprendre ou à
+                  // abandonner. `isRegenerating` l'exclut : la tâche n'a simplement pas encore
+                  // eu le temps d'apparaître.
+                  const isOrphanBuild = rebuild && !isRegenerating && !liveIndexTaskIds.has(index.id);
+                  const isInterrupted = isGenerating && !isPaused && (!!interruptedTask || isOrphanBuild);
                   // En file d'attente : matérialisé (generating/build) et une tâche l'attend
                   // réellement. Le déduire de l'absence de toute tâche ferait passer un
                   // instantané périmé (indexation terminée, liste pas encore relue) pour une
                   // attente.
                   const isQueued = isGenerating && queuedTasks.some(t => t.type === 'index' && t.index_id === index.id);
-                  const isRegenerating = regeneratingIds.has(index.id);
                   const actionsAlwaysVisible = isGenerating || isRegenerating;
                   const labels = sourcesLabels(index, collections);
                   // Une entrée existe désormais pour chaque index prêt (elle porte la couverture) :
@@ -949,7 +1006,10 @@ export default function IndexesPage() {
                             <IndexCoverage
                               updates={updates}
                               locale={locale}
-                              onIndex={hasNew ? () => handleRegenerate(index) : undefined}
+                              // `isRegenerating` : sans ce garde-fou un double-clic envoyait deux
+                              // enfilages, et le 409 du second remplaçait le message de succès
+                              // par une erreur rouge.
+                              onIndex={hasNew && !isRegenerating ? () => handleRegenerate(index) : undefined}
                             />
                           </Box>
                         ) : (
@@ -997,7 +1057,13 @@ export default function IndexesPage() {
                               )}
                               {isPaused || isInterrupted ? (
                                 <Tooltip title={isInterrupted ? t('actions.resumeInterrupted') : t('actions.resume')} arrow>
-                                  <IconButton size="small" color="primary" onClick={() => handleResumeGeneration(index.id)}>
+                                  {/* Reconstruction orpheline : plus de tâche à reprendre, on en
+                                      réenfile une — elle repartira du checkpoint laissé sur place. */}
+                                  <IconButton
+                                    size="small"
+                                    color="primary"
+                                    onClick={() => (isOrphanBuild ? handleRegenerate(index) : handleResumeGeneration(index.id))}
+                                  >
                                     <PlayArrowIcon fontSize="small" />
                                   </IconButton>
                                 </Tooltip>
@@ -1017,7 +1083,7 @@ export default function IndexesPage() {
                                   <span><IconButton size="small" disabled><CircularProgress size={16} /></IconButton></span>
                                 </Tooltip>
                               ) : (
-                                <Tooltip title={t('actions.cancelGeneration')} arrow>
+                                <Tooltip title={isOrphanBuild ? t('actions.abandonBuild') : t('actions.cancelGeneration')} arrow>
                                   <IconButton size="small" color="warning" onClick={() => handleCancelGeneration(index.id)}>
                                     <CancelIcon fontSize="small" />
                                   </IconButton>

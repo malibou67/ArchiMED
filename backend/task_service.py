@@ -103,6 +103,11 @@ class TaskService:
 
     _runners: Dict[str, Callable[[Dict[str, Any]], None]] = {}
     _cancel_hooks: Dict[str, Callable[[Dict[str, Any]], None]] = {}
+    # Joué quand une tâche finit en 'error'. Nécessaire pour les échecs survenus **avant** le
+    # runner (conflit de verrou, runner absent) : celui-ci n'ayant jamais tourné, il ne peut
+    # pas nettoyer ce qu'il avait laissé en place — un index resté « en reconstruction », par
+    # exemple, que plus aucune tâche ne fait avancer.
+    _error_hooks: Dict[str, Callable[[Dict[str, Any]], None]] = {}
 
     # Verrous de scope détenus par ce process, par task_id (non persistés).
     _held_locks: Dict[str, List[Path]] = {}
@@ -136,10 +141,26 @@ class TaskService:
     # ── Enregistrement des runners ────────────────────────────────────
     @staticmethod
     def register(task_type: str, runner: Callable[[Dict[str, Any]], None],
-                 on_cancel: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
+                 on_cancel: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 on_error: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         TaskService._runners[task_type] = runner
         if on_cancel is not None:
             TaskService._cancel_hooks[task_type] = on_cancel
+        if on_error is not None:
+            TaskService._error_hooks[task_type] = on_error
+
+    @staticmethod
+    def _run_hook(hooks: Dict[str, Callable[[Dict[str, Any]], None]], task: Dict[str, Any]) -> None:
+        """Joue un hook de fin de vie. Il ne doit jamais faire échouer l'appelant : la lane et
+        la persistance de la tâche priment sur son nettoyage."""
+        hook = hooks.get(task.get('type'))
+        if hook is None:
+            return
+        try:
+            hook(task)
+        except Exception:
+            log.error("Échec du hook de tâche " + kv(type=task.get('type'), id=task.get('id')),
+                      exc_info=True)
 
     # ── Persistance ───────────────────────────────────────────────────
     @staticmethod
@@ -984,6 +1005,9 @@ class TaskService:
         except Exception as e:
             task['status'] = 'error'
             task['error'] = str(e)
+            # Certains échecs précèdent le runner (verrou pris par un autre poste, runner
+            # absent) : il n'a alors rien pu nettoyer de ce que l'enfilage avait matérialisé.
+            TaskService._run_hook(TaskService._error_hooks, task)
         finally:
             try:
                 TaskService._release_locks(task)
@@ -1119,21 +1143,26 @@ class TaskService:
         TaskService._save(task)
         TaskService._release_locks(task)
         TaskService._invalidate_merged()
-        hook = TaskService._cancel_hooks.get(task.get('type'))
-        if hook:
-            try:
-                hook(task)
-            except Exception:
-                pass
+        TaskService._run_hook(TaskService._cancel_hooks, task)
 
     @staticmethod
     def delete(task_id: str) -> bool:
         """Supprime une tâche non en cours. Autorisé depuis n'importe quel poste pour les
-        tâches d'un autre poste (nettoyage d'orpheline), sauf si elle tourne réellement."""
+        tâches d'un autre poste (nettoyage d'orpheline), sauf si elle tourne réellement.
+
+        Supprimer une tâche **non terminée** (en attente, en pause, interrompue) joue son hook
+        d'annulation : elle avait pu matérialiser quelque chose à l'enfilage — un index marqué
+        « en reconstruction », par exemple — que plus rien ne viendrait alors nettoyer."""
         TaskService._ensure_loaded()
+        # 'interrupted' est dans TERMINAL mais reste reprenable : la supprimer, c'est bien
+        # abandonner un travail en cours, donc jouer le hook.
+        ABANDONED = ('queued', 'paused', 'interrupted')
+        removed: Optional[Dict[str, Any]] = None   # tâche abandonnée, dont le hook reste à jouer
+
         with TaskService._lock:
             task = TaskService._tasks.get(task_id)
-            if task is not None and TaskService._is_owned(task):
+            owned = task is not None and TaskService._is_owned(task)
+            if owned:
                 if task['status'] == 'running':
                     return False
                 q = TaskService._queue.get(task['type'])
@@ -1143,17 +1172,26 @@ class TaskService:
                 TaskService._release_locks(task)
                 TaskService._invalidate_merged()
                 TaskService._unlink_task(task_id)
-                return True
-        # Tâche d'un autre poste.
-        disk = TaskService._load_disk(task_id)
-        if disk is not None and disk.get('status') == 'running' and not TaskService._is_stale_running(disk):
-            return False  # vraiment en cours ailleurs
-        with TaskService._lock:
-            TaskService._tasks.pop(task_id, None)
-        if disk is not None:
-            TaskService._release_locks(disk)
-        TaskService._invalidate_merged()
-        TaskService._unlink_task(task_id)
+                if task['status'] in ABANDONED:
+                    removed = task
+
+        if not owned:
+            # Tâche d'un autre poste.
+            disk = TaskService._load_disk(task_id)
+            if disk is not None and disk.get('status') == 'running' and not TaskService._is_stale_running(disk):
+                return False  # vraiment en cours ailleurs
+            with TaskService._lock:
+                TaskService._tasks.pop(task_id, None)
+            if disk is not None:
+                TaskService._release_locks(disk)
+                if disk.get('status') in ABANDONED:
+                    removed = disk
+            TaskService._invalidate_merged()
+            TaskService._unlink_task(task_id)
+
+        if removed is not None:
+            # Hors du verrou : le hook écrit sur le partage, qui peut être lent.
+            TaskService._run_hook(TaskService._cancel_hooks, removed)
         return True
 
     @staticmethod

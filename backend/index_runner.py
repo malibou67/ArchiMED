@@ -4,7 +4,7 @@ Module séparé (importe `services` ET `task_service`) pour éviter un cycle d'i
 `task_service` importe `services`, et `services` n'importe pas `task_service`.
 """
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from app_logging import get_logger, kv
 from services import IndexesService
@@ -14,13 +14,14 @@ log = get_logger('index')
 
 
 def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional[str] = None,
-                  full: bool = False) -> dict:
+                  full: bool = False, meta: Optional[Dict[str, Any]] = None) -> dict:
     """Ajoute une tâche d'indexation à la lane 'index'.
 
     Deux usages :
       - **nouvel index** : `create = {name, sources:[{collection_id, model_name}]}` ;
-      - **mise à jour** : `index_id` d'un index existant (ses sources/nom sont relus). Elle est
-        incrémentale par défaut ; `full=True` force la réindexation de tous les registres.
+      - **mise à jour** : `index_id` d'un index existant (ses sources/nom sont relus, ou
+        `meta` si l'appelant vient déjà de les lire). Elle est incrémentale par défaut ;
+        `full=True` force la réindexation de tous les registres.
 
     `full` voyage dans la tâche (`index_full`) plutôt que dans le metadata de l'index : les
     champs de tâche sont persistés tels quels et survivent donc à une pause, une reprise ou un
@@ -28,9 +29,14 @@ def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional
 
     L'index est matérialisé AVANT l'enfilage pour que le runner trouve son metadata et que la
     ligne apparaisse immédiatement ; en cas de conflit de scope, on annule la matérialisation.
+
+    Cette fonction s'exécute **dans la requête HTTP** : elle ne doit toucher au partage que le
+    strict nécessaire. La liste des registres, qui exigeait d'énumérer des dizaines de milliers
+    de XML, est désormais établie par le runner (`on_scan`) : le clic répond aussitôt.
     """
     if index_id:
-        meta = IndexesService.get_index(index_id)
+        if meta is None:
+            meta = IndexesService.get_index(index_id)
         if not meta:
             raise ValueError(f"Index introuvable : {index_id}")
         name = meta.get('name') or index_id
@@ -50,13 +56,14 @@ def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional
         is_new = True
         full = True   # rien à réutiliser pour un index qui n'existe pas encore
 
-    registres: List[Dict[str, Any]] = IndexesService.list_sources_registres(sources_info)
     fields = {
         'index_id': index_id,
         'index_name': name,
         'index_is_new': is_new,
         'index_full': bool(full),
-        'index_registres': registres,
+        # Remplis par le runner (`on_scan`) dès la fin de sa première passe : les établir ici
+        # imposait de parcourir tout le partage avant même de répondre au clic.
+        'index_registres': [],
         # Résumé compact des sources (collection + modèle) pour l'affichage des tâches
         # multi-collections/modèles ; l'ancien couple collection_id/model_name ne suffit plus.
         'index_sources': [
@@ -67,7 +74,7 @@ def enqueue_index(create: Optional[Dict[str, Any]] = None, *, index_id: Optional
             }
             for s in sources_info
         ],
-        'total': sum(r['pages'] for r in registres),
+        'total': 0,
     }
 
     # Matérialisation avant enfilage (le thread d'exécution peut démarrer aussitôt).
@@ -129,11 +136,31 @@ def run_index_task(task: dict) -> None:
             log.info("Registres réutilisés tels quels " + kv(
                 index=index_id, registres=len(skipped), pages=base))
 
-    result = IndexesService.generate_index(
-        index_id,
-        on_progress=on_progress, should_cancel=should_cancel, should_pause=should_pause,
-        full=bool(task.get('index_full')), on_plan=on_plan,
-    )
+    def on_scan(registres: list, total: int) -> None:
+        # La liste des registres est établie par la première passe du runner, pas à l'enfilage :
+        # le détail de la tâche est donc vide pendant les premières secondes, le temps du scan.
+        task['index_registres'] = registres
+        task['total'] = total
+        TaskService._save(task)
+        log.info("Registres à traiter " + kv(
+            index=index_id, registres=len(registres), pages=total))
+
+    try:
+        result = IndexesService.generate_index(
+            index_id,
+            on_progress=on_progress, should_cancel=should_cancel, should_pause=should_pause,
+            full=bool(task.get('index_full')), on_plan=on_plan, on_scan=on_scan,
+        )
+    except Exception as e:
+        # `generate_index` retire déjà le marqueur `build`, mais il ne peut rien faire si
+        # l'échec l'a court-circuité (MemoryError, dossier disparu…). Ce filet garantit qu'un
+        # index ne reste jamais affiché « en reconstruction » avec une tâche déjà terminée.
+        log.error("Indexation échouée " + kv(id=task['id'], index=index_id), exc_info=True)
+        try:
+            IndexesService.fail_build(index_id, str(e))
+        except Exception:
+            pass
+        raise
 
     log.info("Indexation terminée " + kv(
         id=task['id'], index=index_id, issue=result or 'done',
@@ -147,16 +174,17 @@ def run_index_task(task: dict) -> None:
 
 
 def _cleanup_cancelled(task: dict) -> None:
-    """Nettoyage après annulation : un nouvel index partiel est supprimé, une reconstruction
-    conserve l'index précédent (on retire seulement le staging/marqueur `build`)."""
+    """Nettoyage après annulation ou échec d'une tâche d'indexation.
+
+    La décision (supprimer / conserver) revient à `abort_build`, qui la prend sur l'état réel
+    du disque. Elle reposait sur `index_is_new`, figé à l'enfilage : après un redémarrage, une
+    purge d'historique ou depuis un autre poste, ce champ pouvait faire supprimer un index
+    parfaitement valide."""
     iid = task.get('index_id')
     if not iid:
         return
     try:
-        if task.get('index_is_new'):
-            IndexesService.delete_index(iid)
-        else:
-            IndexesService.clear_build(iid)
+        IndexesService.abort_build(iid)
     except Exception:
         pass
 
@@ -166,4 +194,54 @@ def _on_cancel_index(task: dict) -> None:
     _cleanup_cancelled(task)
 
 
-TaskService.register('index', run_index_task, on_cancel=_on_cancel_index)
+def _on_error_index(task: dict) -> None:
+    """Échec d'une tâche d'indexation *hors* du runner (conflit de verrou, runner absent).
+
+    On retire le marqueur `build` sans rien supprimer : contrairement à une annulation, un
+    échec doit rester visible — l'index concerné garde son message d'erreur."""
+    iid = task.get('index_id')
+    if not iid:
+        return
+    try:
+        IndexesService.fail_build(iid, task.get('error') or "Échec de la tâche d'indexation.")
+    except Exception:
+        pass
+
+
+def reconcile_orphan_builds() -> int:
+    """Au démarrage : signale les reconstructions dont plus aucune tâche ne s'occupe.
+
+    Un arrêt brutal, une purge d'historique ou une tâche supprimée à la main laissaient un
+    index marqué « en reconstruction » sans rien pour le faire avancer. La ligne restait
+    figée, et la seule action offerte devenait l'annulation. On la marque 'interrupted' :
+    l'interface propose alors explicitement de reprendre ou d'abandonner.
+
+    Retourne le nombre d'index remis en cohérence."""
+    try:
+        indexes = IndexesService.list_indexes()
+    except Exception:
+        return 0
+    live = {t.get('index_id') for t in TaskService.list_tasks()
+            if t.get('type') == 'index' and t.get('status') not in ('done', 'error',
+                                                                    'cancelled')}
+    fixed = 0
+    for meta in indexes:
+        build = meta.get('build')
+        if not build or meta.get('id') in live or build.get('status') == 'interrupted':
+            continue
+        try:
+            fresh = IndexesService.get_index(meta['id'])
+            if not fresh or not fresh.get('build'):
+                continue
+            fresh['build']['status'] = 'interrupted'
+            IndexesService._save_index_meta(meta['id'], fresh)
+            fixed += 1
+        except Exception:
+            continue
+    if fixed:
+        log.info("Reconstructions orphelines signalées " + kv(index=fixed))
+    return fixed
+
+
+TaskService.register('index', run_index_task, on_cancel=_on_cancel_index,
+                     on_error=_on_error_index)

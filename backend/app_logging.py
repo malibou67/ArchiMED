@@ -23,6 +23,7 @@ import multiprocessing
 import os
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -168,7 +169,38 @@ def setup() -> Optional[Path]:
     root = logging.getLogger()
     root.setLevel(_level_from_env())
     root.addHandler(handler)
+    _install_excepthooks()
     return path
+
+
+def _install_excepthooks() -> None:
+    """Journalise les exceptions qui ne sont rattrapées par personne.
+
+    Sans cela une indexation tuée par un `MemoryError` — l'index tient plusieurs centaines de
+    Mo en RAM — ne laissait aucune trace : le thread mourait en silence et l'index restait
+    affiché « en reconstruction » sans la moindre explication dans le journal."""
+    crash_log = logging.getLogger('crash')
+
+    def _thread_hook(args) -> None:
+        # Un thread arrêté par `Thread._stop()` remonte ici sans exception : rien à dire.
+        if args.exc_type is SystemExit:
+            return
+        crash_log.critical(
+            "Exception non rattrapée dans le thread « %s »",
+            getattr(args.thread, 'name', '?'),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    def _main_hook(exc_type, exc_value, exc_tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            _previous_main(exc_type, exc_value, exc_tb)
+            return
+        crash_log.critical("Exception non rattrapée",
+                           exc_info=(exc_type, exc_value, exc_tb))
+        _previous_main(exc_type, exc_value, exc_tb)
+
+    _previous_main = sys.excepthook
+    threading.excepthook = _thread_hook
+    sys.excepthook = _main_hook
 
 
 def _level_from_env() -> int:

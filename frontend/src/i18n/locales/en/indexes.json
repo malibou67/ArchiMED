@@ -14,7 +14,11 @@
     "starting": "Starting…",
     "queued": "In queue…",
     "pages": "{{done}} / {{total}} pages",
-    "pageCount": "{{page}} · {{done}} / {{total}} pages"
+    "pageCount": "{{page}} · {{done}} / {{total}} pages",
+    "phase": {
+      "scanning": "Scanning registers…",
+      "loading": "Loading the existing index…"
+    }
   },
   "builder": {
     "createTitle": "Generate an index",
@@ -111,7 +115,8 @@
     "updateGeneric": "Update the index (index the new transcriptions)",
     "fullRebuild": "Full rebuild (reindex everything)",
     "more": "More actions",
-    "delete": "Delete"
+    "delete": "Delete",
+    "abandonBuild": "Abandon the rebuild (the current index is kept)"
   },
   "deleteDialog": {
     "title": "Delete the index",

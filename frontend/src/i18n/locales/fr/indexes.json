@@ -14,7 +14,11 @@
     "starting": "Démarrage…",
     "queued": "En file d'attente…",
     "pages": "{{done}} / {{total}} pages",
-    "pageCount": "{{page}} · {{done}} / {{total}} pages"
+    "pageCount": "{{page}} · {{done}} / {{total}} pages",
+    "phase": {
+      "scanning": "Analyse des registres…",
+      "loading": "Chargement de l'index existant…"
+    }
   },
   "builder": {
     "createTitle": "Générer un index",
@@ -111,7 +115,8 @@
     "updateGeneric": "Mettre à jour l'index (indexer les nouvelles transcriptions)",
     "fullRebuild": "Reconstruction complète (tout réindexer)",
     "more": "Autres actions",
-    "delete": "Supprimer"
+    "delete": "Supprimer",
+    "abandonBuild": "Abandonner la reconstruction (l'index actuel est conservé)"
   },
   "deleteDialog": {
     "title": "Supprimer l'index",

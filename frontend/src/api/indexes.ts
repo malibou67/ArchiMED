@@ -38,8 +38,10 @@ export const indexesApi = {
   },
 
   // Enfile une tâche d'indexation multi-sources ; renvoie la tâche (suivie dans les tâches).
+  // `timeout: 0` : l'enfilage écrit sur le partage, qui peut être lent — le timeout par défaut
+  // faisait annoncer un échec alors que la tâche était bel et bien partie.
   generate: async (data: IndexCreate): Promise<Task> => {
-    const response = await api.post('/api/indexes/generate', data);
+    const response = await api.post('/api/indexes/generate', data, { timeout: 0 });
     return response.data;
   },
 
@@ -51,7 +53,7 @@ export const indexesApi = {
 
   // Édite un index (nom et/ou sources). Si les sources changent, une reconstruction est enfilée.
   update: async (indexId: string, data: IndexUpdate): Promise<IndexMetadata> => {
-    const response = await api.patch(`/api/indexes/${indexId}`, data);
+    const response = await api.patch(`/api/indexes/${indexId}`, data, { timeout: 0 });
     return response.data;
   },
 
@@ -61,8 +63,16 @@ export const indexesApi = {
     const response = await api.post(
       `/api/indexes/${indexId}/regenerate`,
       null,
-      opts?.full ? { params: { full: true } } : undefined,
+      { timeout: 0, ...(opts?.full ? { params: { full: true } } : {}) },
     );
+    return response.data;
+  },
+
+  // Abandonne une génération en cours en **conservant** l'index précédent s'il existe.
+  // Repli de l'annulation quand plus aucune tâche ne correspond à l'index ; à ne pas confondre
+  // avec `delete`, qui efface tout le dossier et reste réservé à la suppression explicite.
+  abortBuild: async (indexId: string): Promise<{ outcome: 'cleared' | 'deleted' }> => {
+    const response = await api.post(`/api/indexes/${indexId}/abort-build`, null, { timeout: 0 });
     return response.data;
   },
 
