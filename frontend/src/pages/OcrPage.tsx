@@ -54,7 +54,7 @@ import { collectionsApi } from '../api/collections';
 import { modelsApi } from '../api/models';
 import { systemApi, SystemRequirements } from '../api/system';
 import { ocrApi, OcrPageRef } from '../api/ocr';
-import { tasksApi, Task } from '../api/tasks';
+import { tasksApi, taskWorkMs, Task } from '../api/tasks';
 import { useTasks } from '../context/TasksContext';
 import EnvStatusChip from '../components/ocr/EnvStatusChip';
 import OcrLaunchBar from '../components/ocr/OcrLaunchBar';
@@ -298,7 +298,7 @@ export default function OcrPage() {
   const loadPastTasks = () => {
     tasksApi.list()
       .then((tasks) => setPastOcrTasks(tasks.filter((t) =>
-        t.type === 'ocr' && t.status === 'done' && t.processed > 0 && !!t.started_at && !!t.finished_at,
+        t.type === 'ocr' && t.status === 'done' && t.processed > 0 && !!t.started_at,
       )))
       .catch(() => {});
   };
@@ -750,8 +750,12 @@ export default function OcrPage() {
     sample = sample.slice(0, 10); // les plus récentes (la liste est triée récentes d'abord)
     let pages = 0;
     let secs = 0;
+    const maintenant = Date.now();
     for (const t of sample) {
-      const dur = (new Date(t.finished_at!).getTime() - new Date(t.started_at!).getTime()) / 1000;
+      // Temps de travail cumulé, et non `finished_at - started_at` : une tâche passée qui avait
+      // été mise en pause aurait sinon gonflé le débit et sous-estimé toutes les estimations.
+      const ms = taskWorkMs(t, maintenant);
+      const dur = ms == null ? 0 : ms / 1000;
       if (dur > 0) { pages += t.processed; secs += dur; }
     }
     if (pages === 0 || secs === 0) return null;

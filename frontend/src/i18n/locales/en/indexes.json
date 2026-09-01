@@ -101,6 +101,10 @@
     "createdAt": "Created on",
     "status": "Status"
   },
+  "overlay": {
+    "deletingIndex": "Deleting the index…",
+    "deletingIndexDetail": "Its files are being removed."
+  },
   "actions": {
     "viewCurrent": "View the index content (current version)",
     "view": "View the index content",

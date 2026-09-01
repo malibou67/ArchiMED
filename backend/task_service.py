@@ -843,7 +843,9 @@ class TaskService:
             'failed': 0,
             'current': None,
             'created_at': datetime.now().isoformat(),
-            'started_at': None,
+            'started_at': None,        # première mise en route, jamais réécrite ensuite
+            'run_started_at': None,    # début du segment d'exécution courant (None à l'arrêt)
+            'work_ms': 0,              # temps de travail cumulé des segments clos, pause exclue
             'finished_at': None,
             'error': None,
             'errors': [],
@@ -930,9 +932,16 @@ class TaskService:
                 return
             t = TaskService._tasks[tid]
             TaskService._active[task_type] = tid
+            now = datetime.now().isoformat()
+            départ = t.get('started_at')
             t['status'] = 'running'
-            t['started_at'] = datetime.now().isoformat()
-            t['heartbeat'] = t['started_at']
+            # `started_at` date la PREMIÈRE mise en route et ne bouge plus : une reprise ouvre un
+            # nouveau segment. La réécrire remettait à zéro le temps mesuré alors que `processed`
+            # repart, lui, du checkpoint — le débit apparent explosait et le « reste ~ » affiché
+            # s'effondrait à quelques secondes.
+            t['started_at'] = départ or now
+            t['run_started_at'] = now
+            t['heartbeat'] = now
             TaskService._save(t)
             TaskService._invalidate_merged()
             log.info("Démarrage " + kv(type=task_type, id=tid, label=t.get('label')))
@@ -943,23 +952,46 @@ class TaskService:
             except Exception:
                 TaskService._active[task_type] = None
                 t['status'] = 'queued'
-                t['started_at'] = None
+                # Sur une reprise ratée, la première mise en route reste un fait : on restaure la
+                # valeur d'avant plutôt que de l'effacer (elle était `None` au tout premier essai).
+                t['started_at'] = départ
+                t['run_started_at'] = None
                 q.insert(0, tid)
                 TaskService._save(t)
                 raise
 
     @staticmethod
-    def _elapsed(task: Dict[str, Any]) -> Optional[str]:
-        """Durée depuis `started_at`, en « 1h04m12s » / « 40m13s » / « 12s » (pour le journal)."""
-        started = task.get('started_at')
-        if not started:
-            return None
+    def _work_ms(task: Dict[str, Any], *, until: Optional[str] = None) -> int:
+        """Temps de travail cumulé en millisecondes, temps passé en pause exclu : les segments
+        déjà clos (`work_ms`) plus celui en cours s'il y en a un. `until` borne ce dernier à un
+        instant connu — le dernier relevé d'un poste arrêté brutalement, par exemple."""
+        total = task.get('work_ms') or 0
+        start = task.get('run_started_at')
+        if not start:
+            return int(total)
         try:
-            delta = int((datetime.now() - datetime.fromisoformat(started)).total_seconds())
-        except ValueError:
+            fin = datetime.fromisoformat(until) if until else datetime.now()
+            delta = (fin - datetime.fromisoformat(start)).total_seconds() * 1000
+        except (TypeError, ValueError):
+            return int(total)
+        return int(total + max(0.0, delta))
+
+    @staticmethod
+    def _seal_run(task: Dict[str, Any], *, until: Optional[str] = None) -> None:
+        """Clôt le segment d'exécution courant : son temps rejoint `work_ms`. À appeler partout où
+        une exécution s'arrête — fin, pause, annulation, interruption — sans quoi le segment
+        resterait ouvert et son temps serait recompté au démarrage suivant."""
+        task['work_ms'] = TaskService._work_ms(task, until=until)
+        task['run_started_at'] = None
+
+    @staticmethod
+    def _elapsed(task: Dict[str, Any]) -> Optional[str]:
+        """Temps de travail cumulé, en « 1h04m12s » / « 40m13s » / « 12s » (pour le journal).
+        Cumulé plutôt que « depuis `started_at` » : la ligne de fin d'une tâche reprise après une
+        pause n'aurait sinon annoncé que la durée de son dernier segment."""
+        if not task.get('started_at'):
             return None
-        if delta < 0:
-            return None
+        delta = TaskService._work_ms(task) // 1000
         hours, rest = divmod(delta, 3600)
         minutes, seconds = divmod(rest, 60)
         if hours:
@@ -1017,6 +1049,7 @@ class TaskService:
             try:
                 TaskService._release_locks(task)
                 task['pause'] = False
+                TaskService._seal_run(task)   # avant le journal, qui en lit la durée
                 summary = kv(type=ttype, id=task_id, statut=task['status'],
                              durée=TaskService._elapsed(task), traitées=task.get('processed'),
                              échecs=task.get('failed'), err=task.get('error'))
@@ -1144,6 +1177,9 @@ class TaskService:
     def _finalize_cancel(task: Dict[str, Any]) -> None:
         """Passe une tâche en `cancelled`, persiste, libère ses verrous et joue le hook."""
         task['status'] = 'cancelled'
+        # Une orpheline d'un poste éteint peut avoir gardé un segment ouvert : on le clôt sur son
+        # dernier relevé, la durée d'extinction du poste n'étant pas du travail.
+        TaskService._seal_run(task, until=task.get('heartbeat'))
         task['finished_at'] = datetime.now().isoformat()
         TaskService._save(task)
         TaskService._release_locks(task)
@@ -1286,6 +1322,9 @@ class TaskService:
                         traitées=task.get('processed'), total=task.get('total')))
                     task['status'] = 'interrupted'   # le process précédent est mort
                     task['current'] = None
+                    # Le segment en cours s'arrête au dernier relevé : le poste a pu rester éteint
+                    # des heures, qui ne sont pas du temps de travail.
+                    TaskService._seal_run(task, until=task.get('heartbeat'))
                     if not task.get('finished_at'):
                         task['finished_at'] = datetime.now().isoformat()
                     TaskService._save(task)

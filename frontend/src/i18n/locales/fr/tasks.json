@@ -57,6 +57,21 @@
     "tooltip": "Les tâches d'un autre poste ne sont pas suivies en direct : ce poste écrit son avancement sur le partage toutes les 5 s environ. La progression avance donc par paliers, même quand tout se passe bien."
   },
   "retryError": "Impossible de relancer les pages en échec.",
+  "actionError": "L'action n'a pas pu être effectuée.",
+  "overlay": {
+    "pause": "Mise en pause de la tâche…",
+    "pauseDetail": {
+      "ocr": "Elle prendra effet à la fin de la page en cours.",
+      "index": "Elle prendra effet à la fin du registre en cours : cela peut prendre un moment.",
+      "generic": "Elle prendra effet dès que l'étape en cours est terminée."
+    },
+    "cancel": "Arrêt de la tâche…",
+    "cancelDetail": "Elle s'arrête proprement : tout ce qui est déjà traité est conservé.",
+    "resume": "Reprise de la tâche…",
+    "resumeDetail": "Elle repart de son dernier point de sauvegarde.",
+    "delete": "Suppression de la tâche…",
+    "hide": "Masquer"
+  },
   "actions": {
     "pausing": "Mise en pause…",
     "pause": "Mettre en pause",

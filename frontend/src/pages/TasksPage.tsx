@@ -32,8 +32,10 @@ import {
   Pause as PauseIcon,
   PlayArrow as PlayArrowIcon,
 } from '@mui/icons-material';
-import { tasksApi, Task, TaskPreflight, TaskPagesResponse, TaskRegistresResponse, PageState } from '../api/tasks';
+import { tasksApi, taskWorkMs, Task, TaskPreflight, TaskPagesResponse, TaskRegistresResponse, PageState } from '../api/tasks';
 import { useTasks } from '../context/TasksContext';
+import TaskActionOverlay from '../components/TaskActionOverlay';
+import { PendingTaskAction, usePendingTaskAction } from '../components/usePendingTaskAction';
 import { usePageLoading } from '../context/LoadingContext';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
@@ -87,17 +89,25 @@ const fmtDuration = (ms: number) => {
   return `${sec} s`;
 };
 
-const elapsedOf = (t: Task, now: number): number | null => {
-  if (!t.started_at) return null;
-  const start = Date.parse(t.started_at);
-  const end = t.finished_at ? Date.parse(t.finished_at) : now;
-  return end - start;
-};
-
 const isRunning = (t: Task) => t.status === 'running';
 const isQueued = (t: Task) => t.status === 'queued';
 const isPaused = (t: Task) => t.status === 'paused';
 const isFinished = (t: Task) => ['done', 'error', 'cancelled', 'interrupted'].includes(t.status);
+
+// L'overlay d'une action se ferme sur l'effet observé, jamais sur un délai : pause et arrêt sont
+// coopératifs, leur latence est celle de la page ou du registre en cours. Une tâche disparue de la
+// liste (supprimée ici ou ailleurs) compte comme aboutie, sans quoi l'overlay resterait ouvert.
+const actionAboutie = (p: PendingTaskAction, tasks: Task[]): boolean => {
+  const t = tasks.find((x) => x.id === p.id);
+  if (!t) return true;
+  switch (p.kind) {
+    case 'delete': return false;
+    case 'pause': return !isRunning(t);
+    // `queued` suffit : la reprise a pris, la tâche attend seulement son tour dans la file.
+    case 'resume': return !isPaused(t) && t.status !== 'interrupted';
+    case 'cancel': return isFinished(t);
+  }
+};
 // `owned` absent (tâche héritée) → considérée locale.
 const isOwned = (t: Task) => t.owned !== false;
 
@@ -378,6 +388,10 @@ export default function TasksPage() {
   // en échec : sans cette trace le bouton resterait actif et inviterait à relancer en boucle.
   const [retriedIds, setRetriedIds] = useState<Set<string>>(new Set());
   const [actionError, setActionError] = useState<string | null>(null);
+  // Overlay bloquant tant que l'action cliquée n'a pas pris effet (pause et arrêt sont coopératifs).
+  const {
+    pending, overlayOpen, start: startAction, update: updateAction, done: doneAction, hide: hideAction,
+  } = usePendingTaskAction();
 
   const refresh = useCallback(async () => {
     try { setTasks(await tasksApi.list()); }
@@ -406,6 +420,11 @@ export default function TasksPage() {
     });
   }, [tasks]);
 
+  // L'overlay se ferme dès que l'action cliquée a produit son effet observable.
+  useEffect(() => {
+    if (pending && actionAboutie(pending, tasks)) doneAction();
+  }, [pending, tasks, doneAction]);
+
   // « Demande envoyée » jusqu'à ce que le poste destinataire l'ait appliquée (statut changé).
   useEffect(() => {
     const stillRunning = new Set(tasks.filter(isRunning).map((t) => t.id));
@@ -429,14 +448,42 @@ export default function TasksPage() {
     setRequestedIds((p) => new Map(p).set(id, result.machine_label || tr('otherMachine')));
   };
 
-  const handleCancel = async (id: string) => { noteRequest(id, await cancel(id)); await refresh(); };
-  const handlePause = async (id: string) => {
-    setPausingIds((p) => new Set(p).add(id));
-    noteRequest(id, await pause(id));
-    await refresh();
+  // Les quatre actions suivent le même scénario : ouvrir l'overlay avant l'appel (l'effet n'est pas
+  // immédiat, cf. TaskActionOverlay), puis le laisser se fermer sur le statut. Le `catch` est
+  // indispensable : un overlay qui survivrait à une erreur réseau piégerait l'interface.
+  const runAction = async (
+    action: PendingTaskAction,
+    appel: () => Promise<{ requested: boolean; machine_label: string | null } | void>,
+  ) => {
+    startAction(action);
+    setActionError(null);
+    try {
+      const result = await appel();
+      if (result) {
+        noteRequest(action.id, result);
+        if (result.requested) updateAction({ machine: result.machine_label || tr('otherMachine') });
+      }
+      await refresh();
+      // La suppression n'a pas d'état intermédiaire à observer, et le backend peut la refuser sans
+      // lever (tâche devenue active) : son issue est celle de l'appel, on ferme donc ici plutôt que
+      // d'attendre une disparition qui pourrait ne jamais venir.
+      if (action.kind === 'delete') doneAction();
+    } catch {
+      doneAction();
+      setActionError(tr('actionError'));
+    }
   };
-  const handleResume = async (id: string) => { noteRequest(id, await resume(id)); await refresh(); };
-  const handleDelete = async (id: string) => { await remove(id); await refresh(); };
+
+  const handleCancel = (t: Task) =>
+    runAction({ kind: 'cancel', id: t.id, taskType: t.type }, () => cancel(t.id));
+  const handlePause = (t: Task) => {
+    setPausingIds((p) => new Set(p).add(t.id));
+    return runAction({ kind: 'pause', id: t.id, taskType: t.type }, () => pause(t.id));
+  };
+  const handleResume = (t: Task) =>
+    runAction({ kind: 'resume', id: t.id, taskType: t.type }, () => resume(t.id));
+  const handleDelete = (t: Task) =>
+    runAction({ kind: 'delete', id: t.id, taskType: t.type }, () => remove(t.id));
 
   // Réenfile les pages en échec dans une NOUVELLE tâche (la tâche source n'est pas modifiée :
   // elle peut appartenir à un autre poste). `refreshSummary` réveille le polling et le widget.
@@ -511,7 +558,9 @@ export default function TasksPage() {
             const done = t.processed + t.failed;
             const remaining = t.total - done;
             const pct = t.total > 0 ? (done / t.total) * 100 : 0;
-            const elapsed = elapsedOf(t, now);
+            // Temps de travail cumulé, pause exclue : c'est la bonne base d'estimation, elle se
+            // rapporte au même travail que `done`.
+            const elapsed = taskWorkMs(t, now);
             const eta = isRunning(t) && elapsed != null && done > 0 && remaining > 0 ? (elapsed / done) * remaining : null;
             const isOcr = t.type === 'ocr';
             const isOpen = expanded.has(t.id);
@@ -612,7 +661,9 @@ export default function TasksPage() {
 
                   {/* Temps */}
                   <TableCell>
-                    {isRunning(t) && elapsed != null ? (
+                    {/* En pause aussi : le temps écoulé est désormais figé et juste, il dit
+                        combien de travail a déjà été fourni. */}
+                    {(isRunning(t) || isPaused(t)) && elapsed != null ? (
                       <Typography variant="caption" color="text.secondary">
                         {tr('elapsed', { dur: fmtDuration(elapsed) })}{eta != null ? tr('remaining', { dur: fmtDuration(eta) }) : ''}
                       </Typography>
@@ -640,18 +691,18 @@ export default function TasksPage() {
                           <Tooltip title={tr('actions.pausing')}><span><IconButton size="small" disabled><CircularProgress size={16} /></IconButton></span></Tooltip>
                         ) : (
                           <Tooltip title={owned ? tr('actions.pause') : tr('actions.pauseOther', { machine: machineName })}>
-                            <IconButton size="small" color="primary" onClick={() => handlePause(t.id)}><PauseIcon fontSize="small" /></IconButton>
+                            <IconButton size="small" color="primary" onClick={() => handlePause(t)}><PauseIcon fontSize="small" /></IconButton>
                           </Tooltip>
                         )
                       )}
                       {!requested && isPaused(t) && (
                         <Tooltip title={owned ? tr('actions.resume') : tr('actions.resumeOther', { machine: machineName })}>
-                          <IconButton size="small" color="primary" onClick={() => handleResume(t.id)}><PlayArrowIcon fontSize="small" /></IconButton>
+                          <IconButton size="small" color="primary" onClick={() => handleResume(t)}><PlayArrowIcon fontSize="small" /></IconButton>
                         </Tooltip>
                       )}
                       {!requested && (isRunning(t) || isQueued(t) || isPaused(t)) && (
                         <Tooltip title={owned ? tr('actions.cancel') : tr('actions.cancelOther', { machine: machineName })}>
-                          <IconButton size="small" color="error" onClick={() => handleCancel(t.id)}><CancelIcon fontSize="small" /></IconButton>
+                          <IconButton size="small" color="error" onClick={() => handleCancel(t)}><CancelIcon fontSize="small" /></IconButton>
                         </Tooltip>
                       )}
                       {/* Relance des échecs : une reprise ne refait que les pages « à faire », jamais
@@ -676,7 +727,7 @@ export default function TasksPage() {
                       {/* Suppression : tâche terminée (n'importe quel poste) ou orpheline en attente/pause d'un autre poste. */}
                       {(isFinished(t) || (!owned && (isQueued(t) || isPaused(t)))) && (
                         <Tooltip title={owned ? tr('actions.delete') : tr('actions.deleteOther')}>
-                          <IconButton size="small" onClick={() => handleDelete(t.id)} sx={{ color: 'text.secondary' }}><DeleteIcon fontSize="small" /></IconButton>
+                          <IconButton size="small" onClick={() => handleDelete(t)} sx={{ color: 'text.secondary' }}><DeleteIcon fontSize="small" /></IconButton>
                         </Tooltip>
                       )}
                       <Tooltip title={isOcr ? tr('actions.viewPages') : tr('actions.viewRegistres')}>
@@ -705,6 +756,8 @@ export default function TasksPage() {
       </Table>
     </TableContainer>
     </Paper>
+
+    <TaskActionOverlay pending={pending} open={overlayOpen} onHide={hideAction} />
     </Box>
   );
 }

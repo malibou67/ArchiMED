@@ -65,7 +65,10 @@ import {
   IndexUpdates,
   CollectionMetadata,
 } from '../types';
+import { Task, TaskControlResult } from '../api/tasks';
 import { useTasks } from '../context/TasksContext';
+import TaskActionOverlay from '../components/TaskActionOverlay';
+import { usePendingTaskAction } from '../components/usePendingTaskAction';
 import EmptyState from '../components/EmptyState';
 import Loader from '../components/Loader';
 
@@ -557,7 +560,7 @@ function IndexBuilderDialog({
 }
 
 export default function IndexesPage() {
-  const { t, i18n } = useTranslation(['indexes', 'common']);
+  const { t, i18n } = useTranslation(['indexes', 'common', 'tasks']);
   const locale = i18n.language.startsWith('fr') ? 'fr-FR' : 'en-US';
   const [indexes, setIndexes] = useState<IndexMetadata[]>([]);
   const [collections, setCollections] = useState<CollectionMetadata[]>([]);
@@ -601,6 +604,24 @@ export default function IndexesPage() {
     ),
     [runningTasks, queuedTasks, pausedTasks, interruptedTasks],
   );
+
+  // Overlay bloquant tant que l'action cliquée n'a pas pris effet : la pause d'une indexation
+  // attend la fin du registre en cours, ce qui peut prendre un moment.
+  const {
+    pending, overlayOpen, start: startAction, update: updateAction,
+    done: doneAction, hide: hideAction,
+  } = usePendingTaskAction();
+
+  useEffect(() => {
+    if (!pending) return;
+    const suivi = (liste: Task[]) => liste.some(t => t.type === 'index' && t.index_id === pending.id);
+    const abouti =
+      pending.kind === 'pause' ? !suivi(runningTasks)
+        : pending.kind === 'resume' ? !suivi(pausedTasks) && !suivi(interruptedTasks)
+          : pending.kind === 'cancel' ? !liveIndexTaskIds.has(pending.id)
+            : false;   // 'delete' : résolue à la main au retour de l'appel
+    if (abouti) doneAction();
+  }, [pending, runningTasks, pausedTasks, interruptedTasks, liveIndexTaskIds, doneAction]);
 
   // `rescan` : relire réellement les dossiers OCR au lieu des compteurs publiés. Réservé à une
   // action explicite de l'utilisateur (bouton Actualiser), car c'est plusieurs secondes.
@@ -706,8 +727,15 @@ export default function IndexesPage() {
     }
   };
 
+  // Tâche d'un autre poste : la commande lui a seulement été transmise, elle ne prendra effet
+  // qu'à son prochain relevé (~5 s). L'overlay doit le dire, sinon l'attente est incompréhensible.
+  const noterPosteDistant = (result: TaskControlResult) => {
+    if (result.requested) updateAction({ machine: result.machine_label || t('tasks:otherMachine') });
+  };
+
   const handleCancelGeneration = async (indexId: string) => {
     setCancellingIds(prev => new Set(prev).add(indexId));   // retour visuel immédiat
+    startAction({ kind: 'cancel', id: indexId, taskType: 'index' });
     // Une tâche a été priée de s'arrêter : l'arrêt est coopératif et prend plusieurs secondes,
     // le retour visuel doit donc tenir jusqu'à ce qu'elle disparaisse (useEffect plus bas).
     let attendLaTache = false;
@@ -717,7 +745,7 @@ export default function IndexesPage() {
       const task = [...runningTasks, ...queuedTasks, ...pausedTasks, ...interruptedTasks]
         .find(t => t.type === 'index' && t.index_id === indexId);
       if (task) {
-        await cancelTask(task.id);
+        noterPosteDistant(await cancelTask(task.id));
         attendLaTache = true;
       } else {
         // Aucune tâche associée : reconstruction orpheline (tâche purgée, échouée avant son
@@ -732,7 +760,10 @@ export default function IndexesPage() {
       setError(t('errors.cancel'));
       attendLaTache = false;
     } finally {
+      // Sans tâche à attendre (repli `abortBuild`, ou échec), rien ne viendra fermer l'overlay ni
+      // retirer le marqueur de ligne : on s'en charge ici.
       if (!attendLaTache) {
+        doneAction();
         setCancellingIds(prev => { const s = new Set(prev); s.delete(indexId); return s; });
       }
     }
@@ -742,10 +773,12 @@ export default function IndexesPage() {
     const task = runningTasks.find(t => t.type === 'index' && t.index_id === indexId);
     if (!task) return;
     setPausingIds(prev => new Set(prev).add(indexId));   // retour visuel immédiat
+    startAction({ kind: 'pause', id: indexId, taskType: 'index' });
     try {
-      await pauseTask(task.id);
+      noterPosteDistant(await pauseTask(task.id));
       setSuccess(t('success.pausing'));
     } catch {
+      doneAction();
       setError(t('errors.pause'));
     }
   };
@@ -754,11 +787,13 @@ export default function IndexesPage() {
     const task = pausedTasks.find(t => t.type === 'index' && t.index_id === indexId)
       ?? interruptedTasks.find(t => t.type === 'index' && t.index_id === indexId);
     if (!task) return;
+    startAction({ kind: 'resume', id: indexId, taskType: 'index' });
     try {
-      await resumeTask(task.id);
+      noterPosteDistant(await resumeTask(task.id));
       await loadIndexes();
       setSuccess(t('success.resumed'));
     } catch {
+      doneAction();
       setError(t('errors.resume'));
     }
   };
@@ -797,6 +832,12 @@ export default function IndexesPage() {
 
   const handleDeleteConfirm = async () => {
     if (!indexToDelete) return;
+    // Suppression d'un index, pas d'une tâche : l'overlay porte ses propres libellés, et son issue
+    // est celle de l'appel — rien à observer dans l'état de la page, d'où le `done()` explicite.
+    startAction({
+      kind: 'delete', id: indexToDelete,
+      title: t('overlay.deletingIndex'), detail: t('overlay.deletingIndexDetail'),
+    });
     try {
       await indexesApi.delete(indexToDelete);
       setIndexes(prev => prev.filter(i => i.id !== indexToDelete));
@@ -804,6 +845,7 @@ export default function IndexesPage() {
     } catch {
       setError(t('errors.delete'));
     } finally {
+      doneAction();
       setDeleteDialogOpen(false);
       setIndexToDelete(null);
     }
@@ -1202,6 +1244,8 @@ export default function IndexesPage() {
           <Button onClick={handleDeleteConfirm} color="error" variant="contained" disableElevation>{t('actions.delete')}</Button>
         </DialogActions>
       </Dialog>
+
+      <TaskActionOverlay pending={pending} open={overlayOpen} onHide={hideAction} />
     </Box>
   );
 }

@@ -101,6 +101,10 @@
     "createdAt": "Créé le",
     "status": "Statut"
   },
+  "overlay": {
+    "deletingIndex": "Suppression de l’index…",
+    "deletingIndexDetail": "Ses fichiers sont en cours de suppression."
+  },
   "actions": {
     "viewCurrent": "Voir le contenu de l'index (version actuelle)",
     "view": "Voir le contenu de l'index",

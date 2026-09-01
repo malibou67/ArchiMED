@@ -57,6 +57,21 @@
     "tooltip": "Tasks from another machine are not tracked live: that machine writes its progress to the share about every 5 s. Progress therefore advances in steps, even when everything is fine."
   },
   "retryError": "Could not retry the failed pages.",
+  "actionError": "The action could not be completed.",
+  "overlay": {
+    "pause": "Pausing the task…",
+    "pauseDetail": {
+      "ocr": "It will take effect at the end of the current page.",
+      "index": "It will take effect at the end of the current registre, which may take a while.",
+      "generic": "It will take effect as soon as the current step is done."
+    },
+    "cancel": "Stopping the task…",
+    "cancelDetail": "It stops cleanly: everything already processed is kept.",
+    "resume": "Resuming the task…",
+    "resumeDetail": "It restarts from its last checkpoint.",
+    "delete": "Deleting the task…",
+    "hide": "Hide"
+  },
   "actions": {
     "pausing": "Pausing…",
     "pause": "Pause",

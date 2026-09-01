@@ -31,7 +31,12 @@ export interface Task {
   failed: number;
   current: string | null;
   created_at: string;
+  // Première mise en route de la tâche : une reprise après pause ne la réécrit pas.
   started_at: string | null;
+  // Début du segment d'exécution en cours, `null` dès qu'il est clos (pause, fin, interruption).
+  // Absent des tâches enfilées avant leur introduction — cf. `taskWorkMs`.
+  run_started_at?: string | null;
+  work_ms?: number;   // temps de travail cumulé des segments clos, en ms
   finished_at: string | null;
   error: string | null;
   errors: { page: string; error: string }[];
@@ -77,6 +82,27 @@ export interface Task {
   // c'est ce qui date les données d'une tâche distante.
   heartbeat?: string;
 }
+
+// Temps de travail effectif d'une tâche, temps passé en pause exclu — `null` si elle n'a jamais
+// démarré. Une tâche reprise enchaîne plusieurs segments : `work_ms` cumule ceux qui sont clos,
+// `run_started_at` date celui qui court. Mesurer depuis `started_at` reviendrait à ne compter que
+// le dernier segment alors que `processed` couvre, lui, tout le travail accompli — c'est ce qui
+// faisait s'effondrer le « reste ~ » après une reprise.
+// Repli sur l'ancien calcul pour les tâches écrites avant l'introduction de ces champs (historique
+// local, ou tâche d'un poste pas encore à jour).
+export const taskWorkMs = (t: Task, now: number): number | null => {
+  if (t.work_ms == null && !t.run_started_at) {
+    if (!t.started_at) return null;
+    // Sans date de fin ni tâche en cours (une pause d'avant le compteur), il n'y a rien de
+    // mesurable : `now` compterait l'attente comme du travail.
+    const fin = t.finished_at ? Date.parse(t.finished_at) : t.status === 'running' ? now : null;
+    return fin == null ? null : fin - Date.parse(t.started_at);
+  }
+  // Le segment courant est daté par l'horloge du poste propriétaire : borné à ≥ 0, comme partout
+  // où l'on compare une date distante à la nôtre.
+  const encours = t.run_started_at ? Math.max(0, now - Date.parse(t.run_started_at)) : 0;
+  return (t.work_ms ?? 0) + encours;
+};
 
 // Réponse des endpoints de contrôle (annuler / mettre en pause / reprendre).
 // `requested` : la tâche appartient à un autre poste, la commande lui a été transmise et
