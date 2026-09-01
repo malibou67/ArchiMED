@@ -136,6 +136,13 @@ def run_index_task(task: dict) -> None:
             log.info("Registres réutilisés tels quels " + kv(
                 index=index_id, registres=len(skipped), pages=base))
 
+    def on_phase(phase) -> None:
+        # Étape sans décompte propre : les deux préparations, et les trois étapes de fin, où la
+        # barre est pleine mais où il reste à écrire l'index sur le partage. Sans ce libellé la
+        # ligne paraissait bloquée à « x / x » pendant plusieurs minutes.
+        task['index_phase'] = phase
+        TaskService._save(task)
+
     def on_scan(registres: list, total: int) -> None:
         # La liste des registres est établie par la première passe du runner, pas à l'enfilage :
         # le détail de la tâche est donc vide pendant les premières secondes, le temps du scan.
@@ -150,8 +157,10 @@ def run_index_task(task: dict) -> None:
             index_id,
             on_progress=on_progress, should_cancel=should_cancel, should_pause=should_pause,
             full=bool(task.get('index_full')), on_plan=on_plan, on_scan=on_scan,
+            on_phase=on_phase,
         )
     except Exception as e:
+        task.pop('index_phase', None)   # aucune ligne arrêtée ne garde une étape en cours
         # `generate_index` retire déjà le marqueur `build`, mais il ne peut rien faire si
         # l'échec l'a court-circuité (MemoryError, dossier disparu…). Ce filet garantit qu'un
         # index ne reste jamais affiché « en reconstruction » avec une tâche déjà terminée.
@@ -161,6 +170,10 @@ def run_index_task(task: dict) -> None:
         except Exception:
             pass
         raise
+
+    # Idem pour une fin normale, une pause ou une annulation : la dernière étape publiée
+    # (l'écriture de l'index) n'a plus lieu d'être affichée une fois le run sorti.
+    task.pop('index_phase', None)
 
     log.info("Indexation terminée " + kv(
         id=task['id'], index=index_id, issue=result or 'done',

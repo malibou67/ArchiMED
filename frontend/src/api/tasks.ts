@@ -72,6 +72,9 @@ export interface Task {
   index_full?: boolean;      // reconstruction complète (sinon mise à jour incrémentale)
   // Pages conservées par une mise à jour incrémentale : déjà indexées, hors de `total`.
   index_base?: number;
+  // Étape en cours sans décompte propre (cf. IndexProgress.phase). Les étapes de fin arrivent
+  // barre pleine : le libellé est là pour dire ce qu'on attend, pas pour remplacer le compteur.
+  index_phase?: 'scanning' | 'loading' | 'registres' | 'writing' | 'counting';
   // Origine multi-PC
   machine_id?: string;
   machine_label?: string;

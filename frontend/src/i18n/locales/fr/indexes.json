@@ -14,11 +14,7 @@
     "starting": "Démarrage…",
     "queued": "En file d'attente…",
     "pages": "{{done}} / {{total}} pages",
-    "pageCount": "{{page}} · {{done}} / {{total}} pages",
-    "phase": {
-      "scanning": "Analyse des registres…",
-      "loading": "Chargement de l'index existant…"
-    }
+    "pageCount": "{{page}} · {{done}} / {{total}} pages"
   },
   "builder": {
     "createTitle": "Générer un index",

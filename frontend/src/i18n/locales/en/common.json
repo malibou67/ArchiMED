@@ -32,6 +32,13 @@
     "queued_other": "{{count}} tasks queued",
     "none": "No task running"
   },
+  "indexPhase": {
+    "scanning": "Scanning registers…",
+    "loading": "Loading the existing index…",
+    "registres": "Reading the registers…",
+    "writing": "Writing the index file…",
+    "counting": "Counting the indexed pages…"
+  },
   "taskWidget": {
     "finished": "Task finished",
     "view": "View",

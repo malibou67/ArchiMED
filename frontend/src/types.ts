@@ -168,10 +168,13 @@ export type IndexProgress = {
   total: number;
   current_registre?: string;
   current_page?: string;   // page (XML) en cours de lecture
-  // Étape préparatoire en cours, avant que le décompte de pages n'ait un sens : parcours des
-  // registres ('scanning') puis relecture de l'index existant ('loading'). Sur un gros index
-  // ces deux étapes durent, et la ligne resterait sinon muette pendant tout ce temps.
-  phase?: 'scanning' | 'loading';
+  // Étape en cours quand il n'y a rien à compter. Au début, avant que le décompte de pages
+  // n'ait un sens : parcours des registres ('scanning') puis relecture de l'index existant
+  // ('loading'). À la fin, barre déjà pleine, pendant que l'index est écrit : lecture des
+  // metadata de registre ('registres'), écriture du fichier ('writing') et décompte des pages
+  // indexées ('counting'). Sur un gros index cette fin dure des minutes, et la ligne restait
+  // sinon figée sur « x / x » — ce qui se lit comme un blocage.
+  phase?: 'scanning' | 'loading' | 'registres' | 'writing' | 'counting';
 }
 
 // Une brique d'un index : un modèle OCR d'une collection.

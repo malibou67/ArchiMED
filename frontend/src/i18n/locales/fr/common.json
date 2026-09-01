@@ -32,6 +32,13 @@
     "queued_other": "{{count}} tâches en attente",
     "none": "Aucune tâche en cours"
   },
+  "indexPhase": {
+    "scanning": "Analyse des registres…",
+    "loading": "Chargement de l'index existant…",
+    "registres": "Lecture des registres…",
+    "writing": "Écriture du fichier d'index…",
+    "counting": "Décompte des pages indexées…"
+  },
   "taskWidget": {
     "finished": "Tâche terminée",
     "view": "Voir",

@@ -182,7 +182,11 @@ export default function TaskWidget() {
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                 <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }} title={t.current ?? ''}>
                   {fmtNum(done)} / {fmtNum(t.total)}
-                  {!paused && currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
+                  {/* Idem page Tâches : l'étape de fin d'indexation arrive barre pleine, il n'y
+                      a plus de page en cours, et c'est elle qu'on attend. */}
+                  {paused ? ''
+                    : t.index_phase ? ` · ${tr(`indexPhase.${t.index_phase}`)}`
+                      : currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
                   {t.failed > 0 ? ` · ${tr('taskWidget.failures', { count: t.failed })}` : ''}
                 </Typography>
                 {paused && owned && (

@@ -119,16 +119,18 @@ function StatusChip({ status }: { status: IndexMetadata['status'] }) {
 // Le registre (collection · modèle · registre) ne tient pas sur la ligne et n'apprend rien de
 // plus à chaque rafraîchissement : il reste dans l'infobulle.
 function IndexProgress({ progress, rebuild, locale }: { progress?: IndexProgressType; rebuild?: boolean; locale: string }) {
-  const { t } = useTranslation('indexes');
+  const { t } = useTranslation(['indexes', 'common']);
   const p = progress;
   // Étape préparatoire annoncée par le serveur (parcours des registres, relecture de l'index
-  // existant) : elle n'a pas de décompte, mais dure — la nommer vaut mieux qu'une barre muette.
-  if (p?.phase) {
+  // existant) : elle n'a pas encore de décompte, mais dure — la nommer vaut mieux qu'une barre
+  // muette. Les étapes de **fin** portent le même champ mais arrivent avec des compteurs
+  // complets : elles passent par la branche déterminée plus bas, qui garde la barre pleine.
+  if (p?.phase && !p.total) {
     return (
       <Box>
         <LinearProgress variant="indeterminate" color={rebuild ? 'info' : 'warning'} sx={{ height: 5, borderRadius: 3, mb: 0.5 }} />
         <Typography variant="caption" color="text.disabled">
-          {t(`progress.phase.${p.phase}`)}
+          {t(`common:indexPhase.${p.phase}`)}
         </Typography>
       </Box>
     );
@@ -154,9 +156,12 @@ function IndexProgress({ progress, rebuild, locale }: { progress?: IndexProgress
         </Box>
         <Tooltip title={p.current_registre ?? ''} arrow disableHoverListener={!p.current_registre}>
           <Typography variant="caption" color="text.disabled" noWrap sx={{ display: 'block', maxWidth: 260 }}>
-            {p.current_page
-              ? t('progress.pageCount', { page: p.current_page, ...counts })
-              : t('progress.pages', counts)}
+            {/* Une étape de fin remplace la page lue : il n'y en a plus, et c'est elle qu'on attend. */}
+            {p.phase
+              ? `${t('progress.pages', counts)} · ${t(`common:indexPhase.${p.phase}`)}`
+              : p.current_page
+                ? t('progress.pageCount', { page: p.current_page, ...counts })
+                : t('progress.pages', counts)}
           </Typography>
         </Tooltip>
       </Box>

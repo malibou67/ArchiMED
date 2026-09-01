@@ -1917,7 +1917,7 @@ class IndexesService:
     @staticmethod
     def generate_index(index_id: str, on_progress=None,
                        should_cancel=None, should_pause=None,
-                       *, full: bool = False, on_plan=None, on_scan=None) -> str:
+                       *, full: bool = False, on_plan=None, on_scan=None, on_phase=None) -> str:
         """Construit l'index multi-sources à partir des XML OCR.
         Retourne 'done' | 'cancelled' | 'paused'.
 
@@ -1944,6 +1944,9 @@ class IndexesService:
         `on_scan(registres, total_pages)` livre la liste des registres à la fin de la première
         passe — elle n'est plus calculée à l'enfilage, qui devait sinon parcourir tout le
         partage avant de répondre à la requête,
+        `on_phase(phase)` nomme l'étape en cours quand il ne se passe rien de comptable : les
+        deux préparations, et surtout la finalisation, où l'écriture de l'index se fait barre
+        pleine et pouvait passer pour un blocage,
         `should_cancel()` arrête définitivement, `should_pause()` met en pause via checkpoint."""
         SEP = IndexesService.SOURCE_SEP
         index_dir = IndexesService.get_indexes_dir() / index_id
@@ -2018,6 +2021,23 @@ class IndexesService:
                         pass
 
             last_publish = 0.0
+            last_phase: Optional[str] = None
+
+            def _announce(phase: Optional[str]) -> None:
+                """Nomme l'étape en cours pour la tâche, **au changement seulement**.
+
+                La boucle principale publie chaque seconde avec `phase=None` : prévenir à chaque
+                fois réécrirait le fichier de tâche sur le partage pour redire la même chose."""
+                nonlocal last_phase
+                if phase == last_phase or on_phase is None:
+                    last_phase = phase
+                    return
+                last_phase = phase
+                try:
+                    on_phase(phase)
+                except Exception:
+                    pass
+
             # Pages acquises hors de ce run (registres conservés par la mise à jour incrémentale).
             # Elles sortent de la progression publiée : une mise à jour de 30 pages sur un index de
             # 25 000 doit afficher « 12 / 30 », pas « 24 982 / 25 000 » — barre déjà pleine et ETA
@@ -2047,10 +2067,13 @@ class IndexesService:
                 _set_progress(processed - base, total - base, current, page, phase)
                 if not _save_meta() and not index_dir.exists():
                     return False
-                # Une phase préparatoire ne décrit que la ligne d'index : elle n'a pas de
-                # compteur de pages à donner, et le remonter à la tâche écraserait les siens
-                # par des zéros (barre et ETA repartis de rien à chaque jalon).
-                if phase is None:
+                _announce(phase)
+                # Ce que la garde protège, c'est l'absence de compteurs, pas la présence d'une
+                # phase : les deux étapes préparatoires publient (0, 0), et les remonter
+                # écraserait ceux de la tâche par des zéros (barre et ETA repartis de rien à
+                # chaque jalon). Les étapes de **fin**, elles, ont des compteurs réels et
+                # complets — la barre doit rester pleine pendant qu'elles durent.
+                if phase is None or total > base:
                     _report(processed - base, total - base, current, page)
                 return True
 
@@ -2571,6 +2594,15 @@ class IndexesService:
                 IndexesService._discard_staging(staging_file)
                 return 'cancelled'
 
+            # À partir d'ici tout est indexé, la barre est pleine, et pourtant il reste plusieurs
+            # minutes de travail sur un gros index : un `metadata.json` ouvert par registre, un
+            # index.json de plusieurs centaines de Mo à sérialiser et à pousser sur le partage,
+            # puis un balayage de toutes les occurrences. Sans ces annonces la ligne restait figée
+            # sur « 267 973 / 267 973 » et passait pour un blocage. La valeur de retour est
+            # ignorée, contrairement aux publications de la boucle : une fois la finalisation
+            # engagée, un metadata non écrit n'est pas une raison d'abandonner l'index.
+            _publish(processed, total_xml, None, force=True, phase='registres')
+
             # Carte registre → période (namespacée par source) + bloc sources auto-suffisant.
             registres_map: Dict[str, Dict] = {}
             sources_block: Dict[str, Dict] = {}
@@ -2603,6 +2635,9 @@ class IndexesService:
             # Le dernier delta n'a pas forcément eu son checkpoint : il rejoint l'index ici.
             _merge_delta()
 
+            # La plus longue des étapes de fin, et de loin : tout l'index part sur le partage.
+            _publish(processed, total_xml, None, force=True, phase='writing')
+
             # Écriture atomique : staging puis bascule (l'ancien index reste valide jusqu'ici).
             with open(staging_file, 'w', encoding='utf-8') as f:
                 json.dump({"words": mots_uniques, "registres_map": registres_map,
@@ -2620,7 +2655,9 @@ class IndexesService:
                 except (ValueError, TypeError):
                     pass
 
-            # Pages distinctes réellement indexées (présentes dans au moins un mot).
+            # Pages distinctes réellement indexées (présentes dans au moins un mot). Un balayage
+            # de toutes les occurrences de l'index — des dizaines de millions sur un gros index.
+            _publish(processed, total_xml, None, force=True, phase='counting')
             indexed_pages = set()
             for occs in mots_uniques.values():
                 for occ in occs:

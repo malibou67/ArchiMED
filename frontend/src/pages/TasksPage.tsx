@@ -379,7 +379,7 @@ function TaskRegistresPanel({ taskId, live }: { taskId: string; live: boolean })
 }
 
 export default function TasksPage() {
-  const { t: tr } = useTranslation('tasks');
+  const { t: tr } = useTranslation(['tasks', 'common']);
   const { cancel, pause, resume, remove, hasActivity, refresh: refreshSummary } = useTasks();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
@@ -643,7 +643,10 @@ export default function TasksPage() {
                         />
                         <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block' }} title={t.current ?? ''}>
                           {fmtNum(done)} / {fmtNum(t.total)}
-                          {currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
+                          {/* Étape de fin d'indexation : elle arrive barre pleine, il n'y a plus
+                              de page en cours, et c'est elle qu'on attend — parfois des minutes. */}
+                          {t.index_phase ? ` · ${tr(`common:indexPhase.${t.index_phase}`)}`
+                            : currentLabel(t) ? ` · ${currentLabel(t)}` : ''}
                           {t.failed > 0 ? ` · ${tr('failures', { count: t.failed })}` : ''}
                         </Typography>
                         {/* Les pages déjà indexées sortent de la barre : sans cette mention, un

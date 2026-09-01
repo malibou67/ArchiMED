@@ -14,11 +14,7 @@
     "starting": "Starting…",
     "queued": "In queue…",
     "pages": "{{done}} / {{total}} pages",
-    "pageCount": "{{page}} · {{done}} / {{total}} pages",
-    "phase": {
-      "scanning": "Scanning registers…",
-      "loading": "Loading the existing index…"
-    }
+    "pageCount": "{{page}} · {{done}} / {{total}} pages"
   },
   "builder": {
     "createTitle": "Generate an index",
