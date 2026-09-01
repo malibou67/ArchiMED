@@ -1,7 +1,8 @@
 import { useCallback, useState } from 'react';
 
-/** Action déclenchée depuis une ligne de tableau, dont l'effet n'est pas immédiat. */
-export type TaskActionKind = 'pause' | 'resume' | 'cancel' | 'delete';
+/** Action déclenchée depuis une ligne de tableau, dont l'effet n'est pas immédiat.
+ *  `start` : mise en route d'un traitement (enfilage), dont l'attente est celle de l'appel. */
+export type TaskActionKind = 'pause' | 'resume' | 'cancel' | 'delete' | 'start';
 
 export interface PendingTaskAction {
   kind: TaskActionKind;

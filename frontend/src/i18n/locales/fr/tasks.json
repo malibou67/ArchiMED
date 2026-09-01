@@ -70,6 +70,7 @@
     "resume": "Reprise de la tâche…",
     "resumeDetail": "Elle repart de son dernier point de sauvegarde.",
     "delete": "Suppression de la tâche…",
+    "start": "Démarrage de la tâche…",
     "hide": "Masquer"
   },
   "actions": {

@@ -92,7 +92,13 @@ const fmtDuration = (ms: number) => {
 const isRunning = (t: Task) => t.status === 'running';
 const isQueued = (t: Task) => t.status === 'queued';
 const isPaused = (t: Task) => t.status === 'paused';
+// `interrupted` est terminal (le poste s'est arrêté en pleine tâche) mais reste **reprenable** :
+// le backend accepte `resume` et `cancel` dessus au même titre qu'une pause, en repartant du
+// dernier checkpoint. C'est le cas d'une indexation coupée par un redémarrage du backend.
+const isInterrupted = (t: Task) => t.status === 'interrupted';
 const isFinished = (t: Task) => ['done', 'error', 'cancelled', 'interrupted'].includes(t.status);
+// Statuts d'où l'on peut relancer le travail là où il s'était arrêté.
+const isResumable = (t: Task) => isPaused(t) || isInterrupted(t);
 
 // L'overlay d'une action se ferme sur l'effet observé, jamais sur un délai : pause et arrêt sont
 // coopératifs, leur latence est celle de la page ou du registre en cours. Une tâche disparue de la
@@ -101,11 +107,12 @@ const actionAboutie = (p: PendingTaskAction, tasks: Task[]): boolean => {
   const t = tasks.find((x) => x.id === p.id);
   if (!t) return true;
   switch (p.kind) {
-    case 'delete': return false;
     case 'pause': return !isRunning(t);
     // `queued` suffit : la reprise a pris, la tâche attend seulement son tour dans la file.
-    case 'resume': return !isPaused(t) && t.status !== 'interrupted';
+    case 'resume': return !isResumable(t);
     case 'cancel': return isFinished(t);
+    // 'delete' et 'start' : rien à observer, l'appelant referme au retour de l'appel.
+    default: return false;
   }
 };
 // `owned` absent (tâche héritée) → considérée locale.
@@ -695,12 +702,15 @@ export default function TasksPage() {
                           </Tooltip>
                         )
                       )}
-                      {!requested && isPaused(t) && (
+                      {/* Reprise : une tâche interrompue par un arrêt du poste se relance comme une
+                          pause, depuis son checkpoint. Sans ce bouton ici, une indexation coupée par
+                          un redémarrage du backend n'était reprenable que depuis la page Index. */}
+                      {!requested && isResumable(t) && (
                         <Tooltip title={owned ? tr('actions.resume') : tr('actions.resumeOther', { machine: machineName })}>
                           <IconButton size="small" color="primary" onClick={() => handleResume(t)}><PlayArrowIcon fontSize="small" /></IconButton>
                         </Tooltip>
                       )}
-                      {!requested && (isRunning(t) || isQueued(t) || isPaused(t)) && (
+                      {!requested && (isRunning(t) || isQueued(t) || isResumable(t)) && (
                         <Tooltip title={owned ? tr('actions.cancel') : tr('actions.cancelOther', { machine: machineName })}>
                           <IconButton size="small" color="error" onClick={() => handleCancel(t)}><CancelIcon fontSize="small" /></IconButton>
                         </Tooltip>

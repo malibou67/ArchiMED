@@ -70,6 +70,7 @@
     "resume": "Resuming the task…",
     "resumeDetail": "It restarts from its last checkpoint.",
     "delete": "Deleting the task…",
+    "start": "Starting the task…",
     "hide": "Hide"
   },
   "actions": {

@@ -619,7 +619,8 @@ export default function IndexesPage() {
       pending.kind === 'pause' ? !suivi(runningTasks)
         : pending.kind === 'resume' ? !suivi(pausedTasks) && !suivi(interruptedTasks)
           : pending.kind === 'cancel' ? !liveIndexTaskIds.has(pending.id)
-            : false;   // 'delete' : résolue à la main au retour de l'appel
+            // 'delete' et 'start' : rien à observer, résolues à la main au retour de l'appel.
+            : false;
     if (abouti) doneAction();
   }, [pending, runningTasks, pausedTasks, interruptedTasks, liveIndexTaskIds, doneAction]);
 
@@ -715,6 +716,14 @@ export default function IndexesPage() {
   // a déjà fini), donc la ligne ne repasse jamais par un « Prêt » fugace.
   const handleRegenerate = async (index: IndexMetadata, full = false) => {
     setRegeneratingIds(prev => new Set([...prev, index.id]));
+    // Même raison que le marqueur de ligne, en plus visible : l'enfilage écrit sur le partage et
+    // peut tarder. L'attente est ici celle de l'appel — la tâche n'existe pas encore, il n'y a rien
+    // à observer —, d'où le `done()` du `finally`. Ce bouton sert aussi de « reprendre » à une
+    // reconstruction orpheline, dont plus aucune tâche ne s'occupe.
+    startAction({
+      kind: 'start', id: index.id,
+      title: t('overlay.queueing'), detail: t('overlay.queueingDetail'),
+    });
     setError(null); setSuccess(null);
     try {
       await indexesApi.regenerate(index.id, { full });
@@ -723,6 +732,7 @@ export default function IndexesPage() {
     } catch (e: any) {
       setError(e?.response?.data?.detail ?? t('errors.rebuild'));
     } finally {
+      doneAction();
       setRegeneratingIds(prev => { const s = new Set(prev); s.delete(index.id); return s; });
     }
   };

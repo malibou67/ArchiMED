@@ -103,7 +103,9 @@
   },
   "overlay": {
     "deletingIndex": "Suppression de l’index…",
-    "deletingIndexDetail": "Ses fichiers sont en cours de suppression."
+    "deletingIndexDetail": "Ses fichiers sont en cours de suppression.",
+    "queueing": "Ajout à la file d’indexation…",
+    "queueingDetail": "La préparation écrit sur le partage : cela peut prendre quelques secondes."
   },
   "actions": {
     "viewCurrent": "Voir le contenu de l'index (version actuelle)",

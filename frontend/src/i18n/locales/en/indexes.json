@@ -103,7 +103,9 @@
   },
   "overlay": {
     "deletingIndex": "Deleting the index…",
-    "deletingIndexDetail": "Its files are being removed."
+    "deletingIndexDetail": "Its files are being removed.",
+    "queueing": "Queueing the indexing…",
+    "queueingDetail": "Preparing it writes to the share, which can take a few seconds."
   },
   "actions": {
     "viewCurrent": "View the index content (current version)",
