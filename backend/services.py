@@ -1321,6 +1321,11 @@ class RegistresService:
 # rentabilise qu'à partir de quelques centaines de fichiers.
 INDEX_POOL_MIN_PAGES = 200
 
+# Intervalle minimal entre deux checkpoints d'indexation. Depuis qu'un checkpoint n'écrit que
+# le delta depuis le précédent, il ne coûte plus que le registre qui vient d'être bouclé :
+# l'espacement ne sert plus qu'à ne pas multiplier les allers-retours sur le partage.
+CHECKPOINT_THROTTLE_S = 60.0
+
 
 def adaptive_default_index_workers(cores: int) -> int:
     """Laisse un cœur libre (la machine doit rester utilisable), plafonné à 8.
@@ -1669,6 +1674,7 @@ class IndexesService:
                 (index_dir / f).unlink(missing_ok=True)
             except OSError:
                 pass
+        IndexesService._clear_checkpoint_parts(index_dir / "checkpoint.parts")
 
     @staticmethod
     def abort_build(index_id: str) -> str:
@@ -1760,6 +1766,54 @@ class IndexesService:
         for src in sources_info:
             h.update(f"{src.get('key')}|{src.get('collection_id')}|{src.get('model_name')}\n".encode('utf-8'))
         return h.hexdigest()
+
+    @staticmethod
+    def _load_checkpoint_words(cp: Dict[str, Any], parts_dir: Path) -> Dict[str, List[str]]:
+        """Reconstitue le dictionnaire de mots d'un checkpoint.
+
+        Les occurrences ne sont pas dans l'en-tête mais dans des **segments** numérotés
+        (`checkpoint.parts/`), chacun ne portant que ce qui a été indexé depuis le précédent.
+        Ils sont rejoués dans l'ordre de leur numéro, qui est celui des registres : c'est ce qui
+        fait qu'une reprise produit le même index qu'un run d'une traite. En mise à jour
+        incrémentale, `base.json` porte l'index réutilisé et vient en tête.
+
+        Un checkpoint au **format hérité** (occurrences en ligne, sous `words`) est rendu tel
+        quel : une version antérieure a pu en laisser un, et il doit rester repris, pas jeté.
+
+        Un segment manquant ou illisible lève, comme le ferait un en-tête corrompu : l'appelant
+        y voit le signal de repartir sur une reconstruction complète. Reprendre sur un index
+        amputé serait bien pire — des registres marqués « faits » sans leurs mots."""
+        legacy = cp.get('words')
+        if isinstance(legacy, dict):
+            return legacy
+        names: List[str] = []
+        if cp.get('base'):
+            names.append('base.json')
+        names += [f"{i:04d}.json" for i in range(1, int(cp.get('parts') or 0) + 1)]
+        words: Dict[str, List[str]] = {}
+        for name in names:
+            with open(parts_dir / name, 'r', encoding='utf-8-sig') as f:
+                part = json.load(f)
+            if not isinstance(part, dict):
+                raise json.JSONDecodeError(
+                    f"segment de checkpoint illisible : {name}", '', 0)
+            for mot, occs in part.items():
+                words.setdefault(mot, []).extend(occs)
+        return words
+
+    @staticmethod
+    def _clear_checkpoint_parts(parts_dir: Path) -> None:
+        """Supprime les segments d'un checkpoint, dossier compris. Silencieux : le ménage ne
+        doit jamais faire échouer l'indexation qui l'appelle."""
+        try:
+            for f in parts_dir.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            parts_dir.rmdir()
+        except OSError:
+            pass
 
     @staticmethod
     def _load_incremental_state(index_dir: Path, metadata: Dict[str, Any],
@@ -1896,6 +1950,7 @@ class IndexesService:
         metadata_file = index_dir / "metadata.json"
         staging_file = index_dir / "index.json.tmp"
         checkpoint_file = index_dir / "checkpoint.json"
+        checkpoint_parts = index_dir / "checkpoint.parts"
         final_file = index_dir / "index.json"
 
         # Le cache de vocabulaire garde une copie complète de l'index en RAM (plusieurs
@@ -1926,8 +1981,30 @@ class IndexesService:
                     "phase": phase,
                 }
 
+            # Dernier instant (monotone) où la présence du dossier a été vérifiée, et verdict.
+            last_exists_check = 0.0
+            index_gone = False
+
             def _cancelled() -> bool:
-                return (should_cancel is not None and should_cancel()) or not index_dir.exists()
+                """Annulation demandée, ou index supprimé (ici ou depuis un autre poste).
+
+                `should_cancel()` lit un champ en mémoire : gratuit, évalué à chaque appel. La
+                disparition du dossier, elle, coûte un aller-retour sur le partage — et la boucle
+                du pool appelle cette fonction **une fois par page rendue**, soit des dizaines de
+                milliers de `stat` SMB sur le seul chemin critique. On ne la vérifie donc qu'une
+                fois par seconde : c'est déjà le pas auquel `wait` rend la main, la suppression
+                d'un index reste vue en une seconde."""
+                nonlocal last_exists_check, index_gone
+                if should_cancel is not None and should_cancel():
+                    return True
+                if index_gone:
+                    return True
+                now = time.monotonic()
+                if now - last_exists_check < 1.0:
+                    return False
+                last_exists_check = now
+                index_gone = not index_dir.exists()
+                return index_gone
 
             def _paused() -> bool:
                 return should_pause is not None and should_pause()
@@ -1979,6 +2056,13 @@ class IndexesService:
 
             # État, repris d'un checkpoint si l'indexation avait été mise en pause.
             mots_uniques: Dict[str, List[str]] = {}
+            # Occurrences des registres bouclés depuis le dernier checkpoint. Elles ne rejoignent
+            # `mots_uniques` qu'une fois leur segment écrit : c'est ce qui permet à un checkpoint
+            # de ne coûter que le travail récent (cf. `_save_checkpoint`).
+            delta: Dict[str, List[str]] = {}
+            parts_written = 0        # segments déjà écrits (repris tels quels à une reprise :
+            has_base = False         # les renuméroter écraserait ceux du run d'origine)
+            checkpoint_bytes = 0     # taille du dernier segment écrit (journalisée)
             total_words = 0
             done_registres: set = set()          # clés "key::registre"
             done_state: Dict[str, Dict] = {}     # empreintes des registres réellement indexés
@@ -1995,7 +2079,11 @@ class IndexesService:
                     # mise à jour incrémentale interrompue avait marqués « déjà indexés » : elle serait
                     # silencieusement dégradée en incrémental (mark_rebuild ne purge pas le checkpoint).
                     if not (full and cp_mode == 'incremental'):
-                        mots_uniques = cp.get('words', {})
+                        mots_uniques = IndexesService._load_checkpoint_words(cp, checkpoint_parts)
+                        # La numérotation continue celle du run d'origine : repartir de 1
+                        # écraserait ses segments, dont l'index qu'on vient d'en relire.
+                        parts_written = int(cp.get('parts') or 0)
+                        has_base = bool(cp.get('base'))
                         total_words = cp.get('total_words', 0)
                         done_registres = set(cp.get('done_registres', []))
                         done_state = cp.get('done_state', {}) or {}
@@ -2009,15 +2097,76 @@ class IndexesService:
                 except (OSError, json.JSONDecodeError):
                     pass   # checkpoint illisible : on repart de zéro (reconstruction complète)
 
+            # Un run qui ne reprend rien repart de segments neufs : ceux d'un run précédent
+            # (abandonné, ou terminé sans que le ménage ait pu se faire) ne doivent pas traîner
+            # à côté des nouveaux.
+            if not resumed:
+                IndexesService._clear_checkpoint_parts(checkpoint_parts)
+
             base_registres: set = set()   # registres conservés : la base de progression de ce run
 
+            def _write_part(name: str, payload: Dict[str, List[str]]) -> int:
+                """Écrit un segment de checkpoint (tmp + `os.replace`). Rend sa taille, ou 0 si
+                l'écriture a échoué — le partage peut hoqueter, ce n'est pas fatal."""
+                try:
+                    checkpoint_parts.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    return 0
+                path = checkpoint_parts / name
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                try:
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f, ensure_ascii=False)
+                    size = tmp.stat().st_size
+                    os.replace(tmp, path)
+                    return size
+                except OSError:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return 0
+
+            def _merge_delta() -> None:
+                """Replie le delta dans l'index accumulé.
+
+                L'ordre est préservé de bout en bout : les deltas se succèdent dans l'ordre des
+                registres et `extend` conserve celui des occurrences, donc les clés de
+                `mots_uniques` restent rangées par première apparition. Un index construit en
+                parallèle reste identique à un index séquentiel (cf. la fusion par frontière)."""
+                nonlocal delta
+                if not delta:
+                    return
+                for mot, occs in delta.items():
+                    mots_uniques.setdefault(mot, []).extend(occs)
+                delta = {}
+
             def _save_checkpoint() -> None:
-                # Écriture atomique (tmp + os.replace) : un crash pendant l'écriture ne peut pas
-                # laisser un checkpoint tronqué (la reprise après interruption s'y appuie).
+                """Persiste l'avancement : un **segment** portant les occurrences acquises depuis
+                le dernier appel, puis l'en-tête qui le référence.
+
+                L'ancien format réécrivait tout `mots_uniques` à chaque appel. Le poids d'une
+                sauvegarde suivait donc l'index déjà construit — quelques Mo au cinquième
+                registre, près de 200 au soixantième — pour un coût total quadratique, payé en
+                écritures SMB sur le thread même qui réalimente le pool. En n'écrivant que le
+                delta, une sauvegarde coûte le travail récent, et rien d'autre.
+
+                Écriture atomique (tmp + `os.replace`), segment **avant** en-tête : un segment
+                que l'en-tête ne référence pas est ignoré à la reprise, l'inverse serait un
+                checkpoint qui pointe dans le vide. Un échec laisse le checkpoint précédent en
+                place — la reprise refera quelques registres, elle ne perdra pas l'index."""
+                nonlocal parts_written, checkpoint_bytes
+                if delta:
+                    size = _write_part(f"{parts_written + 1:04d}.json", delta)
+                    if not size:
+                        return   # segment non écrit : l'en-tête ne doit surtout pas le compter
+                    parts_written += 1
+                    checkpoint_bytes = size
                 tmp = checkpoint_file.with_name(f"{checkpoint_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
                 try:
                     with open(tmp, 'w', encoding='utf-8') as f:
-                        json.dump({"mode": mode, "words": mots_uniques, "total_words": total_words,
+                        json.dump({"mode": mode, "parts": parts_written, "base": has_base,
+                                   "total_words": total_words,
                                    "done_registres": sorted(done_registres),
                                    "skipped": sorted(base_registres),
                                    "done_state": done_state}, f, ensure_ascii=False)
@@ -2027,6 +2176,22 @@ class IndexesService:
                         tmp.unlink(missing_ok=True)
                     except OSError:
                         pass
+                _merge_delta()
+
+            def _collapse_checkpoint() -> None:
+                """Réécrit le checkpoint en un unique segment de base, depuis l'index en mémoire.
+
+                Les segments décrivent des **ajouts** : ils ne savent pas dire qu'un registre a
+                disparu. Quand `mots_uniques` est modifié autrement que par ajout — la purge des
+                registres évanouis pendant une pause — les rejouer ressusciterait ce qui vient
+                d'être retiré. On repart donc d'une base compactée. C'est la seule écriture au
+                poids de l'index entier, et elle ne survient qu'à une reprise ayant constaté une
+                disparition."""
+                nonlocal parts_written, has_base
+                IndexesService._clear_checkpoint_parts(checkpoint_parts)
+                parts_written = 0
+                has_base = bool(_write_part('base.json', mots_uniques))
+                _save_checkpoint()
 
             # Première passe : lister (source, registre) et compter le total de XML.
             # Chaque tâche porte sa source pour namespacer pages et registres. L'empreinte de
@@ -2082,6 +2247,7 @@ class IndexesService:
                     done_registres -= to_drop
                     done_state = {rk: st for rk, st in done_state.items() if rk in done_registres}
                     total_words = sum(len(v) for v in mots_uniques.values())
+                    _collapse_checkpoint()
 
             elif not full:
                 # Mise à jour incrémentale : on repart de l'index existant, dont on ne purge que
@@ -2108,6 +2274,11 @@ class IndexesService:
                         done_registres = {rk for rk in current_state if rk not in to_remove}
                         done_state = {rk: previous[rk] for rk in done_registres}
                         mode = 'incremental'
+                        # L'index réutilisé est figé pour tout le run : il part **une seule
+                        # fois**, ici, dans un segment à part. Les checkpoints qui suivront n'ont
+                        # plus alors que leur delta à écrire, quelle que soit la taille de
+                        # l'index — c'est tout l'intérêt du découpage en segments.
+                        has_base = bool(_write_part('base.json', mots_uniques))
                     # words is None → index illisible/incompatible : reconstruction complète.
 
             # Base de la progression : les registres conservés, hors du travail de ce run. À une
@@ -2131,10 +2302,10 @@ class IndexesService:
             # Deuxième passe : indexation, registre par registre (namespacé par source).
             # Checkpoint périodique (throttlé) : permet à une indexation *interrompue* (crash,
             # fermeture) de reprendre au dernier registre terminé, comme une pause explicite.
-            # En mise à jour incrémentale il pèse d'emblée le poids de l'index entier : on
-            # l'espace, et on ne l'écrit que si un registre de plus a été traité depuis le dernier
-            # (sinon il n'apporte rien — le préchargement se refait en quelques secondes).
-            CHECKPOINT_THROTTLE_S = 60.0
+            # Il n'écrit que le delta depuis le précédent (cf. `_save_checkpoint`), donc son coût
+            # ne dépend plus de la taille de l'index ; on l'espace tout de même, et on ne l'écrit
+            # que si un registre de plus a été traité depuis le dernier — sinon il n'apporte
+            # rien qu'un aller-retour sur le partage.
             last_checkpoint_at = time.monotonic()
             last_checkpoint_done = len(done_registres)
             failed_pages = 0   # XML illisibles : comptés ici, journalisés en fin de run
@@ -2176,9 +2347,10 @@ class IndexesService:
                 # Les pages rendues attendent ici, et ne sont fusionnées que registre complet,
                 # **dans l'ordre du disque** : celui des fichiers à l'intérieur d'un registre
                 # (les emplacements de `slots`), et celui des registres entre eux (`order` /
-                # `frontier`). `mots_uniques` reçoit donc ses occurrences exactement dans
-                # l'ordre du chemin séquentiel — un index parallèle est identique à un index
-                # séquentiel, à l'octet près.
+                # `frontier`). L'index reçoit donc ses occurrences exactement dans l'ordre du
+                # chemin séquentiel — un index parallèle est identique à un index séquentiel, à
+                # l'octet près. Elles transitent par `delta`, que `_merge_delta` reverse dans
+                # `mots_uniques` sans jamais rien réordonner.
                 # Ce qui est retenu reste borné : la soumission par fenêtre glissante suit
                 # l'ordre des jobs, donc le pool ne peut pas prendre plus d'une fenêtre
                 # d'avance sur le registre en tête de file.
@@ -2199,6 +2371,14 @@ class IndexesService:
                 draining = False      # pause demandée : on ne réalimente plus la fenêtre
                 label = None
                 last_page = None
+                # Chronométrage par registre. Un ralentissement se diagnostique à l'endroit où le
+                # temps part, pas dans une moyenne : `attente` désigne les workers (ou le
+                # partage), `fusion` le thread principal, `ckpt`/`publication` les écritures, et
+                # `sous-régime` compte les tours où la fenêtre n'était pas pleine, c'est-à-dire
+                # où des workers chômaient. La somme couvre le temps réel du registre.
+                t_wait = t_merge = t_ckpt = t_publish = t_stat = 0.0
+                starved = 0
+                reg_started = time.monotonic()
 
                 def _fill(in_flight: set) -> None:
                     """Complète la fenêtre. `wait` rebinde l'ensemble à chaque tour, d'où le paramètre."""
@@ -2215,7 +2395,12 @@ class IndexesService:
                     # est vue en une seconde au lieu d'attendre le retour d'une page. C'est aussi
                     # bien plus fin que les 200 fichiers du chemin séquentiel.
                     while pending:
-                        if _cancelled():
+                        if len(pending) < window:
+                            starved += 1
+                        _t = time.monotonic()
+                        interrupted = _cancelled()
+                        t_stat += time.monotonic() - _t
+                        if interrupted:
                             stopping = True
                             IndexesService._discard_staging(staging_file)
                             return 'cancelled'
@@ -2224,8 +2409,12 @@ class IndexesService:
                         # double. On laisse donc rentrer ce qui est en vol, sans réalimenter.
                         if not draining and _paused():
                             draining = True
+                        _t = time.monotonic()
                         done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                        t_wait += time.monotonic() - _t
+                        _t = time.monotonic()
                         completed = False   # un registre vient d'être bouclé → publication forcée
+                        finished: List[tuple] = []   # (libellé, pages) des registres bouclés ici
                         for fut in done:
                             idx, page_name, pairs, ok = fut.result()
                             ri = job_reg[idx]
@@ -2236,7 +2425,7 @@ class IndexesService:
                             last_page = page_name
                         # Fusion des registres devenus complets, en tête de file d'abord : un
                         # registre terminé avant son prédécesseur attend son tour, sinon ses
-                        # occurrences passeraient devant dans `mots_uniques`.
+                        # occurrences passeraient devant celles de son prédécesseur.
                         while frontier < len(order) and remaining[order[frontier]] == 0:
                             ri = order[frontier]
                             frontier += 1
@@ -2246,26 +2435,50 @@ class IndexesService:
                                     failed_pages += 1
                                 for mot, coords in prs:
                                     total_words += 1
-                                    mots_uniques.setdefault(mot, []).append(f"{pn} - {coords}")
+                                    delta.setdefault(mot, []).append(f"{pn} - {coords}")
                             done_registres.add(reg_key)
                             done_state[reg_key] = reg_state
                             completed = True
-                            # Le checkpoint n'est écrit qu'entre registres complets : il ne
-                            # reflète jamais un registre à moitié traité (cohérent avec le saut
-                            # via done_registres à la reprise).
-                            now = time.monotonic()
-                            if (now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S
-                                    and len(done_registres) > last_checkpoint_done):
-                                _save_checkpoint()
-                                last_checkpoint_at = now
-                                last_checkpoint_done = len(done_registres)
+                            finished.append((reg_labels[ri], len(_xf)))
+                        t_merge += time.monotonic() - _t
                         if done:
                             if not draining:
                                 _fill(pending)
-                            if not _publish(processed, total_xml, label, last_page, force=completed):
+                            # Le checkpoint n'est écrit qu'entre registres complets (il ne sait
+                            # pas décrire un registre à moitié traité, et la reprise le
+                            # réindexerait en double), et **après** avoir réalimenté la fenêtre :
+                            # pendant son écriture les workers ont ainsi de quoi travailler au
+                            # lieu de se retrouver à sec.
+                            now = time.monotonic()
+                            if (completed and now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S
+                                    and len(done_registres) > last_checkpoint_done):
+                                _save_checkpoint()
+                                last_checkpoint_at = time.monotonic()
+                                t_ckpt += last_checkpoint_at - now
+                                last_checkpoint_done = len(done_registres)
+                            _t = time.monotonic()
+                            alive = _publish(processed, total_xml, label, last_page,
+                                             force=completed)
+                            t_publish += time.monotonic() - _t
+                            if not alive:
                                 stopping = True
                                 IndexesService._discard_staging(staging_file)
                                 return 'cancelled'
+                        if finished:
+                            now = time.monotonic()
+                            span = now - reg_started
+                            pages_done = sum(n for _l, n in finished)
+                            log.info(
+                                "Registre indexé : %s pages=%d durée=%.1fs débit=%.1fp/s "
+                                "attente=%.1fs fusion=%.2fs ckpt=%.2fs/%.1fMo publication=%.2fs "
+                                "stat=%.2fs sous-régime=%d (index %s)",
+                                finished[-1][0], pages_done, span,
+                                pages_done / span if span > 0 else 0.0,
+                                t_wait, t_merge, t_ckpt, checkpoint_bytes / 1e6,
+                                t_publish, t_stat, starved, index_id)
+                            t_wait = t_merge = t_ckpt = t_publish = t_stat = 0.0
+                            starved = 0
+                            reg_started = now
                     if draining:
                         _save_checkpoint()
                         return 'paused'
@@ -2308,6 +2521,8 @@ class IndexesService:
                 label = IndexesService._source_label(reg_dir.name, src)
                 if not _publish(processed, total_xml, label, force=True):
                     return 'cancelled'
+                seq_started = time.monotonic()
+                seq_ckpt = 0.0
 
                 page_prefix = f"{src['key']}{SEP}"
                 for n, xml_file in enumerate(xml_files):
@@ -2321,7 +2536,7 @@ class IndexesService:
                         IndexesService._discard_staging(staging_file)
                         return 'cancelled'
                     total_words, ok = IndexesService._process_xml(
-                        xml_file, mots_uniques, total_words, page_prefix)
+                        xml_file, delta, total_words, page_prefix)
                     if not ok:
                         failed_pages += 1
                     processed += 1
@@ -2338,8 +2553,16 @@ class IndexesService:
                 if (now - last_checkpoint_at >= CHECKPOINT_THROTTLE_S
                         and len(done_registres) > last_checkpoint_done):
                     _save_checkpoint()
-                    last_checkpoint_at = now
+                    last_checkpoint_at = time.monotonic()
+                    seq_ckpt = last_checkpoint_at - now
                     last_checkpoint_done = len(done_registres)
+
+                span = time.monotonic() - seq_started
+                log.info("Registre indexé : %s pages=%d durée=%.1fs débit=%.1fp/s "
+                         "ckpt=%.2fs/%.1fMo (séquentiel, index %s)",
+                         label, len(xml_files), span,
+                         len(xml_files) / span if span > 0 else 0.0,
+                         seq_ckpt, checkpoint_bytes / 1e6, index_id)
 
                 if not _publish(processed, total_xml, label, force=True):
                     return 'cancelled'
@@ -2376,6 +2599,9 @@ class IndexesService:
                         "source_key": src['key'],
                         "collection_titre": src.get('collection_titre'),
                     }
+
+            # Le dernier delta n'a pas forcément eu son checkpoint : il rejoint l'index ici.
+            _merge_delta()
 
             # Écriture atomique : staging puis bascule (l'ancien index reste valide jusqu'ici).
             with open(staging_file, 'w', encoding='utf-8') as f:
@@ -2434,6 +2660,7 @@ class IndexesService:
                 checkpoint_file.unlink(missing_ok=True)  # plus de reprise nécessaire
             except OSError:
                 pass
+            IndexesService._clear_checkpoint_parts(checkpoint_parts)
             return 'done'
 
         except Exception as e:

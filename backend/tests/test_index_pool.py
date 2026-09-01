@@ -137,3 +137,66 @@ def test_repli_sequentiel_si_le_pool_ne_demarre_pas(data_dir, monkeypatch):
     monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', boom)
     assert build("idx1") == 'done'
     assert raw_index(data_dir, "idx1") == attendu
+
+
+def test_le_checkpoint_ne_reecrit_pas_tout_lindex(data_dir, monkeypatch):
+    """L'invariant qui justifie le découpage en segments : une sauvegarde coûte le registre qui
+    vient d'être bouclé, pas l'index accumulé depuis le début.
+
+    Sans lui le coût du run est quadratique — quelques Mo de JSON au cinquième registre, près de
+    deux cents au soixantième — et il est payé en écritures sur le partage, depuis le thread même
+    qui réalimente le pool : les workers se retrouvent à sec pendant que ça écrit."""
+    import services
+
+    make_collection(data_dir, "COL", REGISTRES)
+    use_pool(monkeypatch)
+    monkeypatch.setattr(services, 'CHECKPOINT_THROTTLE_S', 0.0)   # un checkpoint par registre
+
+    # Pause une fois trois registres bouclés : `wait` peut rendre plusieurs pages d'un coup,
+    # compter les tours de boucle ne dirait rien du nombre de registres réellement terminés.
+    vu = {'pages': 0}
+    assert build("idx1",
+                 on_progress=lambda p, t, c, page=None: vu.update(pages=p),
+                 should_pause=lambda: vu['pages'] >= 60) == 'paused'
+
+    parts = sorted((data_dir / "indexes" / "idx1" / "checkpoint.parts").glob("[0-9]*.json"))
+    assert len(parts) > 1   # plusieurs registres bouclés, donc plusieurs segments
+
+    # Un registre n'apparaît que dans le segment écrit après lui : aucun segment ne réécrit ce
+    # qu'un précédent avait déjà sauvegardé.
+    deja_vus = set()
+    for part in parts:
+        segment = json.loads(part.read_text(encoding='utf-8'))
+        registres = {occ.split('_')[0] for occs in segment.values() for occ in occs}
+        assert registres, f"{part.name} est vide"
+        assert not (registres & deja_vus), f"{part.name} réécrit {registres & deja_vus}"
+        deja_vus |= registres
+
+
+def test_reprise_depuis_un_checkpoint_de_lancienne_version(data_dir, monkeypatch):
+    """Un checkpoint monolithique laissé par une version antérieure doit être **repris**, pas
+    jeté : mettre l'application à jour ne doit pas condamner une indexation en pause à tout
+    refaire. Ses occurrences sont relues telles quelles, et la suite du run les prolonge."""
+    make_collection(data_dir, "COL", REGISTRES)
+    use_pool(monkeypatch)
+
+    assert build("ref") == 'done'
+    attendu = raw_index(data_dir, "ref")
+    mots_ref = json.loads(attendu)['words']
+
+    # Checkpoint à l'ancien format : les occurrences en ligne, sous 'words'.
+    fait = "s0::REG1"
+    mots = {mot: [o for o in occs if o.startswith(f"{fait}_")] for mot, occs in mots_ref.items()}
+    mots = {mot: occs for mot, occs in mots.items() if occs}
+    checkpoint = data_dir / "indexes" / "idx1" / "checkpoint.json"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    build("idx1", should_cancel=lambda: True)   # matérialise l'index sans rien indexer
+    checkpoint.write_text(json.dumps({
+        "mode": "full", "words": mots,
+        "total_words": sum(len(o) for o in mots.values()),
+        "done_registres": [fait], "done_state": {},
+    }), encoding='utf-8')
+
+    assert IndexesService.generate_index("idx1") == 'done'
+    assert raw_index(data_dir, "idx1") == attendu   # à l'octet : rien de perdu, rien en double
+    assert not checkpoint.exists()
