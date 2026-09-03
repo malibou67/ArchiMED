@@ -64,6 +64,22 @@ STATS_INTERVAL = _env_int('OCR_STATS_INTERVAL', 60)
 MAX_TASKS_PER_CHILD = 100
 EMPTY_CACHE_EVERY = _env_int('OCR_EMPTY_CACHE_EVERY', 20)
 
+# ── Chien de garde du pool ────────────────────────────────────────────────────────
+# Un pool qui ne rend plus une seule page ne se débloque jamais de lui-même : le recyclage
+# des workers n'a lieu qu'à la barrière de fin de lot, et cette barrière attend justement les
+# pages qui ne reviennent pas. Vu en production le 01/09/2026 : 40 h sans une page, les quatre
+# workers vivants (la pause a bien eu quatre process à tuer) et `échecs=0` — car rien ne lève
+# d'exception dans ce cas. Deux façons de se figer ainsi, toutes deux muettes :
+#   - VRAM saturée : le pilote NVIDIA (WDDM) ne rend pas d'OOM, il déborde en mémoire système
+#     et le débit tombe à zéro. La trace « Charge OCR » montrait 12,6 Go réservés sur 12.
+#   - lecture ou écriture bloquée sur le partage réseau : le redirecteur SMB n'a pas de délai.
+# Passé `STALL_TIMEOUT` sans une page rendue, on tue le pool et on rejoue les pages restantes
+# du lot dans un pool neuf — le recyclage étant le remède connu. Au-delà de `STALL_RETRIES`
+# tentatives on laisse remonter l'erreur : le repli séquentiel prend la suite.
+# 0 désactive le chien de garde (comportement d'avant).
+STALL_TIMEOUT = _env_int('OCR_STALL_TIMEOUT', 600)
+STALL_RETRIES = _env_int('OCR_STALL_RETRIES', 2)
+
 # Pages en échec détaillées gardées dans la tâche. La liste est resérialisée à **chaque**
 # écriture : sans plafond, une panne durable (partage coupé en pleine tâche) la fait grossir
 # page après page et rend chaque sauvegarde plus lente que la précédente. Le compte exact reste
@@ -84,8 +100,14 @@ ERRORS_KEPT = 200
 #   W=8 → effondrement : 48 s/page, VRAM saturée
 # Au-delà de ~4 workers la latence par page monte (12,2 → 16,9 s) : le gain sature alors
 # que le risque de saturation grandit. Le défaut vise donc ~80 % de la VRAM, pas 100 %.
-# Des scans plus grands consomment davantage : baisser le budget si besoin.
-GPU_VRAM_PER_WORKER_GB = 2.0
+#
+# Budget porté de 2,0 à 3,0 Go le 03/09/2026 : sur la collection HPC (RTX 3060 12 Go,
+# 4 workers), la trace « Charge OCR » relève 3,0 à 4,5 Go réservés **par worker**, soit
+# jusqu'à 13,7 Go demandés à une carte de 12 — et le pool s'est figé deux fois pour de bon.
+# À 2,0 Go le plafond calculé (5 workers) ne bridait rien ; à 3,0 il tombe à 3 sur cette
+# carte. Des scans plus petits coûtent moins : remonter le budget via le réglage UI ou
+# `OCR_GPU_VRAM_PER_WORKER_GB` sur les postes qui le supportent.
+GPU_VRAM_PER_WORKER_GB = 3.0
 GPU_VRAM_RESERVE_GB = 1.5
 
 
@@ -371,31 +393,58 @@ def _ocr_worker_page(task):
     finally:
         if im is not None:
             im.close()
+        # Attention : `_release_worker_memory()` appelle `empty_cache()`, qui synchronise le
+        # device. Sur une carte saturée, le worker peut rester bloqué **ici**, XML déjà écrit
+        # et résultat jamais rendu — la page sera refaite à la reprise du lot (l'écriture est
+        # atomique, la refaire est sans dommage). C'est le seul endroit du worker où une page
+        # réussie peut ne pas remonter au parent.
         _release_worker_memory()
 
 
+def _workers_detail(worker_stats: Dict[int, Dict[str, Any]]) -> str:
+    """Empreinte des workers du lot en cours, en une ligne (trace de charge et pool figé)."""
+    return ' | '.join(
+        f"pid={st['pid']} n={st['n']}"
+        + (f" rss={st['rss']}Mo" if st.get('rss') is not None else '')
+        + (f" vram={st['vram_res']}/{st['vram_alloc']}Mo" if 'vram_res' in st else '')
+        for st in sorted(worker_stats.values(), key=lambda st: st['pid']))
+
+
+def _since(seconds: float) -> str:
+    """Durée courte pour le journal : « 45s », « 12m30s », « 2h05m00s ».
+
+    Les heures comptent : le chien de garde peut être désactivé (`OCR_STALL_TIMEOUT=0`), et la
+    trace de charge annonce alors un `depuis=` qui grandit sans borne."""
+    h, rest = divmod(int(seconds), 3600)
+    m, s = divmod(rest, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
 def _log_worker_load(task, worker_stats: Dict[int, Dict[str, Any]], in_flight: int,
-                     last_log: float) -> float:
+                     last_log: float, idle: float = 0.0) -> float:
     """Trace périodique de l'empreinte des workers. Retourne la date de la dernière écriture.
 
     C'est la courbe qui dit si un worker dérive : VRAM réservée qui monte sans jamais redescendre
     → le pilote NVIDIA déborde en mémoire système et c'est toute la machine qui ralentit, pas
     seulement l'OCR. Une ligne par minute au plus : le journal tourne à 5 Mo, on ne le remplit
-    pas avec de la métrique."""
+    pas avec de la métrique.
+
+    `idle` est l'âge de la dernière page rendue : la ligne est aussi émise quand **rien** ne se
+    termine (champ `depuis=`), sinon un pool figé et un journal muet se ressemblent trait pour
+    trait — c'est ce qui a laissé passer 40 h d'arrêt le 01/09/2026."""
     if STATS_INTERVAL <= 0:
         return last_log
     now = time.time()
     if now - last_log < STATS_INTERVAL:
         return last_log
-    detail = ' | '.join(
-        f"pid={st['pid']} n={st['n']}"
-        + (f" rss={st['rss']}Mo" if st.get('rss') is not None else '')
-        + (f" vram={st['vram_res']}/{st['vram_alloc']}Mo" if 'vram_res' in st else '')
-        for st in sorted(worker_stats.values(), key=lambda st: st['pid']))
     log.info("Charge OCR " + kv(
         id=task['id'],
         restantes=task['total'] - task['processed'] - task['failed'],
-        en_vol=in_flight, workers=detail))
+        en_vol=in_flight,
+        depuis=_since(idle) if idle >= STATS_INTERVAL else None,
+        workers=_workers_detail(worker_stats)))
     return now
 
 
@@ -780,8 +829,9 @@ class OcrService:
 
         Le pool est **renouvelé** tous les `max_tasks_per_child` pages par worker : c'est ce qui
         empêche une tâche de plusieurs dizaines de milliers de pages de ralentir la machine
-        entière (voir `MAX_TASKS_PER_CHILD`). Voir `_run_pool_batch` pour le pourquoi de ce
-        découpage plutôt que du paramètre standard."""
+        entière (voir `MAX_TASKS_PER_CHILD`). Voir `_run_pool_attempt` pour le pourquoi de ce
+        découpage plutôt que du paramètre standard, et `_run_pool_batch` pour la reprise d'un
+        lot que le chien de garde a dû interrompre."""
         states = task['page_states']
         by_index = {i: p for i, p in todo}
         tasks = [(i, p['collection'], p['registre'], p['page'], ocr_model_id) for i, p in todo]
@@ -802,7 +852,33 @@ class OcrService:
     @staticmethod
     def _run_pool_batch(task, touched, states, by_index, batch, seg_model_id, ocr_model_id,
                         device, workers, threads, mixed, on_page_done, progress) -> None:
+        """Traite un lot, en le rejouant dans un pool neuf si le précédent s'est figé.
+
+        Le chien de garde (voir `STALL_TIMEOUT`) tue un pool qui ne rend plus rien ; les pages
+        qu'il n'a pas rendues sont encore à `0` dans `page_states` — c'est cette liste-là qu'on
+        repasse au pool suivant, pas le lot entier. Après `STALL_RETRIES` reprises infructueuses
+        on laisse remonter : `run_ocr_task` bascule alors en repli séquentiel."""
+        left = list(batch)
+        for attempt in range(1 + max(0, STALL_RETRIES)):
+            left = OcrService._run_pool_attempt(
+                task, touched, states, by_index, left, seg_model_id, ocr_model_id,
+                device, workers, threads, mixed, on_page_done, progress)
+            if not left or OcrService._stop_requested(task):
+                return
+            if attempt < STALL_RETRIES:   # la dernière passe renonce, elle ne « reprend » rien
+                log.warning("Reprise du lot dans un pool neuf " + kv(
+                    id=task['id'], pages=len(left), tentative=attempt + 1, sur=STALL_RETRIES))
+        raise RuntimeError(
+            f"Pool OCR figé : {len(left)} page(s) n'ont rien rendu après "
+            f"{STALL_RETRIES + 1} tentative(s)")
+
+    @staticmethod
+    def _run_pool_attempt(task, touched, states, by_index, batch, seg_model_id, ocr_model_id,
+                          device, workers, threads, mixed, on_page_done, progress) -> List:
         """Traite un lot dans un pool neuf, puis rend les process — donc leur VRAM et leur tas.
+
+        Retourne les entrées du lot restées sans réponse : vide si tout est passé (cas normal)
+        ou si l'arrêt a été demandé, la liste des pages figées si le chien de garde a tiré.
 
         On renouvelle le pool nous-mêmes au lieu de passer `max_tasks_per_child` à
         `ProcessPoolExecutor` : ce paramètre **bloque le pool**. Quand un worker atteint son
@@ -840,6 +916,8 @@ class OcrService:
                 except StopIteration:
                     return
 
+        stalled = False
+        last_done = time.time()
         try:
             pending: set = set()
             _fill(pending)
@@ -849,6 +927,22 @@ class OcrService:
                 if OcrService._stop_requested(task):
                     break
                 done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    # Rien n'est revenu cette seconde-ci : cadence normale sur de gros scans,
+                    # mais c'est aussi le seul signe visible d'un pool figé. On garde la trace
+                    # vivante et on tranche au bout de `STALL_TIMEOUT`.
+                    idle = time.time() - last_done
+                    if 0 < STALL_TIMEOUT < idle:
+                        stalled = True
+                        log.error("Pool figé " + kv(
+                            id=task['id'], depuis=_since(idle),
+                            restantes=task['total'] - task['processed'] - task['failed'],
+                            en_vol=len(pending), workers=_workers_detail(progress['stats'])))
+                        break
+                    progress['last_log'] = _log_worker_load(
+                        task, progress['stats'], len(pending), progress['last_log'], idle)
+                    continue
+                last_done = time.time()
                 for fut in done:
                     idx, col, label, ok, err, stats = fut.result()
                     progress['stats'][stats['pid']] = stats
@@ -864,28 +958,34 @@ class OcrService:
                             registre=by_index[idx]['registre'], page=by_index[idx]['page'], err=err))
                     task['current'] = label
                     on_page_done(col, by_index[idx]['registre'])
-                if done:
-                    _fill(pending)
-                    TaskService._save_throttled(task)
-                    progress['last_log'] = _log_worker_load(
-                        task, progress['stats'], len(pending), progress['last_log'])
+                _fill(pending)
+                TaskService._save_throttled(task)
+                progress['last_log'] = _log_worker_load(
+                    task, progress['stats'], len(pending), progress['last_log'])
         finally:
             # `shutdown` annule les pages en file mais laisse les workers finir celle qu'ils
             # ont commencée : sur un arrêt demandé on tue, sinon « Annuler » laisse le GPU
-            # occupé pendant des minutes (et la tâche suivante démarre par-dessus).
+            # occupé pendant des minutes (et la tâche suivante démarre par-dessus). Sur un pool
+            # figé on tue aussi, et pour la même raison en plus fort : ces workers-là ne
+            # finiront jamais leur page, `shutdown(wait=True)` attendrait indéfiniment.
             stopping = OcrService._stop_requested(task)
-            if stopping:
+            if stopping or stalled:
                 killed = _kill_pool(executor)
                 if killed:
-                    log.info("Arrêt demandé " + kv(workers_interrompus=killed))
+                    log.info(("Arrêt demandé " if stopping else "Pool figé, workers tués ")
+                             + kv(workers_interrompus=killed))
             pool_registry.discard(executor)
             try:
                 # Lot terminé normalement : on **attend** la sortie des workers, sinon le pool
                 # du lot suivant démarrerait pendant que l'ancien tient encore sa VRAM — deux
                 # jeux de workers à la fois, exactement la saturation qu'on cherche à éviter.
-                executor.shutdown(wait=not stopping, cancel_futures=True)
+                executor.shutdown(wait=not (stopping or stalled), cancel_futures=True)
             except Exception:
                 pass  # pool déjà tué : rien à attendre
+        # Les pages jamais rendues sont restées à 0 : rien n'est marqué avant le retour du
+        # worker. Celles dont le XML était écrit mais le résultat perdu seront refaites — le
+        # coût d'une page contre un lot bloqué pour de bon.
+        return [t for t in batch if states[t[0]] == 0] if stalled else []
 
 
 def _plan_todo(task: Dict[str, Any], pages: List[Dict[str, str]]) -> List:
