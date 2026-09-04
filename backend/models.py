@@ -48,6 +48,29 @@ class CollectionMetadata(BaseModel):
     # Anomalies de niveau collection persistées au dernier sync (ocr_orphelin…).
     anomalies: List[str] = []
 
+class RegistresSyncRequest(BaseModel):
+    """Corps du sync ciblé : les dossiers de `scans/` à synchroniser, tels qu'ils s'appellent
+    sur le disque. Une liste plutôt qu'un dossier unique parce que l'outil de copie externe
+    travaille par lots : un appel par lot évite de rouvrir le metadata.json de la collection
+    une fois par registre."""
+    folders: List[str]
+
+class RegistreSyncResult(BaseModel):
+    folder_name: str
+    # `cree` : quelque chose a été écrit (metadata du registre, dossier ocr/, ou son entrée
+    # dans la collection). `inchange` : déjà à jour, aucune écriture. `introuvable` : pas de
+    # dossier de ce nom dans scans/ — signalé sans faire échouer le reste du lot.
+    resultat: Literal['cree', 'inchange', 'introuvable']
+
+class RegistresSyncResponse(CollectionMetadata):
+    """Même forme que la réponse du sync complet (les types du front se réutilisent tels
+    quels), plus le résultat par dossier demandé."""
+    resultats: List[RegistreSyncResult] = []
+    # Toujours `false` : un sync ciblé ne lit pas toute l'arborescence, il ne peut donc pas
+    # recalculer `anomalies` (ocr_orphelin, registre_hors_scans), qui reste ce que le dernier
+    # sync complet y a laissé. Cf. docs/API.md.
+    anomalies_recalculees: bool = False
+
 class RegistreMetadata(BaseModel):
     id: str
     titre: str

@@ -23,6 +23,27 @@ All endpoints are served under `/api`. There is also a top-level health check:
 - `PUT /api/collections/{collection_id}` — Update a collection
 - `POST /api/collections/{collection_id}/sync` — Rebuild one collection's registers from the filesystem
 - `POST /api/collections/{collection_id}/sync/stream` — Same rebuild as an NDJSON stream, with per-register progress
+- `POST /api/collections/{collection_id}/registres/sync` — Targeted sync: rebuild **only** the
+  named register folders. Body `{"folders": ["HPC-00400-00999-1979", …]}`. Meant for the
+  external copy tool, which drops a few folders into `scans/` and calls this at the end of each
+  batch: a folder with no `metadata.json` is invisible to the app, and a full sync would walk
+  the whole collection (599 registers, ~400 000 files for HPC) for the three folders that moved.
+  Each folder is probed and written by the very same code as the full sync — so the pagination
+  `pattern`/`start`/`end` stay frozen as of the first sync, `stats` is only written when absent,
+  and no manually entered field is ever overwritten — and only its own entry in `registres[]` is
+  replaced. A folder missing from `scans/` is reported as `introuvable` without failing the
+  batch. Returns the full-sync response shape plus, per requested folder,
+  `resultats: [{folder_name, resultat}]` where `resultat` is `cree` (something was written),
+  `inchange` (already up to date, nothing written) or `introuvable`.
+  **Limit — collection-level anomalies are not recomputed.** `ocr_orphelin:<x>` and
+  `registre_hors_scans:<x>` are derived by comparing the whole set of `ocr/` folders with the
+  whole set of `scans/` registers, which this endpoint deliberately does not read. The
+  collection's `anomalies` field is therefore left exactly as the last full sync wrote it, and
+  the response says so with `anomalies_recalculees: false`. **The full sync remains the
+  reference for that field**: run it when the anomaly report matters.
+  Returns `400` on an empty list or a folder name that is not a plain directory name, `404` if
+  the collection folder does not exist, and `409` if the collection has no `metadata.json` yet
+  (bootstrapping a collection needs the whole tree, so it is the full sync's job).
 - `GET /api/collections/scan` — Scan `data/collections` and report the status of every collection/register
 - `GET /api/collections/scan/stream` — Same scan as an NDJSON progress stream
 - `POST /api/collections/sync-all` — Rebuild the register lists of every collection

@@ -3,8 +3,9 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
-from models import CollectionMetadata, CollectionCreate, CollectionUpdate, ScanReport, CollectionStatsResponse
-from services import CollectionsService
+from models import (CollectionMetadata, CollectionCreate, CollectionUpdate, ScanReport,
+                    CollectionStatsResponse, RegistresSyncRequest, RegistresSyncResponse)
+from services import CollectionsService, CollectionNotSynced
 from stats_service import CollectionStatsService
 
 router = APIRouter()
@@ -142,6 +143,41 @@ def sync_collection(collection_id: str):
         return result
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/{collection_id}/registres/sync", response_model=RegistresSyncResponse)
+def sync_registres(collection_id: str, request: RegistresSyncRequest):
+    """Synchronise **seulement** les registres nommés, sans reparcourir la collection.
+
+    Destinée à l'outil de copie externe, qui dépose quelques dossiers dans `scans/` puis
+    appelle cette route en fin de lot : le sync complet reparcourrait toute la collection
+    (599 registres et ~400 000 fichiers pour HPC) pour trois dossiers qui ont bougé.
+
+    Chaque dossier est sondé et écrit par le même code que le sync complet — le motif de
+    pagination reste donc figé au premier sync — et seule son entrée de `registres[]` est
+    remplacée. Un dossier absent de `scans/` est rendu `introuvable` sans faire échouer le lot.
+
+    **Les anomalies de niveau collection ne sont pas recalculées** (`anomalies_recalculees`
+    vaut toujours `false`) : elles demandent de comparer l'ensemble des dossiers de `scans/` et
+    de `ocr/`. Le sync complet reste la référence pour ce champ."""
+    folders = [f.strip() for f in request.folders if f and f.strip()]
+    if not folders:
+        raise HTTPException(status_code=400, detail="Indiquez au moins un dossier de registre.")
+    # `folders` vient d'un script, pas d'un chemin d'URL : un nom composé sortirait de scans/.
+    invalides = [f for f in folders if f in ('.', '..') or '/' in f or '\\' in f]
+    if invalides:
+        raise HTTPException(status_code=400,
+                            detail=f"Nom de dossier invalide : {', '.join(invalides)}")
+    try:
+        result = CollectionsService.sync_registres(collection_id, folders)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        return result
+    except HTTPException:
+        raise
+    except CollectionNotSynced as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
