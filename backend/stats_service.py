@@ -77,7 +77,7 @@ class IndexStatsService:
         loaded = IndexesService._load_index(index_id)
         if loaded is None:
             return None
-        total_unique, base_entries, words, registres_map = loaded
+        total_unique, base_entries, words, registres_map, _sources = loaded
 
         sorted_folders = sorted(registres_map.keys(), key=len, reverse=True)
         folder_of_page: Dict[str, Optional[str]] = {}
@@ -183,7 +183,7 @@ class IndexStatsService:
         loaded = IndexesService._load_index(index_id)
         if loaded is None:
             return None
-        _total, base_entries, _words, registres_map = loaded
+        _total, base_entries, _words, registres_map, _sources = loaded
 
         # Top mots significatifs : > 2 lettres et hors mots-outils
         top_words = sorted(
@@ -221,7 +221,7 @@ class IndexStatsService:
         loaded = IndexesService._load_index(index_id)
         if loaded is None:
             return None
-        _total, _base, words, registres_map = loaded
+        _total, _base, words, registres_map, _sources = loaded
 
         folder_of_page = computed["folder_of_page"]
         # folder -> décennie (None si période absente)

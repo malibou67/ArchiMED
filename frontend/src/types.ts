@@ -297,6 +297,14 @@ export type MultiSearchResponse = {
   fuzzy_threshold?: number;
 }
 
+// Progression d'une recherche en flux. `load` compte des octets d'index.json, `scan` des mots
+// parcourus ; `parse` et `build` n'ont pas de granularité (total = 0 → barre indéterminée).
+export type SearchProgress = {
+  phase: 'load' | 'parse' | 'scan' | 'build';
+  current: number;
+  total: number;
+}
+
 export type VocabularyEntry = {
   word: string;
   occurrences: number;

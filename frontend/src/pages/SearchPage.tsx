@@ -13,6 +13,7 @@ import {
   IconButton,
   InputAdornment,
   InputLabel,
+  LinearProgress,
   Menu,
   MenuItem,
   Pagination,
@@ -48,7 +49,7 @@ import { indexesApi } from '../api/indexes';
 import { collectionsApi } from '../api/collections';
 import { registresApi } from '../api/registres';
 import { usePageLoading } from '../context/LoadingContext';
-import { IndexMetadata, IndexStats, MultiSearchResponse, RegistreSummary } from '../types';
+import { IndexMetadata, IndexStats, MultiSearchResponse, RegistreSummary, SearchProgress } from '../types';
 import { useSearchParams } from 'react-router-dom';
 import {
   ViewerEntry,
@@ -68,7 +69,17 @@ import EmptyState from '../components/EmptyState';
 
 export default function SearchPage() {
   const { t, i18n } = useTranslation('search');
-  const fmtN = (n: number) => n.toLocaleString(i18n.language.startsWith('fr') ? 'fr-FR' : 'en-US');
+  const locale = i18n.language.startsWith('fr') ? 'fr-FR' : 'en-US';
+  const fmtN = (n: number) => n.toLocaleString(locale);
+  // Temps réellement attendu, du clic au résultat affiché : « en 8,4 s », « en 1 min 12 s ».
+  const elapsedLabel = (ms: number): string => {
+    const total = ms / 1000;
+    if (total >= 60) return t('summary.elapsedMinutes', { minutes: Math.floor(total / 60), seconds: Math.round(total % 60) });
+    return t('summary.elapsedSeconds', { seconds: total.toLocaleString(locale, { maximumFractionDigits: 1 }) });
+  };
+  // Octets en Mo, avec une décimale tant que le fichier est petit (« 0 / 0 Mo » ne dirait rien).
+  const fmtMo = (bytes: number, total: number) => (bytes / (1024 * 1024)).toLocaleString(
+    locale, { maximumFractionDigits: total < 10 * 1024 * 1024 ? 1 : 0 });
   const indexStatsLabel = (stats: IndexStats): string => {
     const parts = [t('indexStats.words', { count: stats.total_unique_words, val: fmtN(stats.total_unique_words) })];
     if (stats.total_pages != null) parts.push(t('indexStats.pages', { count: stats.total_pages, val: fmtN(stats.total_pages) }));
@@ -85,6 +96,8 @@ export default function SearchPage() {
   const [yearRange, setYearRange] = useState<[number, number] | null>(null);
   const [loadingYearRange, setLoadingYearRange] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [searchProgress, setSearchProgress] = useState<SearchProgress | null>(null);
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [searchResult, setSearchResult] = useState<MultiSearchResponse | null>(null);
   const [viewerList, setViewerList] = useState<ViewerEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -249,23 +262,29 @@ export default function SearchPage() {
     const q = (queryOverride ?? query).trim();
     if (!selectedIndex || !q) return;
     setSearching(true);
+    setSearchProgress(null);
+    setElapsedMs(null);
     setError(null);
     setSearchResult(null);
     setViewerList([]);
     setRegPage(1);
     setExpandedRegistres(new Set());
     setSelectedWords(new Set());
+    const startedAt = performance.now();
     try {
       const yFrom = (yearRange && yearBounds && yearRange[0] !== yearBounds[0]) ? yearRange[0] : undefined;
       const yTo = (yearRange && yearBounds && yearRange[1] !== yearBounds[1]) ? yearRange[1] : undefined;
-      const data = await indexesApi.search(selectedIndex, q, yFrom, yTo, fuzzyThreshold);
+      const data = await indexesApi.searchStream(selectedIndex, q, yFrom, yTo, fuzzyThreshold, setSearchProgress);
+      setElapsedMs(performance.now() - startedAt);
       setSearchResult(data);
       setViewerList(data.pages.map(pageToViewerEntry));
       setResultTab('results');
     } catch (err: any) {
-      setError(err?.response?.data?.detail ?? t('errors.search'));
+      // Le flux NDJSON ne passe pas par axios : l'erreur arrive dans err.message.
+      setError(err?.response?.data?.detail ?? err?.message ?? t('errors.search'));
     } finally {
       setSearching(false);
+      setSearchProgress(null);
     }
   };
 
@@ -547,12 +566,33 @@ export default function SearchPage() {
           {resultTab === 'results' && (
           <>
           {/* ── Recherche en cours ───────────────────── */}
+          {/* Barre déterminée pendant le chargement de l'index et le parcours du vocabulaire ;
+              indéterminée pour les phases trop courtes pour être chiffrées (parse, build). */}
           {searching && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', mt: 10, gap: 2, color: 'text.secondary' }}>
-              <CircularProgress />
-              <Typography variant="body2" color="text.secondary">
-                {t('searchInProgress')}
-              </Typography>
+            <Box sx={{ maxWidth: 520, mx: 'auto', mt: 10, px: 1 }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', mb: 1, gap: 2 }}>
+                <Typography variant="body2" color="text.secondary" noWrap>
+                  {searchProgress ? t(`progress.${searchProgress.phase}`) : t('searchInProgress')}
+                </Typography>
+                {searchProgress && searchProgress.total > 0 && (
+                  <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+                    {searchProgress.phase === 'load'
+                      ? t('progress.megabytes', {
+                          current: fmtMo(searchProgress.current, searchProgress.total),
+                          total: fmtMo(searchProgress.total, searchProgress.total),
+                        })
+                      : t('progress.words', {
+                          current: fmtN(searchProgress.current),
+                          total: fmtN(searchProgress.total),
+                        })}
+                  </Typography>
+                )}
+              </Box>
+              {searchProgress && searchProgress.total > 0 ? (
+                <LinearProgress variant="determinate" value={Math.round((searchProgress.current / searchProgress.total) * 100)} />
+              ) : (
+                <LinearProgress />
+              )}
             </Box>
           )}
 
@@ -573,7 +613,10 @@ export default function SearchPage() {
                 <Typography variant="body2" color="text.secondary">
                   {(() => {
                     const nbRegistres = groupByRegistre(searchResult.pages).length;
-                    return <><strong style={{ color: '#2e7d32' }}>{t('summary.pages', { count: searchResult.count })}</strong> {t('summary.in')} <strong>{t('summary.registres', { count: nbRegistres })}</strong></>;
+                    return <>
+                      <strong style={{ color: '#2e7d32' }}>{t('summary.pages', { count: searchResult.count })}</strong> {t('summary.in')} <strong>{t('summary.registres', { count: nbRegistres })}</strong>
+                      {elapsedMs != null && <Box component="span" sx={{ color: 'text.disabled' }}> · {elapsedLabel(elapsedMs)}</Box>}
+                    </>;
                   })()}
                 </Typography>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>

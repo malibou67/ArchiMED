@@ -2995,22 +2995,45 @@ class IndexesService:
         """Recherche multi-termes avec intersection des pages.
         Retourne uniquement les pages où TOUS les termes sont présents.
         Si year_from/year_to sont fournis, filtre par période de registre."""
-        index_file = IndexesService.get_indexes_dir() / index_id / "index.json"
-        if not index_file.exists():
-            return None
+        result = None
+        for event in IndexesService.search_words_iter(
+            index_id, query, year_from=year_from, year_to=year_to,
+            fuzzy_threshold=fuzzy_threshold,
+        ):
+            if event.get('type') == 'result':
+                result = event['result']
+        return result
 
-        with open(index_file, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
+    # Cadence des événements de progression du scan : on ne regarde l'horloge que tous les
+    # _SCAN_STEP mots (l'appel système, répété sur des millions de mots, se verrait), et on
+    # n'émet qu'au plus une fois par _SCAN_INTERVAL seconde.
+    _SCAN_STEP = 20_000
+    _SCAN_INTERVAL = 0.15
 
-        # Compatibilité : ancien format (dict plat) vs nouveau format ({"words": ..., "registres_map": ...})
-        if "words" in data and isinstance(data["words"], dict):
-            index = data["words"]
-            registres_map: Dict[str, Dict] = data.get("registres_map", {})
-            sources_block: Dict[str, Dict] = data.get("sources", {})
-        else:
-            index = data
-            registres_map = {}
-            sources_block = {}
+    @staticmethod
+    def search_words_iter(
+        index_id: str,
+        query: str,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        fuzzy_threshold: Optional[int] = None,
+    ):
+        """Variante en flux de search_words : émet des événements de progression
+        ({'type': 'progress', 'phase': 'load'|'parse'|'scan'|'build', 'current', 'total'})
+        puis un événement final ({'type': 'result', 'result': {...} ou None}).
+
+        Une recherche sur un gros index dure une minute : ces événements permettent à la page
+        de recherche d'afficher une vraie barre plutôt qu'un spinner."""
+        loaded = None
+        for event in IndexesService._load_index_iter(index_id, need_base=False):
+            if event.get('type') == 'loaded':
+                loaded = event['index']
+            else:
+                yield event
+        if loaded is None:
+            yield {"type": "result", "result": None}
+            return
+        _total_unique, _base, index, registres_map, sources_block = loaded
 
         query_clean = query.strip().lower()
         raw_terms = [t.strip("'\"") for t in query_clean.split() if t.strip("'\"")]
@@ -3037,10 +3060,21 @@ class IndexesService:
 
         # Pour chaque terme : {page_name: {word: [occ_strings]}}
         term_page_data: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        scanned = 0
+        total_scan = len(index) * max(len(terms), 1)
+        last_emit = time.monotonic()
+        yield {"type": "progress", "phase": "scan", "current": 0, "total": total_scan}
         for term in terms:
             term_page_data[term] = {}
             stem = IndexesService._term_stem(term, fuzzy_threshold)
             for word, occs in index.items():
+                scanned += 1
+                if scanned % IndexesService._SCAN_STEP == 0:
+                    now = time.monotonic()
+                    if now - last_emit >= IndexesService._SCAN_INTERVAL:
+                        last_emit = now
+                        yield {"type": "progress", "phase": "scan",
+                               "current": scanned, "total": total_scan}
                 if not IndexesService._term_matches(term, word, fuzzy_threshold, stem):
                     continue
                 for occ in occs:
@@ -3050,10 +3084,16 @@ class IndexesService:
                         if folder not in allowed_folders:
                             continue
                     term_page_data[term].setdefault(page, {}).setdefault(word, []).append(occ)
+        # Le parcours est fini : on le dit, sinon la barre resterait sur le dernier point émis.
+        yield {"type": "progress", "phase": "scan", "current": total_scan, "total": total_scan}
 
         if not terms:
-            return {"query": query, "terms": terms, "pages": [], "count": 0,
-                    "year_from": year_from, "year_to": year_to}
+            yield {"type": "result", "result": {
+                "query": query, "terms": terms, "pages": [], "count": 0,
+                "year_from": year_from, "year_to": year_to}}
+            return
+
+        yield {"type": "progress", "phase": "build", "current": 0, "total": 0}
 
         # Intersection des pages (toutes présentes dans chaque terme)
         page_sets = [set(term_page_data[t].keys()) for t in terms]
@@ -3085,7 +3125,7 @@ class IndexesService:
             pages.append({"page_name": page_name, "words": words_on_page,
                           "source": source, "registre": registre})
 
-        return {
+        yield {"type": "result", "result": {
             "query": query,
             "terms": terms,
             "pages": pages,
@@ -3093,12 +3133,14 @@ class IndexesService:
             "year_from": year_from,
             "year_to": year_to,
             "fuzzy_threshold": fuzzy_threshold,
-        }
+        }}
 
-    # Cache de l'index : index_id -> (mtime, total_unique, base_entries, words, registres_map).
-    # base_entries = liste non filtrée {word, occurrences, pages}, pré-triée par mot.
+    # Cache de l'index : index_id -> (mtime, total_unique, base_entries, words, registres_map, sources).
+    # base_entries = liste non filtrée {word, occurrences, pages}, pré-triée par mot ; None tant
+    # qu'aucun appelant ne l'a réclamée (voir _load_index_iter).
     # words = dict mot -> ["page - coords", ...] (sert au détail des pages d'un mot).
     # registres_map = folder -> {id, titre, periode} (sert aux statistiques).
+    # sources = clé de namespace -> {collection_titre, collection_folder, model_name} (sert à la recherche).
     # Invalidé automatiquement quand index.json change (comparaison de mtime).
     #
     # **Borné à un seul index** : une entrée pèse en RAM plusieurs fois son poids sur disque
@@ -3108,32 +3150,94 @@ class IndexesService:
     # mémoire, finissait de remplir la machine. On ne sert qu'un index à la fois.
     _vocab_cache: Dict[str, tuple] = {}
 
+    # Taille des blocs de lecture d'index.json : assez gros pour ne rien coûter, assez petit
+    # pour donner une progression fluide sur un fichier de plusieurs centaines de Mo.
+    _READ_CHUNK = 4 * 1024 * 1024
+
     @staticmethod
-    def _load_index(index_id: str) -> Optional[tuple]:
-        """Retourne (total_unique, base_entries, words, registres_map) depuis le cache
+    def _load_index(index_id: str, need_base: bool = True) -> Optional[tuple]:
+        """Retourne (total_unique, base_entries, words, registres_map, sources) depuis le cache
         si index.json est inchangé, sinon (re)parse le fichier et met le cache à jour."""
+        loaded = None
+        for event in IndexesService._load_index_iter(index_id, need_base=need_base):
+            if event.get('type') == 'loaded':
+                loaded = event['index']
+        return loaded
+
+    @staticmethod
+    def _load_index_iter(index_id: str, need_base: bool = True):
+        """Variante en flux de _load_index : émet la progression de la lecture du fichier
+        ({'type': 'progress', 'phase': 'load'|'parse', ...}) puis
+        {'type': 'loaded', 'index': (...) ou None}. Rien n'est émis sur un cache hit.
+
+        `need_base=False` laisse base_entries à None : la recherche n'en a pas besoin, et le
+        construire lui ferait payer un parcours complet du vocabulaire en plus. Il est bâti à
+        la demande, sans relire le fichier, au premier appel qui le réclame."""
         index_file = IndexesService.get_indexes_dir() / index_id / "index.json"
         if not index_file.exists():
             IndexesService._vocab_cache.pop(index_id, None)
-            return None
+            yield {"type": "loaded", "index": None}
+            return
 
         mtime = index_file.stat().st_mtime
         cached = IndexesService._vocab_cache.get(index_id)
         if cached and cached[0] == mtime:
-            return cached[1], cached[2], cached[3], cached[4]
+            _mtime, total_unique, base_entries, words, registres_map, sources = cached
+            if need_base and base_entries is None:
+                base_entries = IndexesService._build_base_entries(words)
+                IndexesService._vocab_cache[index_id] = (
+                    mtime, total_unique, base_entries, words, registres_map, sources)
+            yield {"type": "loaded",
+                   "index": (total_unique, base_entries, words, registres_map, sources)}
+            return
 
-        with open(index_file, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
+        # json.load() lit de toute façon le fichier d'un bloc : le découper ne fait que rendre
+        # visibles les dizaines de secondes que prend un gros index (surtout depuis le partage
+        # réseau). On lit dans un tampon pré-dimensionné plutôt que d'accumuler des morceaux à
+        # recoller : le pic mémoire reste celui de json.load (mesuré : 725 Mo sur l'index de
+        # 181 Mo, contre 914 Mo avec un ''.join), et le compteur est en octets exacts.
+        size = index_file.stat().st_size
+        buf = bytearray(size)
+        view = memoryview(buf)
+        read = 0
+        with open(index_file, 'rb') as f:
+            while read < size:
+                n = f.readinto(view[read:read + IndexesService._READ_CHUNK])
+                if not n:
+                    break
+                read += n
+                yield {"type": "progress", "phase": "load", "current": read, "total": size}
+        view.release()
+        del buf[read:]        # le fichier a pu rétrécir depuis le stat()
+        yield {"type": "progress", "phase": "parse", "current": 0, "total": 0}
+        text = buf.decode('utf-8-sig')
+        buf.clear()           # libéré avant le parse : les deux copies ne coexistent pas
+        data = json.loads(text)
+        del text
 
         # Compatibilité : ancien format (dict plat) vs nouveau format ({"words": ...})
         if isinstance(data, dict) and "words" in data and isinstance(data["words"], dict):
             words = data["words"]
             registres_map = data.get("registres_map", {})
+            sources = data.get("sources", {})
         else:
             words = data
             registres_map = {}
+            sources = {}
 
-        base_entries = [
+        base_entries = IndexesService._build_base_entries(words) if need_base else None
+
+        total_unique = len(words)
+        IndexesService._vocab_cache.clear()   # un seul index en mémoire à la fois
+        IndexesService._vocab_cache[index_id] = (
+            mtime, total_unique, base_entries, words, registres_map, sources)
+        yield {"type": "loaded",
+               "index": (total_unique, base_entries, words, registres_map, sources)}
+
+    @staticmethod
+    def _build_base_entries(words: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+        """Liste non filtrée {word, occurrences, pages}, pré-triée par mot."""
+        entries = [
             {
                 "word": word,
                 "occurrences": len(occs),
@@ -3142,21 +3246,17 @@ class IndexesService:
             for word, occs in words.items()
         ]
         # Pré-tri par mot : sert de tri secondaire stable pour les autres tris.
-        base_entries.sort(key=lambda e: e["word"])
-
-        total_unique = len(words)
-        IndexesService._vocab_cache.clear()   # un seul index en mémoire à la fois
-        IndexesService._vocab_cache[index_id] = (mtime, total_unique, base_entries, words, registres_map)
-        return total_unique, base_entries, words, registres_map
+        entries.sort(key=lambda e: e["word"])
+        return entries
 
     @staticmethod
     def get_word_pages(index_id: str, word: str) -> Optional[Dict]:
         """Détail d'un mot exact : pages où il apparaît, avec coordonnées.
         Retourne None si l'index est absent ; un résultat à 0 page si le mot est inconnu."""
-        loaded = IndexesService._load_index(index_id)
+        loaded = IndexesService._load_index(index_id, need_base=False)
         if loaded is None:
             return None
-        _total_unique, _base, words, _registres_map = loaded
+        _total_unique, _base, words, _registres_map, _sources = loaded
 
         occs = words.get(word, [])
         # Regrouper les occurrences par page : page -> liste de "coords"
@@ -3188,7 +3288,7 @@ class IndexesService:
         loaded = IndexesService._load_index(index_id)
         if loaded is None:
             return None
-        total_unique, base_entries, _words, _registres_map = loaded
+        total_unique, base_entries, _words, _registres_map, _sources = loaded
         return total_unique, base_entries
 
     @staticmethod

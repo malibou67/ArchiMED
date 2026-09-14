@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from typing import List, Optional
@@ -289,6 +291,38 @@ def search_in_index(
     if result is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
     return result
+
+
+@router.get("/{index_id}/search/stream")
+def search_in_index_stream(
+    index_id: str,
+    q: str = Query(..., description="Mot(s) à rechercher (ex: cancer du sein)"),
+    year_from: Optional[int] = Query(None, description="Année de début (incluse)"),
+    year_to: Optional[int] = Query(None, description="Année de fin (incluse)"),
+    fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100, description="Seuil de similarité (0-100). 100 = exact/substring, <100 = fuzzy."),
+):
+    """Même recherche que /search, mais en flux NDJSON : une ligne JSON par événement de
+    progression ({"type": "progress", "phase", "current", "total"}), puis le résultat
+    ({"type": "result", "result": {...}}). Une recherche sur un gros index prend une minute :
+    le flux permet d'afficher une barre de progression au lieu d'un spinner."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="La requête de recherche est vide")
+
+    def gen():
+        try:
+            for event in IndexesService.search_words_iter(
+                index_id, q, year_from=year_from, year_to=year_to,
+                fuzzy_threshold=fuzzy_threshold,
+            ):
+                if event.get('type') == 'result' and event.get('result') is None:
+                    yield json.dumps({"type": "error", "detail": "Index non trouvé ou non encore généré"},
+                                     ensure_ascii=False) + "\n"
+                    return
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as e:  # surface l'erreur dans le flux, sans casser la connexion
+            yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # ── Statistiques ──────────────────────────────────────────────────────────────

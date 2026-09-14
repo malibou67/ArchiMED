@@ -1,4 +1,5 @@
 import api from './config';
+import { readNdjson } from './ndjson';
 import {
   IndexMetadata,
   IndexCreate,
@@ -7,6 +8,7 @@ import {
   IndexUpdates,
   IndexPreview,
   MultiSearchResponse,
+  SearchProgress,
   VocabularyResponse,
   WordPagesResponse,
   CorpusStatsResponse,
@@ -83,6 +85,33 @@ export const indexesApi = {
     if (fuzzyThreshold !== undefined && fuzzyThreshold < 100) params.fuzzy_threshold = fuzzyThreshold;
     const response = await api.get(`/api/indexes/${indexId}/search`, { params, timeout: 0 });
     return response.data;
+  },
+
+  // Même recherche que search(), mais en flux NDJSON : onProgress est appelé à chaque
+  // événement de progression (chargement de l'index puis parcours du vocabulaire), et la
+  // promesse résout sur le résultat final. Sur un gros index, l'attente dépasse la minute.
+  searchStream: async (
+    indexId: string,
+    query: string,
+    yearFrom: number | undefined,
+    yearTo: number | undefined,
+    fuzzyThreshold: number | undefined,
+    onProgress: (p: SearchProgress) => void,
+  ): Promise<MultiSearchResponse> => {
+    const params = new URLSearchParams({ q: query });
+    if (yearFrom !== undefined) params.set('year_from', String(yearFrom));
+    if (yearTo !== undefined) params.set('year_to', String(yearTo));
+    if (fuzzyThreshold !== undefined && fuzzyThreshold < 100) params.set('fuzzy_threshold', String(fuzzyThreshold));
+    let result: MultiSearchResponse | null = null;
+    await readNdjson(`/api/indexes/${indexId}/search/stream?${params}`, {}, (event) => {
+      if (event.type === 'progress') {
+        onProgress({ phase: event.phase, current: event.current, total: event.total });
+      } else if (event.type === 'result') {
+        result = event.result;
+      }
+    });
+    if (!result) throw new Error('Résultat de recherche manquant');
+    return result;
   },
 
   getWords: async (

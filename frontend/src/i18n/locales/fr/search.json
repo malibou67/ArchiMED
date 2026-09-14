@@ -45,7 +45,17 @@
     "pages_other": "{{count}} pages trouvées",
     "in": "dans",
     "registres_one": "{{count}} registre différent",
-    "registres_other": "{{count}} registres différents"
+    "registres_other": "{{count}} registres différents",
+    "elapsedSeconds": "en {{seconds}} s",
+    "elapsedMinutes": "en {{minutes}} min {{seconds}} s"
+  },
+  "progress": {
+    "load": "Chargement de l'index…",
+    "parse": "Analyse de l'index…",
+    "scan": "Recherche des mots…",
+    "build": "Constitution des résultats…",
+    "megabytes": "{{current}} / {{total}} Mo",
+    "words": "{{current}} / {{total}} mots"
   },
   "similarityChip": "Ressemblance ≥ {{value}}%",
   "exportMenu": {
