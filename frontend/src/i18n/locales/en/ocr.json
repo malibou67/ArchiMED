@@ -105,8 +105,8 @@
   "viewTasks": "View tasks",
   "queued_one": "{{count}} page added to the OCR queue.",
   "queued_other": "{{count}} pages added to the OCR queue.",
-  "skipped_one": "1 page skipped: its image could not be found on disk. Resynchronise the collection.",
-  "skipped_other": "{{count}} pages skipped: their images could not be found on disk. Resynchronise the collection.",
+  "skipped_one": "1 page skipped: its image was not found in the scan folders. Reload the page to refresh the page list.",
+  "skipped_other": "{{count}} pages skipped: their images were not found in the scan folders. Reload the page to refresh the page list.",
   "busySelection": {
     "title_one": "1 selected register is already being transcribed",
     "title_other": "{{count}} selected registers are already being transcribed",

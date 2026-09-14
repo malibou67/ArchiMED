@@ -105,8 +105,8 @@
   "viewTasks": "Voir les tâches",
   "queued_one": "{{count}} page ajoutée à la file d'attente OCR.",
   "queued_other": "{{count}} pages ajoutées à la file d'attente OCR.",
-  "skipped_one": "1 page ignorée : son image est introuvable sur le disque. Resynchronisez la collection.",
-  "skipped_other": "{{count}} pages ignorées : leurs images sont introuvables sur le disque. Resynchronisez la collection.",
+  "skipped_one": "1 page ignorée : son image est introuvable dans les dossiers de scans. Rechargez la page pour rafraîchir la liste des pages.",
+  "skipped_other": "{{count}} pages ignorées : leurs images sont introuvables dans les dossiers de scans. Rechargez la page pour rafraîchir la liste des pages.",
   "busySelection": {
     "title_one": "1 registre sélectionné est déjà en cours de transcription",
     "title_other": "{{count}} registres sélectionnés sont déjà en cours de transcription",

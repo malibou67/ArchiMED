@@ -140,7 +140,15 @@ def _diagnose_pagination(
 
     Détecte (ou réutilise) un motif `prefix{num}ext`, calcule les bornes, les trous dans
     la numérotation, les doublons et les pages hors-motif. Si un motif est fourni
-    (depuis le metadata), il est conservé tel quel ; sinon il est déduit des fichiers."""
+    (depuis le metadata), il est conservé tel quel ; sinon il est déduit des fichiers.
+
+    ⚠ Le résultat est **lossy par construction** : `pattern`, `start`/`end` et `gaps` ne
+    portent que des **numéros**, la largeur du champ numérique est perdue — et elle n'est
+    même pas uniforme dans un registre donné (on trouve `_9.jpg`, `_79.jpg` et `_080.jpg`
+    côte à côte). Ces champs servent à **lire** des noms — tri, détection de trous, badges
+    du listing — jamais à en fabriquer : régénérer `pattern.replace('{num}', str(n))`
+    produit des fichiers qui n'existent pas. Pour obtenir les noms d'un registre, passer par
+    `RegistresService.list_scan_pages` ou `OcrService.scope_pages`."""
     result: Dict[str, Any] = {
         'pattern': known_pattern,
         'start': known_start,
@@ -1378,7 +1386,10 @@ class RegistresService:
 
     @staticmethod
     def list_scan_pages(collection_id: str, registre_folder: str) -> List[str]:
-        """Liste les fichiers image (scans) d'un registre, triés par numéro de page"""
+        """Liste les fichiers image (scans) d'un registre, dans l'ordre des pages.
+
+        Source de vérité des noms de pages : c'est le disque, pas la pagination du metadata,
+        qui ne porte que des numéros (cf. la mise en garde de `_diagnose_pagination`)."""
         scans_dir = Path(DATA_DIR) / "collections" / collection_id / "scans" / registre_folder
         if not scans_dir.exists():
             return []
@@ -1389,9 +1400,13 @@ class RegistresService:
             if f.is_file() and f.suffix.lower() in image_extensions
         ]
 
+        # Tous les nombres du nom, dans l'ordre : le préfixe étant commun à tout le registre,
+        # c'est le numéro de page qui départage, puis celui de la page hors-motif. Un simple
+        # « dernier nombre avant l'extension » classait `X_110_1.jpg` en première position, et
+        # `_080.jpg` se trie bien avec `_79.jpg` (le remplissage par zéros n'est pas uniforme).
+        # Le nom départage à égalité de nombres, pour un ordre stable.
         def sort_key(name: str):
-            match = re.search(r'(\d+)\.[^.]+$', name)
-            return int(match.group(1)) if match else 0
+            return ([int(n) for n in re.findall(r'\d+', name)], name)
 
         pages.sort(key=sort_key)
         return pages

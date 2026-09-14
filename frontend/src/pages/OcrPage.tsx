@@ -53,7 +53,8 @@ import { useTranslation } from 'react-i18next';
 import { collectionsApi } from '../api/collections';
 import { modelsApi } from '../api/models';
 import { systemApi, SystemRequirements } from '../api/system';
-import { ocrApi, OcrPageRef } from '../api/ocr';
+import { ocrApi, OcrPageRef, OcrScopeItem, OcrScopeOnly } from '../api/ocr';
+import { registresApi } from '../api/registres';
 import { tasksApi, taskWorkMs, Task } from '../api/tasks';
 import { useTasks } from '../context/TasksContext';
 import EnvStatusChip from '../components/ocr/EnvStatusChip';
@@ -65,62 +66,6 @@ const fmtNum = (n: number) => n.toLocaleString('fr-FR');
 
 // Normalisation pour la recherche : minuscules, sans diacritiques.
 const norm = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-
-function makePatternRegex(pattern: string, capturing: boolean): RegExp {
-  const parts = pattern.split(/(\{num\}|\{extra_page\})/);
-  const regex = parts.map(p => {
-    if (p === '{num}') return capturing ? '(\\d+)' : '\\d+';
-    if (p === '{extra_page}') return capturing ? '(.+?)' : '.+';
-    return p.replace(/[.+*?^${}()|[\]\\]/g, '\\$&');
-  }).join('');
-  return new RegExp('^' + regex + '$');
-}
-
-function sortPages(pages: string[], mainPattern?: string, extraPattern?: string): string[] {
-  const mainRx = mainPattern ? makePatternRegex(mainPattern, true) : null;
-  const extraRx = extraPattern ? makePatternRegex(extraPattern, true) : null;
-  const info = pages.map(file => {
-    const mainM = mainRx?.exec(file);
-    if (mainM) return { file, mainNum: parseInt(mainM[1]), isExtra: false, extraId: '' };
-    const extraM = extraRx?.exec(file);
-    if (extraM) return { file, mainNum: parseInt(extraM[1]), isExtra: true, extraId: extraM[2] ?? '' };
-    return { file, mainNum: 0, isExtra: false, extraId: '' };
-  });
-  return info.sort((a, b) => {
-    if (a.mainNum !== b.mainNum) return a.mainNum - b.mainNum;
-    if (a.isExtra !== b.isExtra) return a.isExtra ? 1 : -1;
-    return a.extraId.localeCompare(b.extraId, undefined, { numeric: true });
-  }).map(i => i.file);
-}
-
-// Les noms de pages sont reconstruits depuis la pagination détectée, pas lus sur le disque :
-// il faut donc sauter les trous relevés à la synchronisation, sinon on proposerait — et on
-// enfilerait — des pages qui n'existent pas (le backend les écarte, mais l'arbre mentirait).
-// Mémorisé par objet registre : `getColCheckState` appelle ceci pour chaque registre à chaque rendu.
-const pagesCache = new WeakMap<RegistreSummary, string[]>();
-
-function getPages(reg: RegistreSummary): string[] {
-  const cached = pagesCache.get(reg);
-  if (cached) return cached;
-  let pages: string[] = [];
-  if (reg.pages_pattern && reg.pages_start != null && reg.pages_end != null) {
-    const gaps = new Set(reg.pages_gaps ?? []);
-    const main: string[] = [];
-    for (let i = reg.pages_start; i <= reg.pages_end; i++) {
-      if (gaps.has(i)) continue;
-      main.push(reg.pages_pattern.replace('{num}', String(i)));
-    }
-    pages = sortPages([...main, ...(reg.extra_pages ?? [])], reg.pages_pattern, reg.extra_pagination?.pattern);
-  }
-  pagesCache.set(reg, pages);
-  return pages;
-}
-
-// Dénominateur des cases à cocher : même source que les clés réellement sélectionnables,
-// sinon un registre à trous ne pourrait jamais atteindre l'état « tout coché ».
-function getRegPageCount(reg: RegistreSummary): number {
-  return getPages(reg).length;
-}
 
 function PanelHeader({ title }: { title: string }) {
   return (
@@ -183,6 +128,13 @@ export default function OcrPage() {
 
   const [expandedCollections, setExpandedCollections] = useState<Set<string>>(new Set());
   const [expandedRegistres, setExpandedRegistres] = useState<Set<string>>(new Set());
+  // Sélection à deux étages, exclusifs l'un de l'autre pour un registre donné :
+  //  - `selectedRegistres` : registres cochés en entier, une seule entrée `collection/registre`.
+  //    C'est ce qui rend instantané le cochage d'une collection de 1200 registres — on ne
+  //    matérialise pas 780 000 clés, et le backend développera le périmètre depuis le disque.
+  //  - `selectedPages` : pages cochées une à une, clés `collection/registre/page`.
+  // Décocher une page d'un registre coché en entier le « matérialise » (cf. `togglePage`).
+  const [selectedRegistres, setSelectedRegistres] = useState<Set<string>>(new Set());
   const [selectedPages, setSelectedPages] = useState<Set<string>>(new Set());
   const [treeFilter, setTreeFilter] = useState('');
   // Filtre à 3 états sur le statut de transcription (pour le modèle OCR choisi).
@@ -191,6 +143,13 @@ export default function OcrPage() {
   // Stems déjà transcrits, par clé `${cKey}/${regFolder}/${modelId}` (chargés au dépliage).
   const [doneCache, setDoneCache] = useState<Map<string, Set<string>>>(new Map());
   const fetchingDone = useRef<Set<string>>(new Set());
+
+  // Noms réels des pages, par clé `${cKey}/${regFolder}`, lus sur le disque au dépliage.
+  // Seule source de noms : la pagination du metadata ne porte que des numéros et perd la
+  // largeur du champ numérique, si bien que `pattern.replace('{num}', n)` fabriquait des
+  // fichiers inexistants (`_1.jpg` pour un `_001.jpg` sur le disque).
+  const [pagesCache, setPagesCache] = useState<Map<string, string[]>>(new Map());
+  const fetchingPages = useRef<Set<string>>(new Set());
 
   // Historique des tâches OCR terminées (pour l'estimation de durée).
   const [pastOcrTasks, setPastOcrTasks] = useState<Task[]>([]);
@@ -220,9 +179,9 @@ export default function OcrPage() {
   const busyLabel = (from: string) =>
     from ? t('tree.busyOn', { machine: from }) : t('tree.busyHere');
 
-  // Création de la tâche : 'checking' = sondage des transcriptions existantes (un appel par
-  // registre), 'creating' = POST /api/ocr/run (le backend vérifie chaque image sur le disque).
-  // Sur des dizaines de milliers de pages les deux durent, d'où l'overlay bloquant.
+  // Création de la tâche : 'checking' = sondage des transcriptions des pages cochées à
+  // l'unité (un appel par registre concerné), 'creating' = POST /api/ocr/run, où le backend
+  // développe les périmètres depuis le disque. La seconde dure, d'où l'overlay bloquant.
   const [launchPhase, setLaunchPhase] = useState<null | 'checking' | 'creating'>(null);
   const launching = launchPhase !== null;
   // Avancement du sondage, registre par registre (seul repère pendant la phase 'checking').
@@ -234,10 +193,18 @@ export default function OcrPage() {
   // Pages que le backend a écartées faute d'image sur le disque (registre modifié depuis
   // la dernière synchronisation) : à signaler, sinon le compte annoncé serait inexpliqué.
   const [skippedNotice, setSkippedNotice] = useState(0);
-  // Confirmation d'écrasement. `all` = la sélection telle quelle (l'ordre est celui du
-  // traitement), `doneCount` = combien y sont déjà transcrites avec le modèle choisi,
-  // `missing` = le sous-ensemble restant. null = pas de dialogue.
-  const [overwrite, setOverwrite] = useState<{ all: string[]; doneCount: number; missing: string[] } | null>(null);
+  // Confirmation d'écrasement. `pages`/`scopes` = la sélection telle quelle (l'ordre est celui
+  // du traitement), `doneCount` = combien de pages y sont déjà transcrites avec le modèle
+  // choisi, `missingPages` = les pages nommées qui restent (les périmètres, eux, se filtrent
+  // côté backend). null = pas de dialogue.
+  const [overwrite, setOverwrite] = useState<{
+    pages: OcrPageRef[];
+    scopes: OcrScopeItem[];
+    total: number;
+    doneCount: number;
+    missingPages: OcrPageRef[];
+    missingTotal: number;
+  } | null>(null);
 
   // La pause est coopérative : elle ne prend effet qu'à la fin de la page en cours.
   const pauseOcr = async () => {
@@ -309,6 +276,7 @@ export default function OcrPage() {
     if (prevActivity.current && !hasActivity) {
       loadCollections();
       setDoneCache(new Map());
+      setPagesCache(new Map());
       loadPastTasks();
     }
     prevActivity.current = hasActivity;
@@ -333,6 +301,24 @@ export default function OcrPage() {
   }, [doneRegistresCount]);
 
   const colKey = (col: CollectionMetadata) => col.folder_name || col.type;
+
+  // Charge les noms de pages des registres dépliés. Un aller-retour par registre, mis en
+  // cache : l'arbre replié, lui, n'en a pas besoin (ses compteurs viennent de `pages_count`).
+  useEffect(() => {
+    for (const collection of collections) {
+      const cKey = colKey(collection);
+      for (const reg of collection.registres || []) {
+        const rKey = `${cKey}/${reg.folder_name}`;
+        if (!expandedRegistres.has(rKey)) continue;
+        if (pagesCache.has(rKey) || fetchingPages.current.has(rKey)) continue;
+        fetchingPages.current.add(rKey);
+        registresApi.getPages(cKey, reg.folder_name)
+          .then((names) => setPagesCache((prev) => new Map(prev).set(rKey, names)))
+          .catch(() => {})
+          .finally(() => fetchingPages.current.delete(rKey));
+      }
+    }
+  }, [collections, expandedRegistres, pagesCache]);
 
   // Charge les stems transcrits des registres dépliés (pour le modèle OCR choisi).
   useEffect(() => {
@@ -365,19 +351,20 @@ export default function OcrPage() {
   };
 
   // Envoi effectif. L'éventuelle confirmation d'écrasement a déjà été tranchée par `requestLaunch`.
-  const doLaunch = async (keys: string[]) => {
-    const pages = keys.map(parsePageKey).filter((p): p is OcrPageRef => p !== null);
-    if (pages.length === 0 || !selectedSegModel || !selectedOcrModel) return;
+  const doLaunch = async (pages: OcrPageRef[], scopes: OcrScopeItem[], scopeOnly: OcrScopeOnly) => {
+    if ((pages.length === 0 && scopes.length === 0) || !selectedSegModel || !selectedOcrModel) return;
     try {
-      setLaunchPageCount(pages.length);
+      // Un périmètre n'annonce pas son propre volume : on affiche le total déjà calculé.
+      setLaunchPageCount(scopes.length > 0 ? selectedTotal : pages.length);
       setLaunchPhase('creating');
       setError(null);
-      // `total` et non `pages.length` : le backend écarte les pages dont l'image n'existe pas.
-      const task = await ocrApi.run(selectedSegModel, selectedOcrModel, pages);
+      // `total` et non le compte envoyé : le backend développe les périmètres depuis le
+      // disque, et écarte les pages nommées dont l'image aurait disparu entre-temps.
+      const task = await ocrApi.run(selectedSegModel, selectedOcrModel, pages, scopes, scopeOnly);
       await refreshTasks();
       setQueuedNotice(task.total);
       setSkippedNotice(task.skipped_missing ?? 0);
-      setSelectedPages(new Set()); // on garde les modèles, on libère la sélection pour enchaîner
+      clearSelection(); // on garde les modèles, on libère la sélection pour enchaîner
     } catch (err: any) {
       setError(err?.response?.data?.detail || t('errors.launch'));
       console.error(err);
@@ -416,13 +403,28 @@ export default function OcrPage() {
   };
 
   // Nombre de pages correspondant au filtre (dénominateur des cases à cocher).
+  // `pages_count` est le compte relevé sur le disque à la dernière synchronisation : un entier
+  // déjà en mémoire, donc utilisable pendant le rendu, là où les **noms** des pages demandent
+  // un aller-retour.
   const matchingTotal = (reg: RegistreSummary): number => {
-    const total = getRegPageCount(reg);
+    const total = reg.pages_count;
     if (statusFilter === 'all') return total;
     const done = regPagesDone(reg);
     return statusFilter === 'missing' ? Math.max(0, total - done) : done;
   };
 
+  // Registre retrouvé depuis une clé « collection/registre » : les périmètres sélectionnés ne
+  // portent que des clés, mais les compteurs ont besoin du registre.
+  const regByKey = useMemo(() => {
+    const out = new Map<string, RegistreSummary>();
+    for (const collection of collections) {
+      const cKey = colKey(collection);
+      for (const reg of collection.registres || []) out.set(`${cKey}/${reg.folder_name}`, reg);
+    }
+    return out;
+  }, [collections]);
+
+  // Pages cochées à l'unité, comptées par préfixe « collection/ » et « collection/registre/ ».
   const selectionCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const key of selectedPages) {
@@ -440,27 +442,44 @@ export default function OcrPage() {
     return counts;
   }, [selectedPages]);
 
-  // Registres distincts couverts par la sélection : les clés « collection/registre/ » du compteur
-  // ci-dessus (celles de collection n'ont qu'un slash) — inutile de reparcourir les pages.
+  // Total annoncé dans la barre de lancement : pages cochées à l'unité + périmètres.
+  const selectedTotal = useMemo(() => {
+    let total = selectedPages.size;
+    for (const rKey of selectedRegistres) {
+      const reg = regByKey.get(rKey);
+      if (reg) total += matchingTotal(reg);
+    }
+    return total;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPages, selectedRegistres, regByKey, statusFilter, selectedOcrModel]);
+
+  // Registres distincts couverts : les périmètres, plus ceux qui n'ont que des pages à l'unité.
   const selectedRegistreCount = useMemo(
-    () => [...selectionCounts.keys()].filter((k) => k.indexOf('/') !== k.lastIndexOf('/')).length,
-    [selectionCounts],
+    () => selectedRegistres.size
+      + [...selectionCounts.keys()].filter((k) => k.indexOf('/') !== k.lastIndexOf('/')).length,
+    [selectionCounts, selectedRegistres],
   );
 
   const getRegCheckState = (colId: string, reg: RegistreSummary) => {
-    const total = matchingTotal(reg);
-    if (total === 0) return { checked: false, indeterminate: false };
-    const selected = selectionCounts.get(`${colId}/${reg.folder_name}/`) || 0;
-    return { checked: selected >= total, indeterminate: selected > 0 && selected < total };
+    const rKey = `${colId}/${reg.folder_name}`;
+    if (selectedRegistres.has(rKey)) return { checked: true, indeterminate: false };
+    return { checked: false, indeterminate: (selectionCounts.get(`${rKey}/`) || 0) > 0 };
   };
 
   const getColCheckState = (collection: CollectionMetadata) => {
     const cKey = colKey(collection);
-    const regs = collection.registres || [];
-    const total = regs.reduce((sum, r) => sum + matchingTotal(r), 0);
-    if (total === 0) return { checked: false, indeterminate: false };
-    const selected = selectionCounts.get(`${cKey}/`) || 0;
-    return { checked: selected >= total, indeterminate: selected > 0 && selected < total };
+    const regs = (collection.registres || []).filter((r) => matchingTotal(r) > 0);
+    if (regs.length === 0) return { checked: false, indeterminate: false };
+    let whole = 0;
+    let partial = 0;
+    for (const r of regs) {
+      if (selectedRegistres.has(`${cKey}/${r.folder_name}`)) whole += 1;
+      else if ((selectionCounts.get(`${cKey}/${r.folder_name}/`) || 0) > 0) partial += 1;
+    }
+    return {
+      checked: whole === regs.length,
+      indeterminate: whole + partial > 0 && whole < regs.length,
+    };
   };
 
   const toggleCollection = (cKey: string) => {
@@ -479,7 +498,40 @@ export default function OcrPage() {
     });
   };
 
-  const togglePage = (key: string) => {
+  // Retire un registre de la sélection, sous quelque forme qu'il y figure.
+  const dropRegistres = (rKeys: string[]) => {
+    if (rKeys.length === 0) return;
+    const drop = new Set(rKeys);
+    setSelectedRegistres((prev) => {
+      const next = new Set([...prev].filter((k) => !drop.has(k)));
+      return next.size === prev.size ? prev : next;
+    });
+    setSelectedPages((prev) => {
+      const next = new Set([...prev].filter((k) => {
+        const second = k.indexOf('/', k.indexOf('/') + 1);
+        return second < 0 || !drop.has(k.substring(0, second));
+      }));
+      return next.size === prev.size ? prev : next;
+    });
+  };
+
+  // Coche/décoche **une** page. Si son registre était coché en entier, il faut le matérialiser :
+  // la sélection passe du périmètre à ses pages visibles, moins celle que l'on décoche.
+  const togglePage = (rKey: string, page: string, visible: string[]) => {
+    const key = `${rKey}/${page}`;
+    if (selectedRegistres.has(rKey)) {
+      setSelectedRegistres((prev) => {
+        const next = new Set(prev);
+        next.delete(rKey);
+        return next;
+      });
+      setSelectedPages((prev) => {
+        const next = new Set(prev);
+        for (const p of visible) if (p !== page) next.add(`${rKey}/${p}`);
+        return next;
+      });
+      return;
+    }
     setSelectedPages((prev) => {
       const next = new Set(prev);
       next.has(key) ? next.delete(key) : next.add(key);
@@ -487,41 +539,43 @@ export default function OcrPage() {
     });
   };
 
-  // Pages d'un registre correspondant au filtre courant (charge le statut par page si besoin).
-  const filteredPages = async (cKey: string, reg: RegistreSummary): Promise<string[]> => {
-    const pages = getPages(reg);
-    if (statusFilter === 'all') return pages;
-    const doneSet = await ensureDoneSet(cKey, reg.folder_name);
-    return pages.filter((p) =>
-      statusFilter === 'done' ? doneSet.has(pageStem(p)) : !doneSet.has(pageStem(p)));
+  // Case d'un registre : tout ou rien, sans aucun aller-retour réseau — c'est le périmètre qui
+  // est retenu, le backend le développera depuis le disque au lancement.
+  const toggleAllPages = (colId: string, reg: RegistreSummary) => {
+    const rKey = `${colId}/${reg.folder_name}`;
+    if (busyRegistres.has(rKey)) return;
+    const state = getRegCheckState(colId, reg);
+    if (state.checked || state.indeterminate) {
+      dropRegistres([rKey]);
+      return;
+    }
+    if (matchingTotal(reg) === 0) return;
+    setSelectedRegistres((prev) => new Set(prev).add(rKey));
   };
 
-  // Bascule un lot de clés : si toutes déjà sélectionnées → on retire, sinon on ajoute.
-  const toggleKeys = (keys: string[]) => {
-    setSelectedPages((prev) => {
-      const allSelected = keys.length > 0 && keys.every((k) => prev.has(k));
+  // Cocher une collection de 1200 registres reste instantané : on n'ajoute que 1200 clés de
+  // périmètre, jamais les centaines de milliers de noms de pages qu'elles recouvrent.
+  const toggleAllCollection = (collection: CollectionMetadata) => {
+    const cKey = colKey(collection);
+    // Les registres verrouillés ailleurs sont exclus du lot : les cocher ne mènerait qu'à un refus.
+    const keys = (collection.registres || [])
+      .filter((r) => !busyRegistres.has(`${cKey}/${r.folder_name}`) && matchingTotal(r) > 0)
+      .map((r) => `${cKey}/${r.folder_name}`);
+    if (keys.length > 0 && keys.every((k) => selectedRegistres.has(k))) {
+      dropRegistres(keys);
+      return;
+    }
+    dropRegistres(keys);   // les pages cochées à l'unité seraient comptées deux fois
+    setSelectedRegistres((prev) => {
       const next = new Set(prev);
-      keys.forEach((k) => (allSelected ? next.delete(k) : next.add(k)));
+      keys.forEach((k) => next.add(k));
       return next;
     });
   };
 
-  const toggleAllPages = async (colId: string, reg: RegistreSummary) => {
-    if (busyRegistres.has(`${colId}/${reg.folder_name}`)) return;
-    const keys = (await filteredPages(colId, reg)).map((p) => pageKey(colId, reg.folder_name, p));
-    toggleKeys(keys);
-  };
-
-  const toggleAllCollection = async (collection: CollectionMetadata) => {
-    const cKey = colKey(collection);
-    // Les registres verrouillés ailleurs sont exclus du lot : les cocher ne mènerait qu'à un refus.
-    const perReg = await Promise.all(
-      (collection.registres || [])
-        .filter((r) => !busyRegistres.has(`${cKey}/${r.folder_name}`))
-        .map(async (r) =>
-          (await filteredPages(cKey, r)).map((p) => pageKey(cKey, r.folder_name, p))),
-    );
-    toggleKeys(perReg.flat());
+  const clearSelection = () => {
+    setSelectedPages(new Set());
+    setSelectedRegistres(new Set());
   };
 
   // ── Périmètres verrouillés touchés par la sélection ────────────────
@@ -529,66 +583,90 @@ export default function OcrPage() {
   // de modèle OCR — peut viser un registre devenu occupé : filet avant l'envoi.
   const blockedSelection = useMemo(() => {
     const out = new Map<string, string>();
-    for (const key of selectedPages) {
-      const second = key.indexOf('/', key.indexOf('/') + 1);
-      if (second < 0) continue;
-      const rKey = key.substring(0, second);
+    const consider = (rKey: string) => {
       const from = busyRegistres.get(rKey);
       if (from !== undefined) out.set(rKey, from);
+    };
+    for (const rKey of selectedRegistres) consider(rKey);
+    for (const key of selectedPages) {
+      const second = key.indexOf('/', key.indexOf('/') + 1);
+      if (second >= 0) consider(key.substring(0, second));
     }
     return out;
-  }, [selectedPages, busyRegistres]);
+  }, [selectedPages, selectedRegistres, busyRegistres]);
 
-  const dropBlockedSelection = () => {
-    setSelectedPages((prev) => {
-      const next = new Set<string>();
-      for (const key of prev) {
-        const second = key.indexOf('/', key.indexOf('/') + 1);
-        if (second >= 0 && busyRegistres.has(key.substring(0, second))) continue;
-        next.add(key);
-      }
-      return next;
-    });
-  };
+  const dropBlockedSelection = () => dropRegistres([...blockedSelection.keys()]);
 
-  // ── Lancement : confirmation si des transcriptions vont être écrasées ──
+  // ── Lancement ──────────────────────────────────────────────────────
+  // La sélection se traduit en deux listes : les pages nommées une à une, et les périmètres
+  // (registres cochés en entier) que le backend développera depuis le disque.
+  const selectionPayload = () => ({
+    pages: [...selectedPages].map(parsePageKey).filter((p): p is OcrPageRef => p !== null),
+    scopes: [...selectedRegistres].map((rKey) => {
+      const slash = rKey.indexOf('/');
+      return { collection: rKey.substring(0, slash), registre: rKey.substring(slash + 1) };
+    }) as OcrScopeItem[],
+  });
+
+  // Confirmation si des transcriptions vont être écrasées, **sans toucher au disque** : les
+  // périmètres se comptent sur l'`ocr_status` publié, les pages nommées à l'unité sur le cache
+  // des pastilles. Le vrai relevé, lui, a lieu au lancement, côté backend.
   const requestLaunch = async () => {
-    const keys = [...selectedPages];
+    const { pages, scopes } = selectionPayload();
     setError(null);
     setLaunchProgress({ done: 0, total: 0 });
     setLaunchPhase('checking');
     try {
-      // On ne sonde que les registres dont les métadonnées annoncent au moins une page faite :
-      // sur une grosse sélection, cela évite un aller-retour réseau par registre vierge.
-      const byReg = new Map<string, { ref: OcrPageRef; key: string }[]>();
-      for (const key of keys) {
-        const ref = parsePageKey(key);
-        if (!ref) continue;
-        const rKey = `${ref.collection}/${ref.registre}`;
-        const bucket = byReg.get(rKey);
-        if (bucket) bucket.push({ ref, key });
-        else byReg.set(rKey, [{ ref, key }]);
-      }
-      const done: string[] = [];
-      let checked = 0;
-      setLaunchProgress({ done: 0, total: byReg.size });
-      for (const [, entries] of byReg) {
-        setLaunchProgress({ done: ++checked, total: byReg.size });
-        const { collection: cKey, registre: folder } = entries[0].ref;
-        const reg = collections.find((c) => colKey(c) === cKey)
-          ?.registres?.find((r) => r.folder_name === folder);
-        if (!reg || regPagesDone(reg) === 0) continue;
-        const doneSet = await ensureDoneSet(cKey, folder);
-        for (const { ref, key } of entries) {
-          if (doneSet.has(pageStem(ref.page))) done.push(key);
+      let doneCount = 0;
+      // Pages déjà transcrites d'un registre coché en entier : on lit `ocr_status`, le compte
+      // publié dans le metadata — celui-là même qu'affiche la pastille `fait/total` de l'arbre.
+      // Le relever sur le disque coûtait ~3,9 s par registre sur le partage réseau, soit plus
+      // d'une heure pour une collection de 1200 registres, avant même d'avoir posé la question.
+      // Sous le filtre « manquantes », le périmètre ne rapporte par construction que des pages
+      // non transcrites : rien à écraser.
+      if (statusFilter !== 'missing') {
+        for (const rKey of selectedRegistres) {
+          const reg = regByKey.get(rKey);
+          if (reg) doneCount += Math.min(regPagesDone(reg), matchingTotal(reg));
         }
       }
-      if (done.length === 0) {
-        await doLaunch(keys);
+      // Pages nommées à l'unité : un sondage par registre concerné, et seulement s'il annonce
+      // au moins une page faite.
+      const donePages: OcrPageRef[] = [];
+      const byReg = new Map<string, OcrPageRef[]>();
+      for (const ref of pages) {
+        const rKey = `${ref.collection}/${ref.registre}`;
+        const bucket = byReg.get(rKey);
+        if (bucket) bucket.push(ref);
+        else byReg.set(rKey, [ref]);
+      }
+      let checked = 0;
+      if (byReg.size > 0) setLaunchProgress({ done: 0, total: byReg.size });
+      for (const [rKey, refs] of byReg) {
+        setLaunchProgress({ done: ++checked, total: byReg.size });
+        const reg = regByKey.get(rKey);
+        if (!reg || regPagesDone(reg) === 0) continue;
+        const doneSet = await ensureDoneSet(refs[0].collection, refs[0].registre);
+        for (const ref of refs) if (doneSet.has(pageStem(ref.page))) donePages.push(ref);
+      }
+      doneCount += donePages.length;
+
+      if (doneCount === 0) {
+        await doLaunch(pages, scopes, statusFilter);
         return;
       }
-      const already = new Set(done);
-      setOverwrite({ all: keys, doneCount: done.length, missing: keys.filter((k) => !already.has(k)) });
+      const alreadyDone = new Set(donePages.map((r) => `${r.collection}/${r.registre}/${r.page}`));
+      setOverwrite({
+        pages,
+        scopes,
+        total: selectedTotal,
+        doneCount,
+        // « Ne transcrire que les manquantes » : les pages nommées sont filtrées ici, les
+        // périmètres le seront côté backend par `scope_only`.
+        missingPages: pages.filter(
+          (r) => !alreadyDone.has(`${r.collection}/${r.registre}/${r.page}`)),
+        missingTotal: selectedTotal - doneCount,
+      });
     } catch (err: any) {
       setError(err?.response?.data?.detail || t('errors.launch'));
       console.error(err);
@@ -731,7 +809,7 @@ export default function OcrPage() {
   );
 
   const canLaunch = !launching && !reqLoading && blockers.length === 0
-    && !!selectedSegModel && !!selectedOcrModel && selectedPages.size > 0
+    && !!selectedSegModel && !!selectedOcrModel && selectedTotal > 0
     && blockedSelection.size === 0;
   let disabledReason: string | null = null;
   if (reqLoading) disabledReason = t('disabled.checking');
@@ -739,11 +817,11 @@ export default function OcrPage() {
   else if (setupBlockers.length > 0) disabledReason = t('disabled.configIncomplete');
   else if (!selectedSegModel || !selectedOcrModel) disabledReason = t('disabled.chooseModels');
   else if (blockedSelection.size > 0) disabledReason = t('disabled.selectionBusy', { count: blockedSelection.size });
-  else if (selectedPages.size === 0) disabledReason = t('disabled.selectPage');
+  else if (selectedTotal === 0) disabledReason = t('disabled.selectPage');
 
   // ── Estimation de durée (débit des dernières tâches OCR terminées) ──
   const estimateSeconds = useMemo(() => {
-    if (selectedPages.size === 0 || pastOcrTasks.length === 0) return null;
+    if (selectedTotal === 0 || pastOcrTasks.length === 0) return null;
     const device = requirements?.cuda?.ok ? 'cuda' : 'cpu';
     let sample = pastOcrTasks.filter((t) => t.preflight?.device === device);
     if (sample.length === 0) sample = pastOcrTasks;
@@ -759,8 +837,8 @@ export default function OcrPage() {
       if (dur > 0) { pages += t.processed; secs += dur; }
     }
     if (pages === 0 || secs === 0) return null;
-    return selectedPages.size / (pages / secs);
-  }, [selectedPages.size, pastOcrTasks, requirements]);
+    return selectedTotal / (pages / secs);
+  }, [selectedTotal, pastOcrTasks, requirements]);
 
   const modelRadioGroup = (type: 'segmentation' | 'ocr', value: string, onChange: (v: string) => void) => {
     const filtered = models.filter((m) => m.type === type);
@@ -1088,10 +1166,11 @@ export default function OcrPage() {
 
                                   <Collapse in={isRegExpanded} unmountOnExit>
                                     {isRegExpanded && (() => {
-                                      const allPages = getPages(reg);
+                                      const allPages = pagesCache.get(rKey);
                                       const doneSet = doneCache.get(`${rKey}/${selectedOcrModel}`);
-                                      // Filtre par statut : nécessite le statut par page (doneSet).
-                                      if (statusFilter !== 'all' && !doneSet) {
+                                      // Les noms viennent du disque (et le statut par page du
+                                      // doneSet) : tant que l'un des deux manque, on attend.
+                                      if (!allPages || (statusFilter !== 'all' && !doneSet)) {
                                         return (
                                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, pl: 9, py: 0.5 }}>
                                             <CircularProgress size={12} />
@@ -1113,16 +1192,19 @@ export default function OcrPage() {
                                           {pages.map((page) => {
                                             const pKey = pageKey(cKey, reg.folder_name, page);
                                             const isDone = doneSet?.has(pageStem(page));
+                                            // Une page est cochée soit à l'unité, soit parce que
+                                            // son registre l'est en entier.
+                                            const pageChecked = selectedRegistres.has(rKey) || selectedPages.has(pKey);
                                             return (
                                               <ListItemButton
                                                 key={page}
                                                 sx={{ pl: 6, py: 0.25 }}
                                                 dense
                                                 disabled={busyFrom !== undefined}
-                                                onClick={() => togglePage(pKey)}
+                                                onClick={() => togglePage(rKey, page, pages)}
                                               >
                                                 <ListItemIcon sx={{ minWidth: 36 }}>
-                                                  <Checkbox edge="start" checked={selectedPages.has(pKey)} size="small" />
+                                                  <Checkbox edge="start" checked={pageChecked} size="small" />
                                                 </ListItemIcon>
                                                 <ListItemIcon sx={{ minWidth: 28 }}>
                                                   <ImageIcon fontSize="small" sx={{ color: 'text.disabled' }} />
@@ -1225,7 +1307,7 @@ export default function OcrPage() {
 
       {/* ─── Barre de lancement ─── */}
       <OcrLaunchBar
-        selectedCount={selectedPages.size}
+        selectedCount={selectedTotal}
         selectedRegistreCount={selectedRegistreCount}
         segModelName={models.find((m) => m.id === selectedSegModel)?.name ?? null}
         ocrModelName={models.find((m) => m.id === selectedOcrModel)?.name ?? null}
@@ -1237,7 +1319,7 @@ export default function OcrPage() {
         disabledReason={disabledReason}
         envChip={<EnvStatusChip requirements={requirements} loading={reqLoading} failed={reqFailed} />}
         onLaunch={requestLaunch}
-        onClearSelection={() => setSelectedPages(new Set())}
+        onClearSelection={clearSelection}
         onPauseOcr={pauseOcr}
         onResumeOcr={resumeOcr}
       />
@@ -1249,24 +1331,34 @@ export default function OcrPage() {
           <DialogContentText>
             {t('overwrite.detail', {
               count: overwrite?.doneCount ?? 0,
-              total: overwrite?.all.length ?? 0,
+              total: overwrite?.total ?? 0,
               model: models.find((m) => m.id === selectedOcrModel)?.name ?? selectedOcrModel,
             })}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOverwrite(null)}>{t('common:actions.cancel')}</Button>
-          {(overwrite?.missing.length ?? 0) > 0 && (
+          {(overwrite?.missingTotal ?? 0) > 0 && (
             <Button
-              onClick={() => { const keys = overwrite!.missing; setOverwrite(null); doLaunch(keys); }}
+              onClick={() => {
+                const o = overwrite!;
+                setOverwrite(null);
+                // Les périmètres repartent avec le filtre 'missing' : c'est le backend qui
+                // écarte leurs pages déjà transcrites, sans rapatrier un seul nom.
+                doLaunch(o.missingPages, o.scopes, 'missing');
+              }}
             >
-              {t('overwrite.missingOnly', { count: overwrite?.missing.length ?? 0 })}
+              {t('overwrite.missingOnly', { count: overwrite?.missingTotal ?? 0 })}
             </Button>
           )}
           <Button
             variant="contained"
             color="warning"
-            onClick={() => { const keys = overwrite!.all; setOverwrite(null); doLaunch(keys); }}
+            onClick={() => {
+              const o = overwrite!;
+              setOverwrite(null);
+              doLaunch(o.pages, o.scopes, statusFilter);
+            }}
           >
             {t('overwrite.confirm')}
           </Button>

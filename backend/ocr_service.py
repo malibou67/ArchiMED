@@ -467,18 +467,34 @@ class OcrService:
     # ── Enfilage (délégué au moteur générique) ────────────────────────
     @staticmethod
     def enqueue(seg_model_id: str, ocr_model_id: str, pages: List[Dict[str, str]],
-                retry_of: Optional[str] = None) -> Dict[str, Any]:
+                retry_of: Optional[str] = None,
+                scopes: Optional[List[Dict[str, Optional[str]]]] = None,
+                scope_only: str = 'all') -> Dict[str, Any]:
         """Ajoute une tâche OCR à la lane 'ocr', après avoir écarté les pages sans image.
 
-        La liste est construite côté client à partir de la pagination détectée : elle peut
-        contenir des pages qui n'existent pas sur le disque (trou de pagination, fichier
-        déplacé depuis la dernière synchronisation). Les enfiler ne produirait que des échecs,
-        on les retire ici — c'est le seul endroit qui voie la vérité du disque."""
+        Deux façons de désigner les pages, cumulables : `pages` les nomme une à une, `scopes`
+        désigne des (collection, registre) entiers que l'on développe ici depuis le disque.
+        Le périmètre évite au client d'envoyer les centaines de milliers de noms d'une grosse
+        collection — et de les fabriquer, ce qu'il ne sait pas faire correctement.
+
+        `filter_existing_pages` reste le filet : une page nommée explicitement peut avoir
+        disparu entre l'affichage et le lancement."""
+        if scopes:
+            grouped = OcrService.scope_pages(scopes, ocr_model_id, scope_only)
+            # Les pages nommées d'abord : elles portent l'ordre voulu par l'appelant, et une
+            # page citée des deux côtés ne doit être traitée qu'une fois.
+            seen = {(p['collection'], p['registre'], p['page']) for p in pages}
+            pages = list(pages)
+            for col, regs in grouped.items():
+                for reg, names in regs.items():
+                    pages.extend({'collection': col, 'registre': reg, 'page': n}
+                                 for n in names if (col, reg, n) not in seen)
         kept, skipped = OcrService.filter_existing_pages(pages)
         if not kept:
             raise NoPagesToProcess(
                 f"Aucune page à traiter : les {len(pages)} image(s) demandée(s) sont "
-                "introuvables sur le disque. Resynchronisez la collection."
+                "introuvables dans les dossiers de scans. Rechargez la page pour rafraîchir "
+                "la liste des pages."
             )
         if skipped:
             log.warning("Pages écartées, image introuvable " + kv(
@@ -640,8 +656,8 @@ class OcrService:
 
         Un seul listing par (collection, registre) : sur un partage réseau, lister un dossier
         une fois coûte bien moins cher qu'un `stat` par page — sauf pour une poignée de pages,
-        où c'est l'inverse (cas « je relance deux pages »). Sur le chemin par listing, le nom
-        retenu est celui du disque : Windows ouvrirait `Page_1.jpg` demandé en `page_1.jpg`,
+        où c'est l'inverse (cas « je relance deux pages »). Les deux chemins retiennent le nom
+        tel qu'il est sur le disque : Windows ouvrirait `Page_1.jpg` demandé en `page_1.jpg`,
         mais le XML produit prendrait le stem demandé et fausserait les compteurs."""
         by_registre: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for p in pages:
@@ -654,7 +670,15 @@ class OcrService:
             if len(group) <= 4:
                 reg_dir = scans_root / col / "scans" / reg
                 for p in group:
-                    (kept if (reg_dir / p['page']).is_file() else skipped).append(p)
+                    f = reg_dir / p['page']
+                    if not f.is_file():
+                        skipped.append(p)
+                        continue
+                    # `is_file()` est insensible à la casse sous Windows : reprendre le nom
+                    # canonique, sinon le XML sortirait sous le stem demandé (même règle que
+                    # le chemin par listing ci-dessous).
+                    real = f.resolve().name
+                    kept.append(p if real == p['page'] else {**p, 'page': real})
                 continue
             by_lower = {n.lower(): n for n in RegistresService.list_scan_pages(col, reg)}
             for p in group:
@@ -665,14 +689,18 @@ class OcrService:
                     kept.append(p if real == p['page'] else {**p, 'page': real})
         return kept, skipped
 
+    # Filtres d'état d'un périmètre, pour `scope_pages` / `scope_counts`.
+    _SCOPE_ONLY = ('all', 'missing', 'done')
+
     @staticmethod
-    def missing_pages(model_id: str, scope: Optional[List[Dict[str, Optional[str]]]] = None) -> List[Dict[str, str]]:
-        """Pages (fichiers image des scans) sans transcription pour ce modèle.
-        `scope` : liste optionnelle de {'collection': ..., 'registre': optionnel} ;
+    def _walk_scope(scope: Optional[List[Dict[str, Optional[str]]]]):
+        """Itère les couples (collection, registre) d'un périmètre, dans l'ordre du disque.
+
+        `scope` : liste de {'collection': ..., 'registre': optionnel} ;
         None ou vide = toutes les collections."""
         collections_root = Path(DATA_DIR) / "collections"
         if not collections_root.exists():
-            return []
+            return
 
         # collection -> set de registres demandés (None = tous les registres)
         wanted: Optional[Dict[str, Optional[set]]] = None
@@ -690,7 +718,6 @@ class OcrService:
                 elif wanted[col] is not None:
                     wanted[col].add(reg)
 
-        result: List[Dict[str, str]] = []
         for col_dir in sorted(collections_root.iterdir()):
             if not col_dir.is_dir() or CollectionsService._SCAN_EXCLUDE.match(col_dir.name):
                 continue
@@ -705,11 +732,46 @@ class OcrService:
                     continue
                 if regs_filter is not None and reg_dir.name not in regs_filter:
                     continue
-                done = set(OcrService.done_stems(col_dir.name, reg_dir.name, model_id))
-                for img_name in RegistresService.list_scan_pages(col_dir.name, reg_dir.name):
-                    if Path(img_name).stem not in done:
-                        result.append({'collection': col_dir.name, 'registre': reg_dir.name, 'page': img_name})
+                yield col_dir.name, reg_dir.name
+
+    @staticmethod
+    def scope_pages(scope: Optional[List[Dict[str, Optional[str]]]] = None,
+                    model_id: Optional[str] = None,
+                    only: str = 'all') -> Dict[str, Dict[str, List[str]]]:
+        """Noms des fichiers image d'un périmètre, **lus sur le disque**, groupés
+        collection → registre et dans l'ordre de traitement.
+
+        `only` : 'all', ou 'missing'/'done' pour ne garder que les pages sans/avec PAGE XML
+        pour `model_id`.
+
+        Seule source de noms de pages pour l'OCR. Les métadonnées de pagination
+        (`pages_pattern` + `pages_start`/`pages_end` − `pages_gaps`) ne portent que des
+        **numéros** : la largeur du champ numérique y est perdue, et elle n'est même pas la
+        même partout dans un registre (on trouve `_9.jpg`, `_79.jpg` et `_080.jpg` côte à
+        côte). Reconstituer un nom depuis le motif fabrique donc des fichiers qui n'existent
+        pas — c'était la cause des « pages introuvables » au lancement. Ne pas le refaire."""
+        if only not in OcrService._SCOPE_ONLY:
+            raise ValueError(f"Filtre de périmètre inconnu : {only}")
+        if only != 'all' and not model_id:
+            raise ValueError("Modèle OCR requis pour filtrer sur l'état de transcription.")
+
+        result: Dict[str, Dict[str, List[str]]] = {}
+        for col, reg in OcrService._walk_scope(scope):
+            names = RegistresService.list_scan_pages(col, reg)
+            if only != 'all':
+                done = set(OcrService.done_stems(col, reg, model_id))
+                names = [n for n in names if (Path(n).stem in done) == (only == 'done')]
+            if names:
+                result.setdefault(col, {})[reg] = names
         return result
+
+    @staticmethod
+    def missing_pages(model_id: str, scope: Optional[List[Dict[str, Optional[str]]]] = None) -> List[Dict[str, str]]:
+        """Pages (fichiers image des scans) sans transcription pour ce modèle, à plat."""
+        return [{'collection': col, 'registre': reg, 'page': page}
+                for col, regs in OcrService.scope_pages(scope, model_id, 'missing').items()
+                for reg, pages in regs.items()
+                for page in pages]
 
     # ── Résolution / cache des modèles ────────────────────────────────
     @staticmethod

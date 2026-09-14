@@ -986,7 +986,13 @@ export default function CollectionsPage() {
                                   for (let n = lo; n <= hi; n++) if (!numCounts.has(n)) gaps.push(n);
                                 }
                                 // Largeur de remplissage par zéros détectée sur les pages existantes,
-                                // pour reconstruire le nom exact d'une page manquante (ex. « page_0232.jpg »).
+                                // pour proposer un nom à une page **manquante** (ex. « page_0232.jpg »).
+                                // Ce n'est qu'une supposition : le remplissage n'est pas toujours
+                                // uniforme dans un registre (on trouve `_79.jpg` et `_080.jpg` côte
+                                // à côte). Ne jamais s'en servir pour désigner un fichier à ouvrir —
+                                // c'est ce que faisait la page OCR, et elle enfilait 99 pages
+                                // fantômes par registre. Les noms réels se lisent sur le disque
+                                // (`registresApi.getPages`).
                                 let numPadWidth = 0;
                                 if (mainRx) {
                                   for (const p of sorted) {
