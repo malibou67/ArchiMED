@@ -256,11 +256,11 @@ def export_pages_zip(
     token = download_token or uuid.uuid4().hex
     if not _DOWNLOAD_TOKEN.match(token):
         raise HTTPException(status_code=400, detail="Jeton de téléchargement invalide")
-    PagesExportService.start(
+    job = PagesExportService.start(
         token, index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
     )
     try:
-        files = PagesExportService.prepare(token)
+        files = PagesExportService.prepare(job)
     except ExportCancelled:
         raise HTTPException(status_code=409, detail="Export annulé")
     except Exception as e:
@@ -269,7 +269,7 @@ def export_pages_zip(
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
 
     return _ClosingStreamingResponse(
-        PagesExportService.stream(token, files),
+        PagesExportService.stream(job, files),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{index_id}_pages.zip"'},
     )

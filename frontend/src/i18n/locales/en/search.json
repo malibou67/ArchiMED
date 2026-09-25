@@ -103,6 +103,7 @@
     "error": "The export failed: {{detail}}",
     "cancelledUser": "Export cancelled: the download was interrupted.",
     "cancelledClient": "The download was interrupted by the browser (cancelled, or tab closed).",
+    "cancelledReplaced": "The same search was exported again (from another tab, or after reloading the page): this export stopped so as not to produce the same archive twice, and its download was interrupted.",
     "cancel": "Cancel",
     "cancelling": "Cancelling…",
     "close": "Close",

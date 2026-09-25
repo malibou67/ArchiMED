@@ -331,7 +331,9 @@ export type PagesExportStatus = {
   unreadable: string[];
   unreadable_count: number;
   error: string | null;
-  cancel_reason: 'user' | 'client' | null;
+  // user : bouton Annuler ; client : téléchargement lâché par le navigateur ; replaced : la même
+  // recherche a été exportée de nouveau (autre onglet, page rechargée) et a pris le relais.
+  cancel_reason: 'user' | 'client' | 'replaced' | null;
   cancel_requested: boolean;
   elapsed_s: number;
   idle_s: number;                   // secondes depuis la dernière avancée

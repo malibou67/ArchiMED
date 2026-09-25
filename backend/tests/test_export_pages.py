@@ -62,8 +62,9 @@ def inventaire(query="chat"):
 
 
 def exporter(token, query="chat"):
-    PagesExportService.start(token, "idx1", query)
-    return PagesExportService.prepare(token)
+    """Enregistre et prépare un export ; renvoie son état et ses fichiers, prêts pour le flux."""
+    job = PagesExportService.start(token, "idx1", query)
+    return job, PagesExportService.prepare(job)
 
 
 def archive(data):
@@ -146,9 +147,9 @@ def test_la_progression_raconte_la_recherche_puis_l_inventaire(corpus):
 # ── Archive ──────────────────────────────────────────────────────────────────
 
 def test_l_archive_contient_les_images_et_le_rapport(corpus):
-    files = exporter("tok-archive")
+    job, files = exporter("tok-archive")
 
-    with archive(b"".join(PagesExportService.stream("tok-archive", files))) as zf:
+    with archive(b"".join(PagesExportService.stream(job, files))) as zf:
         assert zf.testzip() is None
         assert zf.namelist() == [
             "REGA/REGA_1.jpg", "REGA/REGA_1_1.jpg", "REGB/REGB_1.jpg", "_export.txt"]
@@ -169,10 +170,10 @@ def test_une_image_illisible_est_sautee_sans_laisser_d_entree(corpus, monkeypatc
     """Avant, l'en-tête de l'entrée était écrit avant d'ouvrir l'image : une image disparue
     laissait un fichier vide dans l'archive, sans que personne le sache."""
     monkeypatch.setattr(export_service, 'READ_RETRY_DELAY', 0)
-    files = exporter("tok-illisible")
+    job, files = exporter("tok-illisible")
     (corpus / "collections" / "COL" / "scans" / "REGA" / "REGA_1_1.jpg").unlink()
 
-    with archive(b"".join(PagesExportService.stream("tok-illisible", files))) as zf:
+    with archive(b"".join(PagesExportService.stream(job, files))) as zf:
         assert zf.testzip() is None
         assert "REGA/REGA_1_1.jpg" not in zf.namelist()
         rapport = zf.read("_export.txt").decode('utf-8-sig')
@@ -187,7 +188,7 @@ def test_une_image_illisible_est_sautee_sans_laisser_d_entree(corpus, monkeypatc
 
 def test_un_hoquet_de_lecture_est_rattrape(corpus, monkeypatch):
     monkeypatch.setattr(export_service, 'READ_RETRY_DELAY', 0)
-    files = exporter("tok-hoquet")
+    job, files = exporter("tok-hoquet")
     ouvrir = open
     échecs = []
 
@@ -199,7 +200,7 @@ def test_un_hoquet_de_lecture_est_rattrape(corpus, monkeypatch):
 
     monkeypatch.setattr(export_service, 'open', capricieux, raising=False)
 
-    with archive(b"".join(PagesExportService.stream("tok-hoquet", files))) as zf:
+    with archive(b"".join(PagesExportService.stream(job, files))) as zf:
         assert "REGB/REGB_1.jpg" in zf.namelist()
     assert échecs
     assert PagesExportService.snapshot("tok-hoquet")['unreadable_count'] == 0
@@ -208,17 +209,17 @@ def test_un_hoquet_de_lecture_est_rattrape(corpus, monkeypatch):
 # ── État de l'export ─────────────────────────────────────────────────────────
 
 def test_l_etat_suit_l_export_du_debut_a_la_fin(corpus):
-    PagesExportService.start("tok-etat", "idx1", "chat")
+    job = PagesExportService.start("tok-etat", "idx1", "chat")
     assert PagesExportService.snapshot("tok-etat")['status'] == 'preparing'
 
-    files = PagesExportService.prepare("tok-etat")
+    files = PagesExportService.prepare(job)
     prêt = PagesExportService.snapshot("tok-etat")
     assert (prêt['status'], prêt['phase']) == ('preparing', 'resolve')
     assert (prêt['pages'], prêt['registres'], prêt['files_total'], prêt['missing_count']) == (3, 2, 3, 1)
     assert prêt['missing'] == ["REGB_2"]
     assert prêt['bytes_total'] == sum(size for _r, _p, size in files)
 
-    flux = PagesExportService.stream("tok-etat", files)
+    flux = PagesExportService.stream(job, files)
     next(flux)
     envoi = PagesExportService.snapshot("tok-etat")
     assert (envoi['status'], envoi['phase']) == ('streaming', 'zip')
@@ -236,8 +237,8 @@ def test_l_etat_suit_l_export_du_debut_a_la_fin(corpus):
 def test_l_annulation_coupe_le_flux(corpus):
     """Le flux doit lever, pas s'arrêter proprement : une fin propre ferait passer une archive
     tronquée pour complète auprès du navigateur."""
-    files = exporter("tok-annule")
-    flux = PagesExportService.stream("tok-annule", files)
+    job, files = exporter("tok-annule")
+    flux = PagesExportService.stream(job, files)
     next(flux)
 
     PagesExportService.request_cancel("tok-annule")
@@ -249,19 +250,19 @@ def test_l_annulation_coupe_le_flux(corpus):
 
 
 def test_l_annulation_pendant_la_preparation(corpus):
-    PagesExportService.start("tok-annule-tot", "idx1", "chat")
+    job = PagesExportService.start("tok-annule-tot", "idx1", "chat")
     PagesExportService.request_cancel("tok-annule-tot")
 
     with pytest.raises(ExportCancelled):
-        PagesExportService.prepare("tok-annule-tot")
+        PagesExportService.prepare(job)
     état = PagesExportService.snapshot("tok-annule-tot")
     assert (état['status'], état['cancel_reason']) == ('cancelled', 'user')
 
 
 def test_un_flux_lache_par_le_navigateur(corpus):
     """Téléchargement annulé ou onglet fermé : Starlette abandonne le flux, qui est refermé."""
-    files = exporter("tok-client")
-    flux = PagesExportService.stream("tok-client", files)
+    job, files = exporter("tok-client")
+    flux = PagesExportService.stream(job, files)
     next(flux)
 
     flux.close()
@@ -272,10 +273,67 @@ def test_un_flux_lache_par_le_navigateur(corpus):
 
 def test_un_index_absent_met_l_export_en_erreur(data_dir):
     IndexesService._vocab_cache.clear()
-    PagesExportService.start("tok-absent", "inconnu", "chat")
+    job = PagesExportService.start("tok-absent", "inconnu", "chat")
 
-    assert PagesExportService.prepare("tok-absent") is None
+    assert PagesExportService.prepare(job) is None
     assert PagesExportService.snapshot("tok-absent")['status'] == 'error'
+
+
+# ── Une même recherche, une seule archive ────────────────────────────────────
+
+def test_la_meme_recherche_relancee_remplace_l_export_en_cours(corpus):
+    """Le cas vu sur le poste : un onglet resté sur l'ancienne interface et la nouvelle ont lancé
+    le même export à 20 s d'écart, et le serveur a produit deux fois la même archive."""
+    premier, fichiers = exporter("tok-premier")
+    flux = PagesExportService.stream(premier, fichiers)
+    next(flux)
+
+    second, fichiers_bis = exporter("tok-second")
+
+    # Le premier s'arrête en levant : son téléchargement est coupé, pas terminé tronqué.
+    with pytest.raises(ExportCancelled):
+        next(flux)
+    état = PagesExportService.snapshot("tok-premier")
+    assert (état['status'], état['cancel_reason']) == ('cancelled', 'replaced')
+    with archive(b"".join(PagesExportService.stream(second, fichiers_bis))) as zf:
+        assert zf.testzip() is None
+    assert PagesExportService.snapshot("tok-second")['status'] == 'done'
+
+
+def test_un_export_remplace_pendant_sa_preparation(corpus):
+    premier = PagesExportService.start("tok-prepare-1", "idx1", "chat")
+    PagesExportService.start("tok-prepare-2", "idx1", "chat")
+
+    with pytest.raises(ExportCancelled) as arrêt:
+        PagesExportService.prepare(premier)
+    assert arrêt.value.reason == 'replaced'
+
+
+def test_une_autre_recherche_ne_remplace_rien(corpus):
+    premier, fichiers = exporter("tok-chat")
+    flux = PagesExportService.stream(premier, fichiers)
+    next(flux)
+
+    exporter("tok-rat", query="rat")
+
+    list(flux)
+    assert PagesExportService.snapshot("tok-chat")['status'] == 'done'
+
+
+def test_un_renvoi_du_meme_jeton_ne_mele_pas_les_comptes(corpus):
+    """Un navigateur qui renvoie la requête réutilise le jeton : l'ancienne requête s'arrête, et
+    ce qu'elle compte encore ne se retrouve pas dans l'état de la nouvelle."""
+    ancien, fichiers = exporter("tok-renvoi")
+    flux = PagesExportService.stream(ancien, fichiers)
+    next(flux)
+
+    PagesExportService.start("tok-renvoi", "idx1", "chat")
+
+    with pytest.raises(ExportCancelled):
+        next(flux)
+    nouveau = PagesExportService.snapshot("tok-renvoi")
+    assert (nouveau['status'], nouveau['files_done'], nouveau['files_total']) == ('preparing', 0, 0)
+    assert (ancien['status'], ancien['cancel_reason']) == ('cancelled', 'replaced')
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────

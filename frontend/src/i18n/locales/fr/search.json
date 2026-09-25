@@ -103,6 +103,7 @@
     "error": "L'export a échoué : {{detail}}",
     "cancelledUser": "Export annulé : le téléchargement a été interrompu.",
     "cancelledClient": "Le téléchargement a été interrompu côté navigateur (annulé, ou onglet fermé).",
+    "cancelledReplaced": "La même recherche a été exportée de nouveau (depuis un autre onglet, ou après un rechargement de la page) : cet export s'est arrêté pour ne pas produire deux fois la même archive, et son téléchargement a été interrompu.",
     "cancel": "Annuler",
     "cancelling": "Annulation…",
     "close": "Fermer",

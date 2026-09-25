@@ -341,8 +341,10 @@ export default function PagesExportDialog({ indexId, indexName, query, token, st
           <Alert severity="error" sx={{ mt: 1 }}>{t('zipExport.error', { detail: status.error ?? '' })}</Alert>
         )}
         {status?.status === 'cancelled' && (
-          <Alert severity={status.cancel_reason === 'client' ? 'warning' : 'info'} sx={{ mt: 1 }}>
-            {status.cancel_reason === 'client' ? t('zipExport.cancelledClient') : t('zipExport.cancelledUser')}
+          <Alert severity={status.cancel_reason === 'user' ? 'info' : 'warning'} sx={{ mt: 1 }}>
+            {status.cancel_reason === 'client' ? t('zipExport.cancelledClient')
+              : status.cancel_reason === 'replaced' ? t('zipExport.cancelledReplaced')
+                : t('zipExport.cancelledUser')}
           </Alert>
         )}
         {lost && <Alert severity="error" sx={{ mt: 1 }}>{t('zipExport.lost')}</Alert>}
