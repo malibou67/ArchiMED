@@ -77,9 +77,9 @@ class IndexStatsService:
         loaded = IndexesService._load_index(index_id)
         if loaded is None:
             return None
-        total_unique, base_entries, words, registres_map, _sources = loaded
+        total_unique, base_entries, words, registres_map, sources = loaded
 
-        sorted_folders = sorted(registres_map.keys(), key=len, reverse=True)
+        prefixes = IndexesService._registre_prefixes(index_id, registres_map, sources)
         folder_of_page: Dict[str, Optional[str]] = {}
 
         # Par registre : pages (set), occurrences, mots uniques
@@ -111,7 +111,7 @@ class IndexStatsService:
                 page = occ.split(' - ')[0]
                 folder = folder_of_page.get(page)
                 if page not in folder_of_page:
-                    folder = IndexesService._get_registre_folder(page, sorted_folders)
+                    folder = IndexesService._get_registre_folder(page, prefixes)
                     folder_of_page[page] = folder
                 all_pages.add(page)
                 reg_pages.setdefault(folder, set()).add(page)

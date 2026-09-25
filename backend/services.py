@@ -309,6 +309,67 @@ def _registre_dirs(scans_dir: Path) -> List[str]:
     return sorted(names, key=len, reverse=True)
 
 
+# Préfixes réels des registres nommés autrement que leur dossier, par metadata.json de
+# collection : chemin -> ((mtime, taille), {préfixe: dossier}).
+_page_alias_cache: Dict[str, tuple] = {}
+
+
+def _collection_page_aliases(col_dir: Optional[Path]) -> Dict[str, str]:
+    """Préfixes de noms de page qui ne commencent pas par le nom de leur dossier registre :
+    `{préfixe: dossier}`.
+
+    D'ordinaire `REG_12.jpg` est rangé dans `REG/`. Mais des registres ont été numérisés sous un
+    autre nom que leur dossier — 17 sur HPC, dont `HPC-373-1963_*.jpg` dans `HPC-373-1973/`.
+    Le motif de pagination relevé par l'analyse de la collection (`registres[].pages_pattern`,
+    et celui des pages bis dans le metadata.json de la collection) donne leur vrai préfixe : la
+    partie fixe avant `{num}`. Un préfixe revendiqué par plusieurs registres est écarté, il ne
+    désigne plus un dossier. Relu seulement quand le fichier change."""
+    if col_dir is None:
+        return {}
+    path = col_dir / "metadata.json"
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    cached = _page_alias_cache.get(str(path))
+    if cached and cached[0] == (st.st_mtime, st.st_size):
+        return cached[1]
+    meta = _read_json_retry(path)
+    claimed: Dict[str, set] = {}
+    for reg in (meta.get('registres') or []) if isinstance(meta, dict) else []:
+        folder = reg.get('folder_name') if isinstance(reg, dict) else None
+        if not folder:
+            continue
+        for pattern in (reg.get('pages_pattern'), (reg.get('extra_pagination') or {}).get('pattern')):
+            if not pattern:
+                continue
+            prefix = re.split(r'\{(?:num|extra_page)\}', pattern, maxsplit=1)[0]
+            if prefix and not prefix.startswith(folder + '_'):
+                claimed.setdefault(prefix, set()).add(folder)
+    aliases = {prefix: next(iter(folders)) for prefix, folders in claimed.items() if len(folders) == 1}
+    _page_alias_cache[str(path)] = ((st.st_mtime, st.st_size), aliases)
+    return aliases
+
+
+def _by_longest_prefix(pairs: List[tuple]) -> List[tuple]:
+    """`[(préfixe, registre, est_alias)]` → `[(préfixe, registre)]`, dans l'ordre où les essayer :
+    le plus long préfixe d'abord, et à égalité le nom de dossier avant un alias — deux registres
+    dont les fichiers portent le même préfixe restent attribués au dossier qui porte ce nom."""
+    return [(prefix, registre) for prefix, registre, _alias
+            in sorted(pairs, key=lambda p: (-len(p[0]), p[2]))]
+
+
+def _folder_prefixes(col_dir: Path) -> List[tuple]:
+    """(préfixe, dossier) des registres d'une collection sur le disque, alias compris
+    (cf. `_collection_page_aliases`), dans l'ordre où les essayer."""
+    folders = _registre_dirs(col_dir / "scans")
+    existing = set(folders)
+    pairs = [(folder + '_', folder, False) for folder in folders]
+    pairs += [(prefix, folder, True) for prefix, folder in _collection_page_aliases(col_dir).items()
+              if folder in existing]
+    return _by_longest_prefix(pairs)
+
+
 def _find_page_image(stem: str, images: Dict[str, int]) -> Optional[str]:
     """Fichier image d'une page parmi `images` (noms d'un registre) : stem exact, casse
     comprise, et première extension trouvée dans cet ordre de préférence."""
@@ -2983,20 +3044,44 @@ class IndexesService:
     }
 
     @staticmethod
-    def _get_registre_folder(page_name: str, sorted_folders: List[str]) -> Optional[str]:
-        """Retourne la clé de registre (namespacée 'sX::folder' en multi-sources) d'une page."""
-        for folder in sorted_folders:
-            if page_name.startswith(folder + '_'):
+    def _registre_prefixes(index_id: str, registres_map: Dict[str, Dict],
+                           sources_block: Dict[str, Dict]) -> List[tuple]:
+        """(préfixe de nom de page, clé de registre) d'un index, dans l'ordre où les essayer :
+        le nom de chaque dossier (`sX::REG_`), plus le vrai préfixe des registres numérisés sous
+        un autre nom que leur dossier (cf. `_collection_page_aliases`). Sans ce dernier, leurs
+        pages n'avaient pas de registre : absentes dès qu'on filtre par période, « non
+        rattachées » dans les statistiques, introuvables pour la visionneuse et l'export."""
+        SEP = IndexesService.SOURCE_SEP
+        pairs = [(key + '_', key, False) for key in registres_map]
+        if sources_block:
+            collections = [(f"{src_key}{SEP}", sb.get('collection_folder'))
+                           for src_key, sb in sources_block.items()]
+        else:   # index mono-collection d'avant les sources : clés sans espace de noms
+            meta = IndexesService.get_index(index_id) or {}
+            collections = [('', meta.get('collection_folder') or meta.get('collection_id'))]
+        for namespace, ref in collections:
+            col_dir = IndexesService._resolve_collection_folder(ref) if ref else None
+            for prefix, folder in _collection_page_aliases(col_dir).items():
+                if namespace + folder in registres_map:
+                    pairs.append((namespace + prefix, namespace + folder, True))
+        return _by_longest_prefix(pairs)
+
+    @staticmethod
+    def _get_registre_folder(page_name: str, prefixes: List[tuple]) -> Optional[str]:
+        """Retourne la clé de registre (namespacée 'sX::folder' en multi-sources) d'une page :
+        celle du premier préfixe qui lui correspond (cf. `_registre_prefixes`)."""
+        for prefix, folder in prefixes:
+            if page_name.startswith(prefix):
                 return folder
         return None
 
     @staticmethod
-    def _page_source_registre(page_name: str, sorted_folders: List[str],
+    def _page_source_registre(page_name: str, prefixes: List[tuple],
                               sources_block: Dict[str, Dict]) -> tuple:
         """(source_label|None, registre_folder|None) d'une page. La source est déduite du
         préfixe de namespace ('sX::…') via le bloc `sources` de l'index."""
         SEP = IndexesService.SOURCE_SEP
-        folder = IndexesService._get_registre_folder(page_name, sorted_folders)
+        folder = IndexesService._get_registre_folder(page_name, prefixes)
         key = None
         registre = folder
         if folder and SEP in folder:
@@ -3092,8 +3177,8 @@ class IndexesService:
         if not terms:
             terms = raw_terms
 
-        # Folders triés par longueur décroissante pour le matching de préfixe
-        sorted_folders = sorted(registres_map.keys(), key=len, reverse=True)
+        # Préfixes de page -> registre, dans l'ordre où les essayer (alias compris)
+        prefixes = IndexesService._registre_prefixes(index_id, registres_map, sources_block)
 
         # Déterminer les folders autorisés par le filtre d'années
         allowed_folders: Optional[set] = None
@@ -3131,7 +3216,7 @@ class IndexesService:
                 for occ in occs:
                     page = occ.split(' - ')[0]
                     if allowed_folders is not None:
-                        folder = IndexesService._get_registre_folder(page, sorted_folders)
+                        folder = IndexesService._get_registre_folder(page, prefixes)
                         if folder not in allowed_folders:
                             continue
                     term_page_data[term].setdefault(page, {}).setdefault(word, []).append(occ)
@@ -3154,7 +3239,7 @@ class IndexesService:
 
         # Construire les résultats par page, triés par registre puis numéro de page
         def sort_key(page_name: str):
-            folder = IndexesService._get_registre_folder(page_name, sorted_folders)
+            folder = IndexesService._get_registre_folder(page_name, prefixes)
             info = registres_map.get(folder, {}) if folder else {}
             periode = info.get("periode", ["0", "0"])
             try:
@@ -3172,7 +3257,7 @@ class IndexesService:
                 for word, occs in term_page_data[term].get(page_name, {}).items():
                     words_on_page[word] = occs
             source, registre = IndexesService._page_source_registre(
-                page_name, sorted_folders, sources_block)
+                page_name, prefixes, sources_block)
             pages.append({"page_name": page_name, "words": words_on_page,
                           "source": source, "registre": registre})
 
@@ -3460,17 +3545,12 @@ class IndexesService:
         if not col_dir:
             return None
         scans_dir = col_dir / "scans"
-        if not scans_dir.exists():
-            return None
-        # Trier par longueur décroissante pour matcher le préfixe le plus long en premier
-        registre_dirs = sorted(
-            (d for d in scans_dir.iterdir() if d.is_dir()),
-            key=lambda d: len(d.name), reverse=True
-        )
-        for registre_dir in registre_dirs:
-            if page.startswith(registre_dir.name + '_'):
+        # Préfixe le plus long d'abord, alias compris (registres nommés autrement que leur
+        # dossier) ; on essaie le suivant tant que le fichier n'est pas trouvé.
+        for prefix, registre in _folder_prefixes(col_dir):
+            if page.startswith(prefix):
                 for ext in ('.jpg', '.jpeg', '.png', '.tif', '.tiff'):
-                    p = registre_dir / f"{page}{ext}"
+                    p = scans_dir / registre / f"{page}{ext}"
                     if p.exists():
                         return p
         return None
@@ -3481,24 +3561,24 @@ class IndexesService:
         [(nom, nom_réel)])]`, dans l'ordre de première apparition.
 
         Seul le `scans/` de chaque collection concernée est lu (un `os.scandir`), pour trouver
-        le registre de chaque page par préfixe. Les registres eux-mêmes restent à lister par
-        l'appelant, un par un, et seulement ceux qui portent une page demandée : lister toute
-        la collection coûtait de l'ordre de l'heure sur le partage pour HPC (1 437 registres),
-        quelle que soit la recherche. Les pages dont la collection ou le registre restent
-        introuvables forment le groupe `(None, None, …)`."""
+        le registre de chaque page par préfixe — le nom du dossier, ou le vrai préfixe d'un
+        registre nommé autrement (cf. `_folder_prefixes`). Les registres eux-mêmes restent à
+        lister par l'appelant, un par un, et seulement ceux qui portent une page demandée :
+        lister toute la collection coûtait de l'ordre de l'heure sur le partage pour HPC
+        (1 437 registres), quelle que soit la recherche. Les pages dont la collection ou le
+        registre restent introuvables forment le groupe `(None, None, …)`."""
         col_cache: Dict[str, Optional[Path]] = {}
-        reg_names: Dict[Path, List[str]] = {}
+        col_prefixes: Dict[Path, List[tuple]] = {}
         groups: Dict[tuple, List[tuple]] = {}
         for name in page_names:
             col_dir, real = IndexesService._page_collection_dir(meta, name, col_cache)
             reg_dir = registre = None
             if col_dir:
-                scans_dir = col_dir / "scans"
-                if scans_dir not in reg_names:
-                    reg_names[scans_dir] = _registre_dirs(scans_dir)
-                registre = next((r for r in reg_names[scans_dir] if real.startswith(r + '_')), None)
+                if col_dir not in col_prefixes:
+                    col_prefixes[col_dir] = _folder_prefixes(col_dir)
+                registre = next((r for prefix, r in col_prefixes[col_dir] if real.startswith(prefix)), None)
                 if registre:
-                    reg_dir = scans_dir / registre
+                    reg_dir = col_dir / "scans" / registre
             groups.setdefault((reg_dir, registre), []).append((name, real))
         return [(reg_dir, registre, members) for (reg_dir, registre), members in groups.items()]
 
