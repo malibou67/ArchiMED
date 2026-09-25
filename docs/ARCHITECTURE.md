@@ -304,7 +304,7 @@ instance uses an empty `baseURL` since production is same-origin.
   PyTorch 2.10 (CUDA 12.8 build for GPU acceleration), torchvision 0.25,
   RapidFuzz (fuzzy search) — pinned versions in `backend/requirements.txt`
 - **Frontend**: React 19, TypeScript, Vite 7, Material-UI (MUI) v7, `@mui/x-charts` v9,
-  React Router v7, i18next / react-i18next, Axios, JSZip (ZIP export)
+  React Router v7, i18next / react-i18next, Axios (the pages ZIP export is streamed by the backend)
 - **Styling**: Material-UI, CSS-in-JS (Emotion)
 - **Desktop**: PyInstaller, pystray (Windows system-tray icon)
 - **OCR format**: PAGE-XML (Kraken / eScriptorium)

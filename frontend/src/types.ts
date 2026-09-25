@@ -305,6 +305,39 @@ export type SearchProgress = {
   total: number;
 }
 
+// État d'un export ZIP des pages, suivi côté serveur pendant que le navigateur télécharge.
+// `phase` : les quatre de la recherche, puis `resolve` (inventaire des images, un pas par
+// registre) et `zip` (envoi, un pas par image). Les octets sont ceux de l'inventaire, pour
+// que la barre finisse à 100 % même si une image se révèle illisible en route.
+export type PagesExportStatus = {
+  token: string;
+  index_id: string;
+  query: string;
+  status: 'preparing' | 'streaming' | 'done' | 'error' | 'cancelled';
+  phase: SearchProgress['phase'] | 'resolve' | 'zip' | null;
+  current: number;
+  total: number;
+  item: string | null;              // registre (inventaire) ou fichier (envoi) en cours
+  pages: number | null;
+  registres: number | null;
+  files_total: number;
+  files_done: number;
+  bytes_total: number;
+  bytes_done: number;
+  files_written: number;
+  bytes_written: number;
+  missing: string[];                // 50 premières pages sans image (l'archive les liste toutes)
+  missing_count: number;
+  unreadable: string[];
+  unreadable_count: number;
+  error: string | null;
+  cancel_reason: 'user' | 'client' | null;
+  cancel_requested: boolean;
+  elapsed_s: number;
+  idle_s: number;                   // secondes depuis la dernière avancée
+  zip_elapsed_s: number;
+}
+
 export type VocabularyEntry = {
   word: string;
   occurrences: number;

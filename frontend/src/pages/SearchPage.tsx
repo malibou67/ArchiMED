@@ -64,6 +64,7 @@ import {
 } from '../components/PageImageViewer';
 import SearchResultsStats from '../components/stats/SearchResultsStats';
 import EmptyState from '../components/EmptyState';
+import PagesExportDialog from '../components/PagesExportDialog';
 
 // ─── SearchPage ───────────────────────────────────────────────────────────────
 
@@ -109,7 +110,8 @@ export default function SearchPage() {
   const [selectedWords, setSelectedWords] = useState<Set<string>>(new Set());
   const [fuzzyThreshold, setFuzzyThreshold] = useState(100);
   const [exportAnchor, setExportAnchor] = useState<null | HTMLElement>(null);
-  const [preparingZip, setPreparingZip] = useState(false);  // overlay pendant la préparation du ZIP
+  // Export ZIP en cours de suivi (fenêtre modale jusqu'à la fin de l'export).
+  const [zipExport, setZipExport] = useState<{ token: string; indexId: string; query: string; startedAt: number } | null>(null);
   const REG_PER_PAGE = 10;
 
   // Pages liées (famille : page principale + extras) pour la visionneuse de recherche.
@@ -311,24 +313,10 @@ export default function SearchPage() {
     URL.revokeObjectURL(a.href);
   };
 
-  // Attend le cookie posé par le backend au démarrage du flux ZIP (= fin de la préparation
-  // serveur), avec un filet de sécurité `timeoutMs` pour ne jamais laisser l'overlay bloqué.
-  const waitForZipStart = (token: string, timeoutMs: number): Promise<void> =>
-    new Promise(resolve => {
-      const start = Date.now();
-      const id = window.setInterval(() => {
-        const ready = document.cookie.split('; ').some(c => c === `archimed_zip_ready=${token}`);
-        if (ready || Date.now() - start > timeoutMs) {
-          window.clearInterval(id);
-          if (ready) document.cookie = 'archimed_zip_ready=; Max-Age=0; path=/';
-          resolve();
-        }
-      }, 400);
-    });
-
-  // Export ZIP piloté en JS (plutôt qu'un simple <a href>) afin d'afficher un loader pendant la
-  // préparation serveur. Le téléchargement reste streamé sur disque (ancre native déclenchée
-  // ici) : aucune limite de taille, l'archive ne transite pas par la mémoire du navigateur.
+  // Export ZIP : le téléchargement reste natif et streamé sur disque (ancre déclenchée ici) —
+  // aucune limite de taille, l'archive ne transite pas par la mémoire du navigateur. La page
+  // n'en voit donc rien passer : la fenêtre de suivi interroge le serveur sous le même jeton,
+  // du clic jusqu'au dernier octet.
   const handleExportZip = () => {
     if (!searchResult) return;
     setExportAnchor(null);
@@ -338,14 +326,13 @@ export default function SearchPage() {
       q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to,
       fuzzy_threshold: searchResult.fuzzy_threshold, download_token: token,
     });
-    setPreparingZip(true);
     const a = document.createElement('a');
     a.href = url;
     a.download = '';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    waitForZipStart(token, 15 * 60_000).finally(() => setPreparingZip(false));
+    setZipExport({ token, indexId: selectedIndex, query: searchResult.query, startedAt: Date.now() });
   };
 
 
@@ -381,23 +368,40 @@ export default function SearchPage() {
 
   const selectedStats = indexes.find(i => i.id === selectedIndex)?.stats;
 
+  // Rendue dans les deux vues ci-dessous : un retour navigateur vers la vue pleine page ne doit
+  // pas faire perdre le suivi d'un export en cours.
+  const exportDialog = zipExport && (
+    <PagesExportDialog
+      key={zipExport.token}
+      indexId={zipExport.indexId}
+      indexName={indexes.find(i => i.id === zipExport.indexId)?.name ?? zipExport.indexId}
+      query={zipExport.query}
+      token={zipExport.token}
+      startedAt={zipExport.startedAt}
+      onClose={() => setZipExport(null)}
+    />
+  );
+
   // Vue pleine page d'un résultat (pilotée par ?view=<index>) : le composant reste monté,
   // donc les résultats sont préservés au retour.
   const viewParam = searchParams.get('view');
   if (viewParam !== null && viewerList.length > 0) {
     const startIndex = Math.min(Math.max(0, Number(viewParam) || 0), viewerList.length - 1);
     return (
-      <FullPageViewer
-        entries={viewerList}
-        startIndex={startIndex}
-        getImageUrl={(p) => indexesApi.getPageImageUrl(selectedIndex, p)}
-        getRelated={getRelated}
-        getEntry={(p) => ({ pageName: p, boxes: [], wordSummary: '' })}
-        getThumbLabel={getThumbLabel}
-        getBoxes={getBoxes}
-        backLabel={t('backToSearch')}
-        onBack={() => { const p = new URLSearchParams(searchParams); p.delete('view'); setSearchParams(p); }}
-      />
+      <>
+        <FullPageViewer
+          entries={viewerList}
+          startIndex={startIndex}
+          getImageUrl={(p) => indexesApi.getPageImageUrl(selectedIndex, p)}
+          getRelated={getRelated}
+          getEntry={(p) => ({ pageName: p, boxes: [], wordSummary: '' })}
+          getThumbLabel={getThumbLabel}
+          getBoxes={getBoxes}
+          backLabel={t('backToSearch')}
+          onBack={() => { const p = new URLSearchParams(searchParams); p.delete('view'); setSearchParams(p); }}
+        />
+        {exportDialog}
+      </>
     );
   }
 
@@ -875,10 +879,7 @@ export default function SearchPage() {
         <Typography variant="body2" sx={{ color: '#fff', opacity: 0.9 }}>{t('loadingImage')}</Typography>
       </Backdrop>
 
-      <Backdrop open={preparingZip} sx={{ zIndex: theme => theme.zIndex.modal + 1, color: '#fff', flexDirection: 'column', gap: 2 }}>
-        <CircularProgress color="inherit" />
-        <Typography variant="body2" sx={{ color: '#fff', opacity: 0.9 }}>{t('preparingArchive')}</Typography>
-      </Backdrop>
+      {exportDialog}
 
       {viewerOpen && viewerList.length > 0 && (
         <ImageViewer

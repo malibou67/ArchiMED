@@ -8,6 +8,7 @@ import {
   IndexUpdates,
   IndexPreview,
   MultiSearchResponse,
+  PagesExportStatus,
   SearchProgress,
   VocabularyResponse,
   WordPagesResponse,
@@ -207,5 +208,18 @@ export const indexesApi = {
     if (params.download_token) qs.set('download_token', params.download_token);
     const file = kind === 'csv' ? 'export-results.csv' : 'export-pages.zip';
     return `/api/indexes/${indexId}/${file}?${qs.toString()}`;
+  },
+
+  // Suivi d'un export ZIP lancé avec `download_token` : le téléchargement est natif, la page
+  // n'en voit rien passer et interroge donc le serveur. Timeout court : un sondage qui traîne
+  // est lui-même le signe d'un serveur en difficulté, et le suivant repartira.
+  getPagesExportStatus: async (indexId: string, token: string): Promise<PagesExportStatus> => {
+    const response = await api.get(`/api/indexes/${indexId}/export-pages/${token}`, { timeout: 5000 });
+    return response.data;
+  },
+
+  cancelPagesExport: async (indexId: string, token: string): Promise<PagesExportStatus> => {
+    const response = await api.delete(`/api/indexes/${indexId}/export-pages/${token}`, { timeout: 5000 });
+    return response.data;
   },
 };

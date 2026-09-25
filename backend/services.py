@@ -259,6 +259,65 @@ def _page_key(name: str, main_pattern: Optional[str], extra_pattern: Optional[st
     return f"{m.group(1)}_{m.group(2)}" if m else None
 
 
+def _scan_sort_key(name: str) -> tuple:
+    """Clé de tri des pages d'un registre : tous les nombres du nom, dans l'ordre.
+
+    Le préfixe étant commun à tout le registre, c'est le numéro de page qui départage, puis
+    celui de la page hors-motif. Un simple « dernier nombre avant l'extension » classait
+    `X_110_1.jpg` en première position, et `_080.jpg` se trie bien avec `_79.jpg` (le
+    remplissage par zéros n'est pas uniforme). Le nom départage à égalité de nombres, pour un
+    ordre stable."""
+    return ([int(n) for n in re.findall(r'\d+', name)], name)
+
+
+def _scan_images(directory: Path) -> Dict[str, int]:
+    """Images d'un dossier de scans : `{nom: taille en octets}`, `{}` si le dossier manque.
+
+    Un seul `os.scandir` : sous Windows, le type et la taille de chaque entrée arrivent avec le
+    listage lui-même, alors que `Path.iterdir()` suivi de `is_file()` paie un aller-retour
+    réseau par fichier. Mesuré sur Y: : 0,13 s par registre, contre 2,3 à 2,8 s."""
+    images: Dict[str, int] = {}
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if os.path.splitext(entry.name)[1].lower() not in IMAGE_EXTENSIONS:
+                    continue
+                try:
+                    if entry.is_file():
+                        images[entry.name] = entry.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return {}
+    return images
+
+
+def _registre_dirs(scans_dir: Path) -> List[str]:
+    """Dossiers registres d'un `scans/`, du nom le plus long au plus court : l'ordre dans
+    lequel chercher le registre d'une page par préfixe (le plus long l'emporte)."""
+    names: List[str] = []
+    try:
+        with os.scandir(scans_dir) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        names.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return sorted(names, key=len, reverse=True)
+
+
+def _find_page_image(stem: str, images: Dict[str, int]) -> Optional[str]:
+    """Fichier image d'une page parmi `images` (noms d'un registre) : stem exact, casse
+    comprise, et première extension trouvée dans cet ordre de préférence."""
+    for ext in ('.jpg', '.jpeg', '.png', '.tif', '.tiff'):
+        if f"{stem}{ext}" in images:
+            return f"{stem}{ext}"
+    return None
+
+
 def _parse_model_accuracy(raw: Any) -> Optional[float]:
     """Précision d'un user_metadata Kraken : scalaire, liste de scalaires, ou liste de
     paires [étape, précision] (kraken ≥ 4) — on garde le meilleur checkpoint."""
@@ -1400,15 +1459,7 @@ class RegistresService:
             if f.is_file() and f.suffix.lower() in image_extensions
         ]
 
-        # Tous les nombres du nom, dans l'ordre : le préfixe étant commun à tout le registre,
-        # c'est le numéro de page qui départage, puis celui de la page hors-motif. Un simple
-        # « dernier nombre avant l'extension » classait `X_110_1.jpg` en première position, et
-        # `_080.jpg` se trie bien avec `_79.jpg` (le remplissage par zéros n'est pas uniforme).
-        # Le nom départage à égalité de nombres, pour un ordre stable.
-        def sort_key(name: str):
-            return ([int(n) for n in re.findall(r'\d+', name)], name)
-
-        pages.sort(key=sort_key)
+        pages.sort(key=_scan_sort_key)
         return pages
 
     @staticmethod
@@ -3364,10 +3415,21 @@ class IndexesService:
         }
 
     @staticmethod
-    def _page_collection_dir(meta: Dict[str, Any], page_name: str) -> tuple:
+    def _page_collection_dir(meta: Dict[str, Any], page_name: str,
+                             cache: Optional[Dict[str, Optional[Path]]] = None) -> tuple:
         """(col_dir, page_reelle) pour une page. En multi-sources, le préfixe 'sX::' désigne
         la source (→ sa collection) et le reste est le nom réel du fichier scan. En legacy,
-        la page n'a pas de préfixe → collection unique de l'index."""
+        la page n'a pas de préfixe → collection unique de l'index.
+
+        `cache` (référence de collection → dossier) sert aux résolutions en masse : sans lui,
+        chaque page repaie la résolution de sa collection, et son `is_dir()` sur le partage."""
+        def resolve(ref: str) -> Optional[Path]:
+            if cache is None:
+                return IndexesService._resolve_collection_folder(ref)
+            if ref not in cache:
+                cache[ref] = IndexesService._resolve_collection_folder(ref)
+            return cache[ref]
+
         SEP = IndexesService.SOURCE_SEP
         sources = meta.get('sources')
         if sources and SEP in page_name:
@@ -3376,10 +3438,16 @@ class IndexesService:
             if not src:
                 return None, page_name
             ref = src.get('collection_id') or src.get('collection_folder')
-            return IndexesService._resolve_collection_folder(ref), rest
+            return resolve(ref), rest
         col_ref = meta.get('collection_folder') or meta.get('collection_id')
-        col_dir = IndexesService._resolve_collection_folder(col_ref) if col_ref else None
+        col_dir = resolve(col_ref) if col_ref else None
         return col_dir, page_name
+
+    @staticmethod
+    def _display_page_name(page_name: str) -> str:
+        """Nom de page tel qu'on l'affiche : sans le préfixe technique de source ('sX::')."""
+        SEP = IndexesService.SOURCE_SEP
+        return page_name.split(SEP, 1)[1] if SEP in page_name else page_name
 
     @staticmethod
     def get_page_image_path(index_id: str, page_name: str) -> Optional[Path]:
@@ -3408,49 +3476,47 @@ class IndexesService:
         return None
 
     @staticmethod
+    def _group_pages_by_registre(meta: Dict[str, Any], page_names: List[str]) -> List[tuple]:
+        """Regroupe des pages par dossier registre : `[(dossier|None, registre|None,
+        [(nom, nom_réel)])]`, dans l'ordre de première apparition.
+
+        Seul le `scans/` de chaque collection concernée est lu (un `os.scandir`), pour trouver
+        le registre de chaque page par préfixe. Les registres eux-mêmes restent à lister par
+        l'appelant, un par un, et seulement ceux qui portent une page demandée : lister toute
+        la collection coûtait de l'ordre de l'heure sur le partage pour HPC (1 437 registres),
+        quelle que soit la recherche. Les pages dont la collection ou le registre restent
+        introuvables forment le groupe `(None, None, …)`."""
+        col_cache: Dict[str, Optional[Path]] = {}
+        reg_names: Dict[Path, List[str]] = {}
+        groups: Dict[tuple, List[tuple]] = {}
+        for name in page_names:
+            col_dir, real = IndexesService._page_collection_dir(meta, name, col_cache)
+            reg_dir = registre = None
+            if col_dir:
+                scans_dir = col_dir / "scans"
+                if scans_dir not in reg_names:
+                    reg_names[scans_dir] = _registre_dirs(scans_dir)
+                registre = next((r for r in reg_names[scans_dir] if real.startswith(r + '_')), None)
+                if registre:
+                    reg_dir = scans_dir / registre
+            groups.setdefault((reg_dir, registre), []).append((name, real))
+        return [(reg_dir, registre, members) for (reg_dir, registre), members in groups.items()]
+
+    @staticmethod
     def _resolve_pages_files(index_id: str, page_names: List[str]) -> Dict[str, tuple]:
         """Résout en masse une liste de noms de pages vers (Path, registre_folder).
-        Scanne chaque collection une seule fois (efficace pour des milliers de pages,
-        y compris quand les pages proviennent de plusieurs collections)."""
+        Chaque registre concerné est listé une fois, et seulement ceux-là
+        (cf. `_group_pages_by_registre`)."""
         meta = IndexesService.get_index(index_id)
         if not meta:
             return {}
 
-        image_exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff')
-        # Cache par collection : (scans_dir, reg_names triés desc, reg_files).
-        col_cache: Dict[str, tuple] = {}
-
-        def _col_info(col_dir: Path) -> tuple:
-            ck = str(col_dir)
-            if ck in col_cache:
-                return col_cache[ck]
-            scans_dir = col_dir / "scans"
-            if not scans_dir.exists():
-                col_cache[ck] = (None, [], {})
-                return col_cache[ck]
-            reg_dirs = sorted((d for d in scans_dir.iterdir() if d.is_dir()),
-                              key=lambda d: len(d.name), reverse=True)
-            reg_files = {d.name: {f.name for f in d.iterdir() if f.is_file()} for d in reg_dirs}
-            col_cache[ck] = (scans_dir, [d.name for d in reg_dirs], reg_files)
-            return col_cache[ck]
-
         result: Dict[str, tuple] = {}
-        for name in page_names:
-            col_dir, real = IndexesService._page_collection_dir(meta, name)
-            path = None
-            registre = None
-            if col_dir:
-                scans_dir, reg_names, reg_files = _col_info(col_dir)
-                if scans_dir is not None:
-                    registre = next((r for r in reg_names if real.startswith(r + '_')), None)
-                    if registre:
-                        files = reg_files[registre]
-                        for ext in image_exts:
-                            fn = f"{real}{ext}"
-                            if fn in files:
-                                path = scans_dir / registre / fn
-                                break
-            result[name] = (path, registre)
+        for reg_dir, registre, members in IndexesService._group_pages_by_registre(meta, page_names):
+            images = _scan_images(reg_dir) if reg_dir else {}
+            for name, real in members:
+                filename = _find_page_image(real, images)
+                result[name] = (reg_dir / filename if filename else None, registre)
         return result
 
     @staticmethod
@@ -3469,7 +3535,6 @@ class IndexesService:
         pages = result.get("pages", [])
         files = IndexesService._resolve_pages_files(index_id, [p["page_name"] for p in pages])
 
-        SEP = IndexesService.SOURCE_SEP
         rows: List[Dict[str, Any]] = []
         for p in pages:
             name = p["page_name"]
@@ -3477,10 +3542,8 @@ class IndexesService:
             path, registre = files.get(name, (None, None))
             chemin = os.path.relpath(str(path), DATA_DIR) if path else ""
             src = p.get("source") or {}
-            # Nom de page affiché : sans le préfixe technique de source.
-            display = name.split(SEP, 1)[1] if SEP in name else name
             rows.append({
-                "page": display,
+                "page": IndexesService._display_page_name(name),
                 "registre": registre or p.get("registre") or "",
                 "source": src.get("collection_titre") or src.get("collection_folder") or "",
                 "model": src.get("model_name") or "",
@@ -3491,100 +3554,79 @@ class IndexesService:
         return rows
 
     @staticmethod
-    def resolve_result_zip_files(
+    def resolve_result_zip_files_iter(
         index_id: str, q: str,
         year_from: Optional[int] = None, year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
-    ) -> Optional[List[tuple]]:
-        """Fichiers (registre, Path) à inclure dans le ZIP d'une recherche : les pages résultats
-        ET leurs extra pages (même registre, même numéro principal), pour coller à ce qu'affiche
-        la visionneuse. Retourne None si l'index est absent."""
-        result = IndexesService.search_words(
+    ):
+        """Fichiers à mettre dans le ZIP d'une recherche : les pages résultats ET leurs extra
+        pages (même registre, même numéro principal), pour coller à ce qu'affiche la visionneuse.
+
+        En flux, pour que l'export dise où il en est : relaie la progression de la recherche
+        (`search_words_iter`), émet {'type': 'progress', 'phase': 'resolve', 'current', 'total',
+        'registre'} à chaque registre inventorié (le premier, à 0, porte aussi 'pages', le nombre
+        de pages trouvées), puis finit par {'type': 'files', 'files':
+        [(registre, Path, taille)], 'missing': [pages sans image], 'pages': pages trouvées,
+        'registres': registres inventoriés} — `files` à None si l'index est absent.
+
+        Chaque registre concerné est listé une fois, et ses motifs de pagination sont lus dans
+        son propre metadata.json : `RegistresService.get_registre` relisait ceux de toute la
+        collection pour chaque registre (23 à 55 s par appel sur HPC, depuis le partage)."""
+        result = None
+        for event in IndexesService.search_words_iter(
             index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
-        )
-        if result is None:
-            return None
-        pages = result.get("pages", [])
-        resolved = IndexesService._resolve_pages_files(index_id, [p["page_name"] for p in pages])
+        ):
+            if event.get('type') == 'result':
+                result = event['result']
+            else:
+                yield event
+        meta = IndexesService.get_index(index_id) if result is not None else None
+        if result is None or not meta:
+            yield {"type": "files", "files": None}
+            return
 
-        # Cache par registre : (dossier scans/<registre>, {fichier -> famille principale+extras}).
-        reg_cache: Dict[tuple, tuple] = {}
-        out: List[tuple] = []
-        seen: set = set()
-        for _name, (path, registre) in resolved.items():
-            if not path or not registre:
-                continue
-            collection_id = path.parents[2].name  # …/<collection_id>/scans/<registre>/<fichier>
-            ck = (collection_id, registre)
-            if ck not in reg_cache:
-                reg = RegistresService.get_registre(collection_id, registre) or {}
-                main_pattern = reg.get('pages_pattern')
-                extra_pattern = (reg.get('extra_pagination') or {}).get('pattern')
-                files = RegistresService.list_scan_pages(collection_id, registre)
-                groups: Dict[str, List[str]] = {}
-                keyed: Dict[str, Optional[str]] = {}
-                for f in files:
-                    k = _page_key(f, main_pattern, extra_pattern)
-                    keyed[f] = k
-                    if k is not None:
-                        groups.setdefault(k, []).append(f)
-                fam_index = {f: (groups[k] if k is not None else [f]) for f, k in keyed.items()}
-                reg_cache[ck] = (path.parent, fam_index)
-            scans_reg_dir, fam_index = reg_cache[ck]
-            for fn in fam_index.get(path.name, [path.name]):
-                fp = scans_reg_dir / fn
-                if fp not in seen:
-                    seen.add(fp)
-                    out.append((registre, fp))
-        return out
+        page_names = [p["page_name"] for p in result.get("pages", [])]
+        groups = IndexesService._group_pages_by_registre(meta, page_names)
+        located = [g for g in groups if g[0] is not None]
+        missing = [IndexesService._display_page_name(name)
+                   for reg_dir, _registre, members in groups if reg_dir is None
+                   for name, _real in members]
+        total = len(located)
+        yield {"type": "progress", "phase": "resolve", "current": 0, "total": total,
+               "pages": len(page_names)}
 
-    @staticmethod
-    def stream_pages_zip(files: List[tuple]):
-        """Génère un ZIP (non compressé, streamé) des fichiers bruts.
-        `files` = liste de (registre, Path). Mémoire constante même pour des milliers de pages."""
-        import zipfile
-
-        class _Buffer:
-            def __init__(self):
-                self.data = bytearray()
-            def write(self, b):
-                self.data += b
-                return len(b)
-            def flush(self):
-                pass
-
-        buf = _Buffer()
-        seen: Dict[str, int] = {}
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for registre, path in files:
-                if not path:
+        files: List[tuple] = []
+        for done, (reg_dir, registre, members) in enumerate(located, 1):
+            images = _scan_images(reg_dir)
+            reg_meta = _read_json_retry(reg_dir / "metadata.json")
+            if not isinstance(reg_meta, dict):
+                reg_meta = {}
+            main_pattern = reg_meta.get('pages_pattern')
+            extra_pattern = (reg_meta.get('extra_pagination') or {}).get('pattern')
+            # Famille de chaque fichier (page principale + extras), dans l'ordre du registre.
+            keys: Dict[str, Optional[str]] = {}
+            families: Dict[str, List[str]] = {}
+            for filename in sorted(images, key=_scan_sort_key):
+                key = _page_key(filename, main_pattern, extra_pattern)
+                keys[filename] = key
+                if key is not None:
+                    families.setdefault(key, []).append(filename)
+            seen: set = set()
+            for name, real in members:
+                filename = _find_page_image(real, images)
+                if filename is None:
+                    missing.append(IndexesService._display_page_name(name))
                     continue
-                arc = f"{registre}/{path.name}" if registre else path.name
-                # Éviter les doublons de noms dans l'archive.
-                if arc in seen:
-                    seen[arc] += 1
-                    stem, dot, ext = arc.rpartition('.')
-                    arc = f"{stem}_{seen[arc]}{dot}{ext}" if dot else f"{arc}_{seen[arc]}"
-                else:
-                    seen[arc] = 0
-                try:
-                    with zf.open(arc, 'w') as dest, open(path, 'rb') as src:
-                        while True:
-                            chunk = src.read(1 << 16)
-                            if not chunk:
-                                break
-                            dest.write(chunk)
-                            if buf.data:
-                                yield bytes(buf.data)
-                                buf.data.clear()
-                except OSError:
-                    continue
-                if buf.data:
-                    yield bytes(buf.data)
-                    buf.data.clear()
-        if buf.data:
-            yield bytes(buf.data)
-            buf.data.clear()
+                key = keys[filename]
+                for member in (families[key] if key is not None else [filename]):
+                    if member not in seen:
+                        seen.add(member)
+                        files.append((registre, reg_dir / member, images[member]))
+            yield {"type": "progress", "phase": "resolve", "current": done, "total": total,
+                   "registre": registre}
+
+        yield {"type": "files", "files": files, "missing": missing,
+               "pages": len(page_names), "registres": total}
 
     @staticmethod
     def delete_index(index_id: str) -> bool:

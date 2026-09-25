@@ -1,4 +1,6 @@
 import json
+import re
+import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -9,10 +11,36 @@ from models import (
 )
 from services import IndexesService
 from stats_service import IndexStatsService
+from export_service import PagesExportService, ExportCancelled
 from index_runner import enqueue_index
 from task_service import TaskConflict, TaskUnavailable
 
 router = APIRouter()
+
+# Jeton d'export fourni par la page (UUID, ou repli horodaté hors contexte sécurisé).
+_DOWNLOAD_TOKEN = re.compile(r'^[A-Za-z0-9-]{8,64}$')
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """StreamingResponse qui referme son générateur dès que la requête se termine.
+
+    Quand le navigateur lâche un téléchargement, Starlette abandonne l'itération sans refermer
+    le générateur : il ne l'était qu'au passage du ramasse-miettes (de 1,5 à 8 s mesurées), et
+    l'export restait affiché « en cours » d'ici là ; refermé ici, l'abandon se voit en moins de
+    0,1 s. Aucun thread ne l'exécute plus à ce stade (anyio attend la fin de `next()` avant
+    d'honorer l'annulation) ; sur un flux épuisé ou déjà en erreur, `close()` ne fait rien."""
+
+    def __init__(self, content, *args, **kwargs):
+        super().__init__(content, *args, **kwargs)
+        self._content = content
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self._content, 'close', None)
+            if close is not None:
+                close()
 
 
 @router.get("/", response_model=List[IndexMetadata])
@@ -216,29 +244,55 @@ def export_pages_zip(
     year_from: Optional[int] = Query(None),
     year_to: Optional[int] = Query(None),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
-    download_token: Optional[str] = Query(None, description="Jeton renvoyé en cookie au démarrage du flux (loader front)"),
+    download_token: Optional[str] = Query(None, description="Identifiant de l'export, pour en suivre la progression"),
 ):
     """Exporte les images brutes (sans annotation) des pages résultats — et de leurs extra
-    pages — en ZIP streamé."""
-    files = IndexesService.resolve_result_zip_files(
-        index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+    pages — en ZIP streamé, avec un récapitulatif `_export.txt`.
+
+    Le téléchargement reste natif ; `download_token` permet à la page de suivre l'export
+    (`GET /{index_id}/export-pages/{token}`) et de l'annuler (`DELETE`). La préparation
+    (recherche, inventaire des images) se fait ici, avant la réponse, pour que ses erreurs
+    restent de vrais statuts HTTP."""
+    token = download_token or uuid.uuid4().hex
+    if not _DOWNLOAD_TOKEN.match(token):
+        raise HTTPException(status_code=400, detail="Jeton de téléchargement invalide")
+    PagesExportService.start(
+        token, index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
     )
+    try:
+        files = PagesExportService.prepare(token)
+    except ExportCancelled:
+        raise HTTPException(status_code=409, detail="Export annulé")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e) or type(e).__name__)
     if files is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
 
-    response = StreamingResponse(
-        IndexesService.stream_pages_zip(files),
+    return _ClosingStreamingResponse(
+        PagesExportService.stream(token, files),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{index_id}_pages.zip"'},
     )
-    # Les en-têtes (dont Set-Cookie) partent une fois la préparation terminée, juste avant le
-    # premier octet : le front s'en sert pour masquer le loader « Préparation de l'archive ».
-    if download_token:
-        response.set_cookie(
-            "archimed_zip_ready", download_token,
-            max_age=120, httponly=False, samesite="lax", path="/",
-        )
-    return response
+
+
+@router.get("/{index_id}/export-pages/{token}")
+def get_pages_export(index_id: str, token: str):
+    """État d'un export ZIP en cours ou récent : étape, compteurs, bilan ou erreur."""
+    snapshot = PagesExportService.snapshot(token)
+    if snapshot is None or snapshot['index_id'] != index_id:
+        raise HTTPException(status_code=404, detail="Export inconnu")
+    return snapshot
+
+
+@router.delete("/{index_id}/export-pages/{token}")
+def cancel_pages_export(index_id: str, token: str):
+    """Demande l'annulation d'un export ZIP. Il s'arrête à l'étape ou à l'image suivante, et
+    le téléchargement est coupé : le navigateur le marque en échec plutôt que de garder une
+    archive tronquée."""
+    snapshot = PagesExportService.snapshot(token)
+    if snapshot is None or snapshot['index_id'] != index_id:
+        raise HTTPException(status_code=404, detail="Export inconnu")
+    return PagesExportService.request_cancel(token)
 
 
 @router.get("/{index_id}/words/export")

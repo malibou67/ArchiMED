@@ -99,7 +99,20 @@ metadata instead of walking `ocr/`. They are kept for scripting and external cal
 - `GET /api/indexes/{index_id}/stats/term-frequency` — Term evolution over time (per decade)
 - `GET /api/indexes/{index_id}/stats/quality` — OCR quality indicators
 - `GET /api/indexes/{index_id}/export-results.csv` — Export search results as CSV
-- `GET /api/indexes/{index_id}/export-pages.zip` — Export matched page images as a streamed ZIP
+- `GET /api/indexes/{index_id}/export-pages.zip?q=…&download_token=…` — Export matched page images
+  (and their extra pages) as a streamed ZIP, with an `_export.txt` summary at its root: query, filters,
+  counts, and the pages whose image is missing or unreadable. The search and the inventory of the
+  images run before the response, so their errors are real HTTP statuses (404 unknown index,
+  409 cancelled, 400 malformed token). `download_token` (`[A-Za-z0-9-]{8,64}`, generated server-side if
+  absent) names the export for the two routes below
+- `GET /api/indexes/{index_id}/export-pages/{token}` — Progress of a ZIP export, polled by the page while
+  the browser downloads: `status` (`preparing|streaming|done|error|cancelled`), `phase`
+  (`load|parse|scan|build|resolve|zip`), `current/total`, `item` (registre or file in progress),
+  `pages`, `registres`, `files_*`, `bytes_*`, `missing[]`/`unreadable[]` (first 50, plus counts),
+  `error`, `cancel_reason` (`user|client`), `elapsed_s`, `idle_s` (seconds since the last progress),
+  `zip_elapsed_s`. Kept in memory for an hour after the end; 404 once forgotten or after a restart
+- `DELETE /api/indexes/{index_id}/export-pages/{token}` — Cancel a ZIP export: it stops at the next step
+  or image, and the download is cut so the browser marks it failed instead of keeping a truncated archive
 - `GET /api/indexes/{index_id}/words/export` — Export the full vocabulary as CSV
 
 ## Tasks
