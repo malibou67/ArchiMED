@@ -4,11 +4,13 @@ import {
   Backdrop,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Collapse,
   Divider,
   FormControl,
+  FormControlLabel,
   FormHelperText,
   IconButton,
   InputAdornment,
@@ -34,6 +36,7 @@ import {
 } from '@mui/material';
 import {
   ArrowDropDown as ArrowDropDownIcon,
+  Block as BlockIcon,
   DateRange as DateRangeIcon,
   Download as DownloadIcon,
   FilterList as FilterListIcon,
@@ -109,6 +112,11 @@ export default function SearchPage() {
   const [expandedRegistres, setExpandedRegistres] = useState<Set<string>>(new Set());
   const [selectedWords, setSelectedWords] = useState<Set<string>>(new Set());
   const [fuzzyThreshold, setFuzzyThreshold] = useState(100);
+  const [wholeWord, setWholeWord] = useState(false);  // « par » sans « parfois »
+  // Mots à exclure : le texte est gardé quand on décoche, mais n'est envoyé que coché.
+  const [excludeEnabled, setExcludeEnabled] = useState(false);
+  const [exclude, setExclude] = useState('');
+  const excludeInputRef = useRef<HTMLInputElement>(null);
   const [exportAnchor, setExportAnchor] = useState<null | HTMLElement>(null);
   // Export ZIP en cours de suivi (fenêtre modale jusqu'à la fin de l'export).
   const [zipExport, setZipExport] = useState<{ token: string; indexId: string; query: string; startedAt: number } | null>(null);
@@ -276,7 +284,10 @@ export default function SearchPage() {
     try {
       const yFrom = (yearRange && yearBounds && yearRange[0] !== yearBounds[0]) ? yearRange[0] : undefined;
       const yTo = (yearRange && yearBounds && yearRange[1] !== yearBounds[1]) ? yearRange[1] : undefined;
-      const data = await indexesApi.searchStream(selectedIndex, q, yFrom, yTo, fuzzyThreshold, setSearchProgress);
+      const data = await indexesApi.searchStream(selectedIndex, q, {
+        yearFrom: yFrom, yearTo: yTo, fuzzyThreshold, wholeWord,
+        exclude: excludeEnabled ? exclude : undefined,
+      }, setSearchProgress);
       setElapsedMs(performance.now() - startedAt);
       setSearchResult(data);
       setViewerList(data.pages.map(pageToViewerEntry));
@@ -324,7 +335,8 @@ export default function SearchPage() {
     const token = window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const url = indexesApi.getResultsExportUrl(selectedIndex, 'zip', {
       q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to,
-      fuzzy_threshold: searchResult.fuzzy_threshold, download_token: token,
+      fuzzy_threshold: searchResult.fuzzy_threshold, whole_word: searchResult.whole_word,
+      exclude: searchResult.excluded_terms?.join(' '), download_token: token,
     });
     const a = document.createElement('a');
     a.href = url;
@@ -452,21 +464,41 @@ export default function SearchPage() {
                 {selectedStats && <FormHelperText sx={{ mx: 0 }}>{indexStatsLabel(selectedStats)}</FormHelperText>}
               </FormControl>
 
-              <TextField
-                fullWidth
-                placeholder={t('queryPlaceholder')}
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                autoFocus
-                sx={{ flex: 1 }}
-                InputProps={{
-                  startAdornment: (
-                    <InputAdornment position="start">
-                      <SearchIcon sx={{ color: 'text.disabled', fontSize: 20 }} />
-                    </InputAdornment>
-                  ),
-                }}
-              />
+              {/* Mots recherchés, et dessous les mots à exclure quand l'option est cochée */}
+              <Box sx={{ flex: 1, minWidth: 0, width: { xs: '100%', md: 'auto' } }}>
+                <TextField
+                  fullWidth
+                  placeholder={t('queryPlaceholder')}
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  autoFocus
+                  InputProps={{
+                    startAdornment: (
+                      <InputAdornment position="start">
+                        <SearchIcon sx={{ color: 'text.disabled', fontSize: 20 }} />
+                      </InputAdornment>
+                    ),
+                  }}
+                />
+                <Collapse in={excludeEnabled} onEntered={() => excludeInputRef.current?.focus()}>
+                  <TextField
+                    fullWidth
+                    placeholder={t('excludePlaceholder')}
+                    value={exclude}
+                    onChange={e => setExclude(e.target.value)}
+                    inputRef={excludeInputRef}
+                    inputProps={{ 'aria-label': t('excludeToggle') }}
+                    sx={{ mt: 1.5 }}
+                    InputProps={{
+                      startAdornment: (
+                        <InputAdornment position="start">
+                          <BlockIcon sx={{ color: 'error.light', fontSize: 20 }} />
+                        </InputAdornment>
+                      ),
+                    }}
+                  />
+                </Collapse>
+              </Box>
 
               <Button
                 type="submit"
@@ -535,6 +567,24 @@ export default function SearchPage() {
                   sx={{ py: 0.5, color: fuzzyThreshold < 100 ? 'warning.main' : 'primary.main' }}
                 />
               </Box>
+
+              {/* Mot entier */}
+              <Tooltip title={t('wholeWordHint')} describeChild>
+                <FormControlLabel
+                  control={<Checkbox size="small" checked={wholeWord} onChange={e => setWholeWord(e.target.checked)} />}
+                  label={<Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.72rem' }}>{t('wholeWord')}</Typography>}
+                  sx={{ mr: 0 }}
+                />
+              </Tooltip>
+
+              {/* Mots à exclure */}
+              <Tooltip title={t('excludeHint')} describeChild>
+                <FormControlLabel
+                  control={<Checkbox size="small" checked={excludeEnabled} onChange={e => setExcludeEnabled(e.target.checked)} />}
+                  label={<Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.72rem' }}>{t('excludeToggle')}</Typography>}
+                  sx={{ mr: 0 }}
+                />
+              </Tooltip>
             </Box>
           </Paper>
 
@@ -628,6 +678,14 @@ export default function SearchPage() {
                   {searchResult.terms.map(term => (
                     <Chip key={term} label={term} size="small" color="default" variant="filled" />
                   ))}
+                  {searchResult.excluded_terms && searchResult.excluded_terms.length > 0 && (
+                    <>
+                      <Typography variant="body2" color="text.secondary" sx={{ ml: 1 }}>{t('excludedWords')}</Typography>
+                      {searchResult.excluded_terms.map(term => (
+                        <Chip key={`exclu-${term}`} label={term} size="small" color="error" variant="outlined" />
+                      ))}
+                    </>
+                  )}
                   {(searchResult.year_from != null || searchResult.year_to != null) && (
                     <Chip
                       icon={<DateRangeIcon sx={{ fontSize: '14px !important' }} />}
@@ -645,6 +703,9 @@ export default function SearchPage() {
                       variant="outlined"
                     />
                   )}
+                  {searchResult.whole_word && (
+                    <Chip label={t('wholeWordChip')} size="small" color="primary" variant="outlined" />
+                  )}
                   {searchResult.count > 0 && (
                     <>
                       <Button
@@ -661,7 +722,7 @@ export default function SearchPage() {
                       <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)}>
                         <MenuItem
                           component="a"
-                          href={indexesApi.getResultsExportUrl(selectedIndex, 'csv', { q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to, fuzzy_threshold: searchResult.fuzzy_threshold })}
+                          href={indexesApi.getResultsExportUrl(selectedIndex, 'csv', { q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to, fuzzy_threshold: searchResult.fuzzy_threshold, whole_word: searchResult.whole_word, exclude: searchResult.excluded_terms?.join(' ') })}
                           download
                           onClick={() => setExportAnchor(null)}
                         >

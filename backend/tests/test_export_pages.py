@@ -320,6 +320,24 @@ def test_une_autre_recherche_ne_remplace_rien(corpus):
     assert PagesExportService.snapshot("tok-chat")['status'] == 'done'
 
 
+def test_la_meme_requete_en_mot_entier_ne_remplace_rien(corpus):
+    """« chat » et « chat » en mot entier ne produisent pas la même archive."""
+    premier = PagesExportService.start("tok-contient", "idx1", "chat")
+    PagesExportService.start("tok-entier", "idx1", "chat", whole_word=True)
+
+    PagesExportService.prepare(premier)
+    assert PagesExportService.snapshot("tok-contient")['status'] != 'cancelled'
+
+
+def test_la_meme_requete_avec_exclusion_ne_remplace_rien(corpus):
+    """« chat » et « chat » sans « noir » ne produisent pas la même archive."""
+    premier = PagesExportService.start("tok-tout", "idx1", "chat")
+    PagesExportService.start("tok-sans-noir", "idx1", "chat", exclude="noir")
+
+    PagesExportService.prepare(premier)
+    assert PagesExportService.snapshot("tok-tout")['status'] != 'cancelled'
+
+
 def test_un_renvoi_du_meme_jeton_ne_mele_pas_les_comptes(corpus):
     """Un navigateur qui renvoie la requête réutilise le jeton : l'ancienne requête s'arrête, et
     ce qu'elle compte encore ne se retrouve pas dans l'état de la nouvelle."""
@@ -342,7 +360,8 @@ def test_les_routes_livrent_et_suivent_l_export(corpus):
     """Sans httpx, pas de TestClient : on appelle les fonctions de route, et on vide la
     réponse streamée comme le ferait Starlette."""
     from routers import indexes as routes
-    paramètres = dict(q="chat", year_from=None, year_to=None, fuzzy_threshold=None)
+    paramètres = dict(q="chat", year_from=None, year_to=None, fuzzy_threshold=None, whole_word=False,
+                      exclude=None)
 
     with pytest.raises(HTTPException) as refus:
         routes.export_pages_zip("idx1", download_token="pas un jeton", **paramètres)
@@ -374,8 +393,8 @@ def test_un_telechargement_abandonne_se_voit_aussitot(corpus):
     l'abandon ne se voyait qu'au passage du ramasse-miettes, et l'export restait « en cours »."""
     from routers import indexes as routes
     réponse = routes.export_pages_zip(
-        "idx1", q="chat", year_from=None, year_to=None, fuzzy_threshold=None,
-        download_token="tok-abandon")
+        "idx1", q="chat", year_from=None, year_to=None, fuzzy_threshold=None, whole_word=False,
+        exclude=None, download_token="tok-abandon")
 
     async def navigateur_qui_lache():
         lâché = asyncio.Event()

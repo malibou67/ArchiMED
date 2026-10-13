@@ -295,6 +295,8 @@ export type MultiSearchResponse = {
   year_from?: number;
   year_to?: number;
   fuzzy_threshold?: number;
+  whole_word?: boolean;              // mots entiers seulement (« par » sans « parfois »)
+  excluded_terms?: string[];         // une page qui contient l'un de ces mots est écartée
 }
 
 // Progression d'une recherche en flux. `load` compte des octets d'index.json, `scan` des mots

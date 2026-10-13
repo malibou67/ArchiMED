@@ -90,7 +90,7 @@ metadata instead of walking `ocr/`. They are kept for scripting and external cal
   `rescan=true` walks the OCR folders instead — authoritative even for XML dropped outside the app, but
   seconds-slow, and what the "Refresh the list" button sends. Indexes built before coverage tracking
   report `coverage_known: false`
-- `GET /api/indexes/{index_id}/search?q=…&year_from=…&year_to=…&fuzzy_threshold=…` — Full-text search (multiple terms, optional year range and fuzzy matching)
+- `GET /api/indexes/{index_id}/search?q=…&year_from=…&year_to=…&fuzzy_threshold=…&whole_word=…&exclude=…` — Full-text search (multiple terms, optional year range and fuzzy matching). By default a term matches every word that contains it; `whole_word=true` keeps only the word itself (`par` no longer finds `parfois`), or close spellings of the whole word when `fuzzy_threshold` is below 100. `exclude` (space-separated words) drops every page that contains at least one of them, matched with the same rules; the response lists them in `excluded_terms`. The streamed variant (`/search/stream`) and the CSV/ZIP exports take the same parameters
 - `GET /api/indexes/{index_id}/year-range` — Min/max year covered by the index
 - `GET /api/indexes/{index_id}/words` — Paginated vocabulary (filter / sort / stopwords / min occurrences)
 - `GET /api/indexes/{index_id}/words/{word}/pages` — Every page (with bounding-box coordinates) where a word occurs (declared as `{word:path}`, so a word containing `/` is accepted)

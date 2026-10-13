@@ -215,10 +215,13 @@ def export_results_csv(
     year_from: Optional[int] = Query(None),
     year_to: Optional[int] = Query(None),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
+    whole_word: bool = Query(False),
+    exclude: Optional[str] = Query(None),
 ):
     """Exporte les résultats d'une recherche en CSV (registre, page, occurrences, chemin)."""
     rows = IndexesService.resolve_result_pages(
         index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+        whole_word=whole_word, exclude=exclude,
     )
     if rows is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
@@ -244,6 +247,8 @@ def export_pages_zip(
     year_from: Optional[int] = Query(None),
     year_to: Optional[int] = Query(None),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
+    whole_word: bool = Query(False),
+    exclude: Optional[str] = Query(None),
     download_token: Optional[str] = Query(None, description="Identifiant de l'export, pour en suivre la progression"),
 ):
     """Exporte les images brutes (sans annotation) des pages résultats — et de leurs extra
@@ -258,6 +263,7 @@ def export_pages_zip(
         raise HTTPException(status_code=400, detail="Jeton de téléchargement invalide")
     job = PagesExportService.start(
         token, index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+        whole_word=whole_word, exclude=exclude,
     )
     try:
         files = PagesExportService.prepare(job)
@@ -335,13 +341,19 @@ def search_in_index(
     year_from: Optional[int] = Query(None, description="Année de début (incluse)"),
     year_to: Optional[int] = Query(None, description="Année de fin (incluse)"),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100, description="Seuil de similarité (0-100). 100 = exact/substring, <100 = fuzzy."),
+    whole_word: bool = Query(False, description="Mots entiers seulement : « par » ne trouve pas « parfois »."),
+    exclude: Optional[str] = Query(None, description="Mots à exclure : une page qui en contient un est écartée."),
 ):
     """Recherche un ou plusieurs termes dans l'index avec intersection des pages.
     Les paramètres year_from et year_to permettent de restreindre la recherche à une période.
-    fuzzy_threshold active la recherche approximative via rapidfuzz."""
+    fuzzy_threshold active la recherche approximative via rapidfuzz ; whole_word écarte les
+    mots qui ne font que contenir un terme ; exclude écarte les pages qui contiennent un de
+    ses mots (mêmes règles de correspondance)."""
     if not q.strip():
         raise HTTPException(status_code=400, detail="La requête de recherche est vide")
-    result = IndexesService.search_words(index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold)
+    result = IndexesService.search_words(index_id, q, year_from=year_from, year_to=year_to,
+                                         fuzzy_threshold=fuzzy_threshold, whole_word=whole_word,
+                                         exclude=exclude)
     if result is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
     return result
@@ -354,6 +366,8 @@ def search_in_index_stream(
     year_from: Optional[int] = Query(None, description="Année de début (incluse)"),
     year_to: Optional[int] = Query(None, description="Année de fin (incluse)"),
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100, description="Seuil de similarité (0-100). 100 = exact/substring, <100 = fuzzy."),
+    whole_word: bool = Query(False, description="Mots entiers seulement : « par » ne trouve pas « parfois »."),
+    exclude: Optional[str] = Query(None, description="Mots à exclure : une page qui en contient un est écartée."),
 ):
     """Même recherche que /search, mais en flux NDJSON : une ligne JSON par événement de
     progression ({"type": "progress", "phase", "current", "total"}), puis le résultat
@@ -366,7 +380,7 @@ def search_in_index_stream(
         try:
             for event in IndexesService.search_words_iter(
                 index_id, q, year_from=year_from, year_to=year_to,
-                fuzzy_threshold=fuzzy_threshold,
+                fuzzy_threshold=fuzzy_threshold, whole_word=whole_word, exclude=exclude,
             ):
                 if event.get('type') == 'result' and event.get('result') is None:
                     yield json.dumps({"type": "error", "detail": "Index non trouvé ou non encore généré"},

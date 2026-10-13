@@ -107,7 +107,8 @@ def _plural(count: int, singular: str, plural: str) -> str:
 
 def _search_key(job: Dict[str, Any]) -> tuple:
     """Ce qui fait qu'un export produirait la même archive qu'un autre."""
-    return (job['index_id'], job['query'], job['year_from'], job['year_to'], job['fuzzy_threshold'])
+    return (job['index_id'], job['query'], job['year_from'], job['year_to'], job['fuzzy_threshold'],
+            job['whole_word'], job['exclude'])
 
 
 class PagesExportService:
@@ -122,7 +123,8 @@ class PagesExportService:
     @classmethod
     def start(cls, token: str, index_id: str, query: str,
               year_from: Optional[int] = None, year_to: Optional[int] = None,
-              fuzzy_threshold: Optional[int] = None) -> Dict[str, Any]:
+              fuzzy_threshold: Optional[int] = None,
+              whole_word: bool = False, exclude: Optional[str] = None) -> Dict[str, Any]:
         """Enregistre un export avant tout travail — la page peut l'interroger dès le clic —
         et arrête ceux de la même recherche encore en cours."""
         meta = IndexesService.get_index(index_id) or {}
@@ -130,7 +132,8 @@ class PagesExportService:
         job = {
             'token': token, 'index_id': index_id, 'index_name': meta.get('name') or index_id,
             'query': query, 'year_from': year_from, 'year_to': year_to,
-            'fuzzy_threshold': fuzzy_threshold,
+            'fuzzy_threshold': fuzzy_threshold, 'whole_word': whole_word,
+            'exclude': (exclude or '').strip() or None,
             'status': 'preparing', 'phase': None, 'current': 0, 'total': 0, 'item': None,
             'pages': None, 'registres': None,
             'files_total': 0, 'files_done': 0, 'bytes_total': 0, 'bytes_done': 0,
@@ -164,6 +167,7 @@ class PagesExportService:
             for event in IndexesService.resolve_result_zip_files_iter(
                 job['index_id'], job['query'], year_from=job['year_from'],
                 year_to=job['year_to'], fuzzy_threshold=job['fuzzy_threshold'],
+                whole_word=job['whole_word'], exclude=job['exclude'],
             ):
                 cls._check_cancel(job)
                 if event.get('type') == 'files':
@@ -377,6 +381,10 @@ class PagesExportService:
             lines.append(f"Période : {job['year_from'] or '…'} – {job['year_to'] or '…'}")
         if job['fuzzy_threshold'] is not None and job['fuzzy_threshold'] < 100:
             lines.append(f"Ressemblance : ≥ {job['fuzzy_threshold']} %")
+        if job['whole_word']:
+            lines.append("Mot entier uniquement")
+        if job['exclude']:
+            lines.append(f"Mots exclus : {', '.join(job['exclude'].split())}")
         lines += [
             "",
             f"{_plural(job['pages'] or 0, 'page trouvée', 'pages trouvées')} dans "

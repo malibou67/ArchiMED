@@ -320,3 +320,5 @@ class MultiSearchResponse(BaseModel):
     year_from: Optional[int] = None
     year_to: Optional[int] = None
     fuzzy_threshold: Optional[int] = None
+    whole_word: bool = False     # mots entiers seulement (« par » sans « parfois »)
+    excluded_terms: List[str] = []  # une page qui contient l'un de ces mots est écartée

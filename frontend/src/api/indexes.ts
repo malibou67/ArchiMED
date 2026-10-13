@@ -18,6 +18,26 @@ import {
 } from '../types';
 import { Task } from './tasks';
 
+// Filtres d'une recherche. Un filtre neutre (ressemblance à 100, aucun mot exclu…) n'est pas
+// envoyé : l'URL reste celle d'une recherche simple.
+export type SearchOptions = {
+  yearFrom?: number;
+  yearTo?: number;
+  fuzzyThreshold?: number;
+  wholeWord?: boolean;
+  exclude?: string;   // mots à exclure, séparés par des espaces
+};
+
+const searchParams = (query: string, o: SearchOptions): URLSearchParams => {
+  const params = new URLSearchParams({ q: query });
+  if (o.yearFrom !== undefined) params.set('year_from', String(o.yearFrom));
+  if (o.yearTo !== undefined) params.set('year_to', String(o.yearTo));
+  if (o.fuzzyThreshold !== undefined && o.fuzzyThreshold < 100) params.set('fuzzy_threshold', String(o.fuzzyThreshold));
+  if (o.wholeWord) params.set('whole_word', 'true');
+  if (o.exclude?.trim()) params.set('exclude', o.exclude.trim());
+  return params;
+};
+
 export const indexesApi = {
   getAll: async (): Promise<IndexMetadata[]> => {
     const response = await api.get('/api/indexes/');
@@ -79,12 +99,8 @@ export const indexesApi = {
     return response.data;
   },
 
-  search: async (indexId: string, query: string, yearFrom?: number, yearTo?: number, fuzzyThreshold?: number): Promise<MultiSearchResponse> => {
-    const params: Record<string, unknown> = { q: query };
-    if (yearFrom !== undefined) params.year_from = yearFrom;
-    if (yearTo !== undefined) params.year_to = yearTo;
-    if (fuzzyThreshold !== undefined && fuzzyThreshold < 100) params.fuzzy_threshold = fuzzyThreshold;
-    const response = await api.get(`/api/indexes/${indexId}/search`, { params, timeout: 0 });
+  search: async (indexId: string, query: string, options: SearchOptions = {}): Promise<MultiSearchResponse> => {
+    const response = await api.get(`/api/indexes/${indexId}/search`, { params: searchParams(query, options), timeout: 0 });
     return response.data;
   },
 
@@ -94,15 +110,10 @@ export const indexesApi = {
   searchStream: async (
     indexId: string,
     query: string,
-    yearFrom: number | undefined,
-    yearTo: number | undefined,
-    fuzzyThreshold: number | undefined,
+    options: SearchOptions,
     onProgress: (p: SearchProgress) => void,
   ): Promise<MultiSearchResponse> => {
-    const params = new URLSearchParams({ q: query });
-    if (yearFrom !== undefined) params.set('year_from', String(yearFrom));
-    if (yearTo !== undefined) params.set('year_to', String(yearTo));
-    if (fuzzyThreshold !== undefined && fuzzyThreshold < 100) params.set('fuzzy_threshold', String(fuzzyThreshold));
+    const params = searchParams(query, options);
     let result: MultiSearchResponse | null = null;
     await readNdjson(`/api/indexes/${indexId}/search/stream?${params}`, {}, (event) => {
       if (event.type === 'progress') {
@@ -198,13 +209,15 @@ export const indexesApi = {
   getResultsExportUrl: (
     indexId: string,
     kind: 'csv' | 'zip',
-    params: { q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number; download_token?: string },
+    params: { q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number; whole_word?: boolean; exclude?: string; download_token?: string },
   ): string => {
     const qs = new URLSearchParams();
     qs.set('q', params.q);
     if (params.year_from != null) qs.set('year_from', String(params.year_from));
     if (params.year_to != null) qs.set('year_to', String(params.year_to));
     if (params.fuzzy_threshold != null && params.fuzzy_threshold < 100) qs.set('fuzzy_threshold', String(params.fuzzy_threshold));
+    if (params.whole_word) qs.set('whole_word', 'true');
+    if (params.exclude?.trim()) qs.set('exclude', params.exclude.trim());
     if (params.download_token) qs.set('download_token', params.download_token);
     const file = kind === 'csv' ? 'export-results.csv' : 'export-pages.zip';
     return `/api/indexes/${indexId}/${file}?${qs.toString()}`;

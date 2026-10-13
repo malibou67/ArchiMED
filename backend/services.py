@@ -3111,9 +3111,18 @@ class IndexesService:
         return ""
 
     @staticmethod
-    def _term_matches(term: str, word: str, fuzzy_threshold: Optional[int], stem: str) -> bool:
+    def _term_matches(term: str, word: str, fuzzy_threshold: Optional[int], stem: str,
+                      whole_word: bool = False) -> bool:
         """Un mot correspond s'il : contient le terme (neurosyphilis ⊃ syphilis),
-        partage la racine (syphilis → syphilitique), ou est proche (faute OCR)."""
+        partage la racine (syphilis → syphilitique), ou est proche (faute OCR).
+
+        En mot entier, ni contenance ni racine (« par » ne trouve pas « parfois ») : le mot
+        lui-même, ou une graphie proche du mot entier si la ressemblance est active."""
+        if whole_word:
+            if word == term:
+                return True
+            return fuzzy_threshold is not None and fuzzy_threshold < 100 \
+                and _fuzz.ratio(term, word) >= fuzzy_threshold
         if term in word:
             return True
         if fuzzy_threshold is not None and fuzzy_threshold < 100:
@@ -3127,14 +3136,18 @@ class IndexesService:
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
+        whole_word: bool = False,
+        exclude: Optional[str] = None,
     ) -> Optional[Dict]:
         """Recherche multi-termes avec intersection des pages.
         Retourne uniquement les pages où TOUS les termes sont présents.
-        Si year_from/year_to sont fournis, filtre par période de registre."""
+        Si year_from/year_to sont fournis, filtre par période de registre.
+        whole_word écarte les mots qui ne font que contenir un terme.
+        exclude écarte les pages qui contiennent au moins un de ses mots."""
         result = None
         for event in IndexesService.search_words_iter(
             index_id, query, year_from=year_from, year_to=year_to,
-            fuzzy_threshold=fuzzy_threshold,
+            fuzzy_threshold=fuzzy_threshold, whole_word=whole_word, exclude=exclude,
         ):
             if event.get('type') == 'result':
                 result = event['result']
@@ -3153,6 +3166,8 @@ class IndexesService:
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
+        whole_word: bool = False,
+        exclude: Optional[str] = None,
     ):
         """Variante en flux de search_words : émet des événements de progression
         ({'type': 'progress', 'phase': 'load'|'parse'|'scan'|'build', 'current', 'total'})
@@ -3176,6 +3191,10 @@ class IndexesService:
         terms = [t for t in raw_terms if t not in IndexesService.STOP_WORDS]
         if not terms:
             terms = raw_terms
+        # Mots à exclure : découpés comme la requête, mais sans filtre de mots vides — un mot
+        # exclu l'est explicitement.
+        excluded_terms = [t.strip("'\"") for t in (exclude or "").strip().lower().split()
+                          if t.strip("'\"")]
 
         # Préfixes de page -> registre, dans l'ordre où les essayer (alias compris)
         prefixes = IndexesService._registre_prefixes(index_id, registres_map, sources_block)
@@ -3196,12 +3215,15 @@ class IndexesService:
 
         # Pour chaque terme : {page_name: {word: [occ_strings]}}
         term_page_data: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        # Pages qui contiennent au moins un mot exclu (mêmes règles de correspondance).
+        excluded_pages: set = set()
         scanned = 0
-        total_scan = len(index) * max(len(terms), 1)
+        total_scan = len(index) * max(len(terms) + len(excluded_terms), 1)
         last_emit = time.monotonic()
         yield {"type": "progress", "phase": "scan", "current": 0, "total": total_scan}
-        for term in terms:
-            term_page_data[term] = {}
+        for term, excluded in [(t, False) for t in terms] + [(t, True) for t in excluded_terms]:
+            if not excluded:
+                term_page_data[term] = {}
             stem = IndexesService._term_stem(term, fuzzy_threshold)
             for word, occs in index.items():
                 scanned += 1
@@ -3211,7 +3233,10 @@ class IndexesService:
                         last_emit = now
                         yield {"type": "progress", "phase": "scan",
                                "current": scanned, "total": total_scan}
-                if not IndexesService._term_matches(term, word, fuzzy_threshold, stem):
+                if not IndexesService._term_matches(term, word, fuzzy_threshold, stem, whole_word):
+                    continue
+                if excluded:
+                    excluded_pages.update(occ.split(' - ')[0] for occ in occs)
                     continue
                 for occ in occs:
                     page = occ.split(' - ')[0]
@@ -3236,6 +3261,8 @@ class IndexesService:
         common_pages = page_sets[0]
         for s in page_sets[1:]:
             common_pages &= s
+        # Une page qui contient un seul mot exclu est écartée.
+        common_pages -= excluded_pages
 
         # Construire les résultats par page, triés par registre puis numéro de page
         def sort_key(page_name: str):
@@ -3269,6 +3296,8 @@ class IndexesService:
             "year_from": year_from,
             "year_to": year_to,
             "fuzzy_threshold": fuzzy_threshold,
+            "whole_word": whole_word,
+            "excluded_terms": excluded_terms,
         }}
 
     # Cache de l'index : index_id -> (mtime, total_unique, base_entries, words, registres_map, sources).
@@ -3604,11 +3633,14 @@ class IndexesService:
         index_id: str, q: str,
         year_from: Optional[int] = None, year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
+        whole_word: bool = False,
+        exclude: Optional[str] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Liste ordonnée des pages d'une recherche, avec registre, occurrences et chemin
         du fichier image (relatif à DATA_DIR). Retourne None si l'index est absent."""
         result = IndexesService.search_words(
             index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+            whole_word=whole_word, exclude=exclude,
         )
         if result is None:
             return None
@@ -3638,6 +3670,8 @@ class IndexesService:
         index_id: str, q: str,
         year_from: Optional[int] = None, year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
+        whole_word: bool = False,
+        exclude: Optional[str] = None,
     ):
         """Fichiers à mettre dans le ZIP d'une recherche : les pages résultats ET leurs extra
         pages (même registre, même numéro principal), pour coller à ce qu'affiche la visionneuse.
@@ -3655,6 +3689,7 @@ class IndexesService:
         result = None
         for event in IndexesService.search_words_iter(
             index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+            whole_word=whole_word, exclude=exclude,
         ):
             if event.get('type') == 'result':
                 result = event['result']
