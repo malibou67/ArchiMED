@@ -15,7 +15,10 @@ being one OCR model of one collection.
 indexes/
 └── idx_20260115103000_hospital-index/
     ├── metadata.json               → status, sources, stats, dates
-    └── index.json                  → dictionary of word → list of occurrences (with coordinates)
+    ├── index.json                  → dictionary of word → list of occurrences (with coordinates)
+    └── selections/                 → sorted Excel workbooks imported from the search page (shared)
+        ├── sel_<timestamp>_<hex>.json        → name, date, page count, chain of searches
+        └── sel_<timestamp>_<hex>.pages.json  → the pages kept
 ```
 
 ## metadata.json format

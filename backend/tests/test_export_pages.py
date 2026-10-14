@@ -338,6 +338,31 @@ def test_la_meme_requete_avec_exclusion_ne_remplace_rien(corpus):
     assert PagesExportService.snapshot("tok-tout")['status'] != 'cancelled'
 
 
+def selection_de(*registres):
+    """Une sélection (telle que la route la résout) faite des pages « chat » de ces registres."""
+    pages = {p['page_name'] for p in IndexesService.search_words("idx1", "chat")['pages']
+             if p['registre'] in registres}
+    return {'id': 'sel_20261014120000_abcdef', 'name': "chats de A", 'pages': pages}
+
+
+def test_la_meme_requete_dans_une_selection_ne_remplace_rien(corpus):
+    premier = PagesExportService.start("tok-index", "idx1", "chat")
+    PagesExportService.start("tok-selection", "idx1", "chat", within=selection_de("REGA"))
+
+    PagesExportService.prepare(premier)
+    assert PagesExportService.snapshot("tok-index")['status'] != 'cancelled'
+
+
+def test_l_export_dans_une_selection_n_en_sort_pas_et_la_nomme(corpus):
+    job = PagesExportService.start("tok-dans", "idx1", "chat", within=selection_de("REGA"))
+    files = PagesExportService.prepare(job)
+
+    with archive(b"".join(PagesExportService.stream(job, files))) as zf:
+        assert zf.namelist() == ["REGA/REGA_1.jpg", "REGA/REGA_1_1.jpg", "_export.txt"]
+        rapport = zf.read("_export.txt").decode('utf-8-sig')
+    assert "Dans la sélection : « chats de A »" in rapport
+
+
 def test_un_renvoi_du_meme_jeton_ne_mele_pas_les_comptes(corpus):
     """Un navigateur qui renvoie la requête réutilise le jeton : l'ancienne requête s'arrête, et
     ce qu'elle compte encore ne se retrouve pas dans l'état de la nouvelle."""
@@ -361,7 +386,7 @@ def test_les_routes_livrent_et_suivent_l_export(corpus):
     réponse streamée comme le ferait Starlette."""
     from routers import indexes as routes
     paramètres = dict(q="chat", year_from=None, year_to=None, fuzzy_threshold=None, whole_word=False,
-                      exclude=None)
+                      exclude=None, within=None)
 
     with pytest.raises(HTTPException) as refus:
         routes.export_pages_zip("idx1", download_token="pas un jeton", **paramètres)
@@ -394,7 +419,7 @@ def test_un_telechargement_abandonne_se_voit_aussitot(corpus):
     from routers import indexes as routes
     réponse = routes.export_pages_zip(
         "idx1", q="chat", year_from=None, year_to=None, fuzzy_threshold=None, whole_word=False,
-        exclude=None, download_token="tok-abandon")
+        exclude=None, within=None, download_token="tok-abandon")
 
     async def navigateur_qui_lache():
         lâché = asyncio.Event()

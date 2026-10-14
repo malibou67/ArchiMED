@@ -322,3 +322,32 @@ class MultiSearchResponse(BaseModel):
     fuzzy_threshold: Optional[int] = None
     whole_word: bool = False     # mots entiers seulement (« par » sans « parfois »)
     excluded_terms: List[str] = []  # une page qui contient l'un de ces mots est écartée
+
+# ── Sélections de pages (recherche en entonnoir) ─────────────────────────────
+
+class SelectionStep(BaseModel):
+    """Une recherche de la chaîne : ses paramètres, ce qu'elle a trouvé, ce qui en a été gardé."""
+    query: str
+    whole_word: bool = False
+    fuzzy_threshold: Optional[int] = None
+    excluded_terms: List[str] = []
+    year_from: Optional[int] = None
+    year_to: Optional[int] = None
+    found: int                   # pages trouvées par la recherche
+    kept: Optional[int] = None   # pages gardées (fixé à l'import du classeur trié)
+
+class SelectionSummary(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    count: int
+    source_file: Optional[str] = None  # classeur Excel importé
+    steps: List[SelectionStep]   # chaîne complète depuis tout l'index
+    stale: bool = False          # sources de l'index changées depuis l'enregistrement
+
+class SelectionImport(BaseModel):
+    """Réponse à l'import d'un classeur trié : la sélection créée, et le bilan de la lecture."""
+    selection: SelectionSummary
+    kept: int                    # lignes à « oui »
+    dropped: int                 # lignes à « non » (ou vides)
+    ignored: int                 # lignes dont la valeur de « Garder » n'est pas reconnue

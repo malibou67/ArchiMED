@@ -38,7 +38,9 @@ import {
   ArrowDropDown as ArrowDropDownIcon,
   Block as BlockIcon,
   DateRange as DateRangeIcon,
+  FilterAlt as FilterAltIcon,
   Download as DownloadIcon,
+  UploadFile as UploadFileIcon,
   FilterList as FilterListIcon,
   ImageSearch as ImageSearchIcon,
   KeyboardArrowDown as ArrowDownIcon,
@@ -52,7 +54,7 @@ import { indexesApi } from '../api/indexes';
 import { collectionsApi } from '../api/collections';
 import { registresApi } from '../api/registres';
 import { usePageLoading } from '../context/LoadingContext';
-import { IndexMetadata, IndexStats, MultiSearchResponse, RegistreSummary, SearchProgress } from '../types';
+import { IndexMetadata, IndexStats, MultiSearchResponse, RegistreSummary, SearchProgress, SelectionSummary } from '../types';
 import { useSearchParams } from 'react-router-dom';
 import {
   ViewerEntry,
@@ -68,6 +70,8 @@ import {
 import SearchResultsStats from '../components/stats/SearchResultsStats';
 import EmptyState from '../components/EmptyState';
 import PagesExportDialog from '../components/PagesExportDialog';
+import ResultsExportDialog from '../components/ResultsExportDialog';
+import SelectionScopeSelect from '../components/selections/SelectionScopeSelect';
 
 // ─── SearchPage ───────────────────────────────────────────────────────────────
 
@@ -117,7 +121,19 @@ export default function SearchPage() {
   const [excludeEnabled, setExcludeEnabled] = useState(false);
   const [exclude, setExclude] = useState('');
   const excludeInputRef = useRef<HTMLInputElement>(null);
+  const queryInputRef = useRef<HTMLInputElement>(null);
+  // Recherche en entonnoir : classeurs Excel triés puis réimportés (sélections de l'index),
+  // portée de la prochaine recherche ('' = tout l'index), et sélection où la recherche affichée
+  // a été faite.
+  const [selections, setSelections] = useState<SelectionSummary[]>([]);
+  const [scopeId, setScopeId] = useState('');
+  const [searchedIn, setSearchedIn] = useState<SelectionSummary | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const [importing, setImporting] = useState(false);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
   const [exportAnchor, setExportAnchor] = useState<null | HTMLElement>(null);
+  // Export CSV / Excel en cours (fenêtre bloquante jusqu'au téléchargement).
+  const [fileExport, setFileExport] = useState<{ format: 'csv' | 'xlsx'; key: number } | null>(null);
   // Export ZIP en cours de suivi (fenêtre modale jusqu'à la fin de l'export).
   const [zipExport, setZipExport] = useState<{ token: string; indexId: string; query: string; startedAt: number } | null>(null);
   const REG_PER_PAGE = 10;
@@ -243,6 +259,19 @@ export default function SearchPage() {
     return () => { cancelled = true; };
   }, [selectedIndex, indexes]);
 
+  // Sélections enregistrées de l'index (partagées par tous les postes). Changer d'index ramène
+  // la portée à tout l'index : une sélection ne vaut que pour l'index où elle a été faite.
+  useEffect(() => {
+    setScopeId('');
+    setSelections([]);
+    if (!selectedIndex) return;
+    let cancelled = false;
+    indexesApi.listSelections(selectedIndex)
+      .then(list => { if (!cancelled) setSelections(list); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedIndex]);
+
   // Quand la visionneuse est active, construit la famille (stems) de chaque page-résultat
   // à partir de la liste complète de son registre. Chaque membre (principale ET extras)
   // pointe vers la famille complète, pour que la bande latérale reste affichée même en
@@ -281,15 +310,18 @@ export default function SearchPage() {
     setExpandedRegistres(new Set());
     setSelectedWords(new Set());
     const startedAt = performance.now();
+    const scope = selections.find(s => s.id === scopeId) ?? null;
     try {
       const yFrom = (yearRange && yearBounds && yearRange[0] !== yearBounds[0]) ? yearRange[0] : undefined;
       const yTo = (yearRange && yearBounds && yearRange[1] !== yearBounds[1]) ? yearRange[1] : undefined;
       const data = await indexesApi.searchStream(selectedIndex, q, {
         yearFrom: yFrom, yearTo: yTo, fuzzyThreshold, wholeWord,
         exclude: excludeEnabled ? exclude : undefined,
+        within: scope?.id,
       }, setSearchProgress);
       setElapsedMs(performance.now() - startedAt);
       setSearchResult(data);
+      setSearchedIn(scope);
       setViewerList(data.pages.map(pageToViewerEntry));
       setResultTab('results');
     } catch (err: any) {
@@ -336,7 +368,7 @@ export default function SearchPage() {
     const url = indexesApi.getResultsExportUrl(selectedIndex, 'zip', {
       q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to,
       fuzzy_threshold: searchResult.fuzzy_threshold, whole_word: searchResult.whole_word,
-      exclude: searchResult.excluded_terms?.join(' '), download_token: token,
+      exclude: searchResult.excluded_terms?.join(' '), within: searchedIn?.id, download_token: token,
     });
     const a = document.createElement('a');
     a.href = url;
@@ -345,6 +377,51 @@ export default function SearchPage() {
     a.click();
     document.body.removeChild(a);
     setZipExport({ token, indexId: selectedIndex, query: searchResult.query, startedAt: Date.now() });
+  };
+
+  // Export CSV / Excel de la recherche affichée : la fenêtre de suivi le lance à l'ouverture
+  // (une `key` par export).
+  const startFileExport = (format: 'csv' | 'xlsx') => {
+    setExportAnchor(null);
+    setFileExport({ format, key: Date.now() });
+  };
+
+  // ── Recherche en entonnoir : classeur trié dans Excel, réimporté, puis cherché ──
+  // L'import fait du classeur une sélection et bascule la portée dessus : la recherche
+  // suivante se fera dans les pages gardées.
+  const handleImport = async (file: File) => {
+    setImporting(true);
+    setImportNotice(null);
+    setError(null);
+    try {
+      const res = await indexesApi.importSelection(selectedIndex, file);
+      setSelections(prev => [res.selection, ...prev.filter(s => s.id !== res.selection.id)]);
+      setScopeId(res.selection.id);
+      setImportNotice([
+        t('selections.imported', {
+          file: res.selection.source_file ?? file.name,
+          count: res.kept, kept: fmtN(res.kept), dropped: fmtN(res.dropped),
+        }),
+        res.ignored > 0 ? t('selections.ignored', { count: res.ignored, val: fmtN(res.ignored) }) : '',
+      ].filter(Boolean).join(' '));
+      setQuery('');
+      queryInputRef.current?.focus();
+    } catch (err: any) {
+      // Un refus de classeur arrive en code (traduit ici, dans la langue de l'interface) ;
+      // les autres erreurs restent un texte.
+      const detail = err?.response?.data?.detail;
+      setError(detail?.code
+        ? t(`selections.importErrors.${detail.code}`, { ...detail.params, defaultValue: detail.message })
+        : (typeof detail === 'string' ? detail : err?.message) ?? t('selections.importError'));
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleDeleteSelection = async (sel: SelectionSummary) => {
+    await indexesApi.deleteSelection(selectedIndex, sel.id);
+    setSelections(prev => prev.filter(s => s.id !== sel.id));
+    if (scopeId === sel.id) setScopeId('');
   };
 
 
@@ -379,6 +456,7 @@ export default function SearchPage() {
   if (loadingIndexes) return null;  // overlay global (usePageLoading) pendant le chargement initial
 
   const selectedStats = indexes.find(i => i.id === selectedIndex)?.stats;
+  const scopeSelection = selections.find(s => s.id === scopeId);
 
   // Rendue dans les deux vues ci-dessous : un retour navigateur vers la vue pleine page ne doit
   // pas faire perdre le suivi d'un export en cours.
@@ -468,10 +546,13 @@ export default function SearchPage() {
               <Box sx={{ flex: 1, minWidth: 0, width: { xs: '100%', md: 'auto' } }}>
                 <TextField
                   fullWidth
-                  placeholder={t('queryPlaceholder')}
+                  placeholder={scopeSelection
+                    ? t('selections.queryPlaceholderIn', { name: scopeSelection.name })
+                    : t('queryPlaceholder')}
                   value={query}
                   onChange={e => setQuery(e.target.value)}
                   autoFocus
+                  inputRef={queryInputRef}
                   InputProps={{
                     startAdornment: (
                       <InputAdornment position="start">
@@ -519,6 +600,41 @@ export default function SearchPage() {
               <Typography variant="caption" sx={{ fontWeight: 700, color: 'text.secondary', letterSpacing: '0.05em', flexShrink: 0 }}>
                 {t('filters')}
               </Typography>
+
+              {/* Portée : tout l'index, ou un classeur Excel trié puis réimporté (entonnoir) */}
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0, width: { xs: '100%', sm: 'auto' } }}>
+                <SelectionScopeSelect
+                  selections={selections}
+                  value={scopeId}
+                  onChange={id => { setScopeId(id); setImportNotice(null); }}
+                  onDelete={handleDeleteSelection}
+                />
+                <Tooltip title={t('selections.importHint')}>
+                  <span>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      startIcon={importing ? <CircularProgress size={14} color="inherit" /> : <UploadFileIcon />}
+                      disabled={!selectedIndex || importing}
+                      onClick={() => importInputRef.current?.click()}
+                      sx={{ height: 40, whiteSpace: 'nowrap' }}
+                    >
+                      {t('selections.importButton')}
+                    </Button>
+                  </span>
+                </Tooltip>
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  hidden
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';      // réimporter le même fichier (corrigé) doit marcher
+                    if (file) handleImport(file);
+                  }}
+                />
+              </Box>
 
               {/* Période */}
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: { xs: '100%', sm: 300 } }}>
@@ -589,6 +705,9 @@ export default function SearchPage() {
           </Paper>
 
           {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+          {importNotice && (
+            <Alert severity="success" sx={{ mb: 2 }} onClose={() => setImportNotice(null)}>{importNotice}</Alert>
+          )}
 
           {/* ── Barre : onglets (après recherche) ── */}
           {searchResult && (
@@ -706,6 +825,18 @@ export default function SearchPage() {
                   {searchResult.whole_word && (
                     <Chip label={t('wholeWordChip')} size="small" color="primary" variant="outlined" />
                   )}
+                  {searchedIn && (
+                    <Tooltip title={t('selections.searchedInHint', { count: searchedIn.count, val: fmtN(searchedIn.count) })}>
+                      <Chip
+                        icon={<FilterAltIcon sx={{ fontSize: '16px !important' }} />}
+                        label={t('selections.searchedIn', { name: searchedIn.name })}
+                        size="small"
+                        color="primary"
+                        variant="filled"
+                        sx={{ maxWidth: 320 }}
+                      />
+                    </Tooltip>
+                  )}
                   {searchResult.count > 0 && (
                     <>
                       <Button
@@ -720,12 +851,15 @@ export default function SearchPage() {
                         {t('exportButton')}
                       </Button>
                       <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)}>
-                        <MenuItem
-                          component="a"
-                          href={indexesApi.getResultsExportUrl(selectedIndex, 'csv', { q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to, fuzzy_threshold: searchResult.fuzzy_threshold, whole_word: searchResult.whole_word, exclude: searchResult.excluded_terms?.join(' ') })}
-                          download
-                          onClick={() => setExportAnchor(null)}
-                        >
+                        {/* Le classeur à trier : la première étape de l'entonnoir. Excel et CSV
+                            s'exportent dans une fenêtre qui suit l'export jusqu'au fichier. */}
+                        <MenuItem onClick={() => startFileExport('xlsx')}>
+                          <Box>
+                            <Typography variant="body2">{t('exportMenu.xlsxTitle')}</Typography>
+                            <Typography variant="caption" color="text.secondary">{t('exportMenu.xlsxDesc')}</Typography>
+                          </Box>
+                        </MenuItem>
+                        <MenuItem onClick={() => startFileExport('csv')}>
                           <Box>
                             <Typography variant="body2">{t('exportMenu.csvTitle')}</Typography>
                             <Typography variant="caption" color="text.secondary">{t('exportMenu.csvDesc')}</Typography>
@@ -941,6 +1075,21 @@ export default function SearchPage() {
       </Backdrop>
 
       {exportDialog}
+
+      {fileExport && searchResult && (
+        <ResultsExportDialog
+          key={fileExport.key}
+          indexId={selectedIndex}
+          indexName={indexes.find(i => i.id === selectedIndex)?.name ?? selectedIndex}
+          format={fileExport.format}
+          params={{
+            q: searchResult.query, year_from: searchResult.year_from, year_to: searchResult.year_to,
+            fuzzy_threshold: searchResult.fuzzy_threshold, whole_word: searchResult.whole_word,
+            exclude: searchResult.excluded_terms?.join(' '), within: searchedIn?.id, lang: locale.slice(0, 2),
+          }}
+          onClose={err => { setFileExport(null); if (err) setError(err); }}
+        />
+      )}
 
       {viewerOpen && viewerList.length > 0 && (
         <ImageViewer

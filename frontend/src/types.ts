@@ -299,6 +299,38 @@ export type MultiSearchResponse = {
   excluded_terms?: string[];         // une page qui contient l'un de ces mots est écartée
 }
 
+// Sélection de pages : les pages gardées d'une recherche (classeur Excel trié puis réimporté),
+// pour chercher dedans ensuite (recherche en entonnoir). `steps` est la chaîne complète depuis
+// tout l'index.
+export type SelectionStep = {
+  query: string;
+  whole_word: boolean;
+  fuzzy_threshold: number | null;
+  excluded_terms: string[];
+  year_from: number | null;
+  year_to: number | null;
+  found: number;                     // pages trouvées par la recherche
+  kept?: number | null;              // pages gardées (fixé à l'import du classeur trié)
+}
+
+export type SelectionSummary = {
+  id: string;
+  name: string;
+  created_at: string;
+  count: number;
+  source_file?: string | null;       // classeur Excel importé
+  steps: SelectionStep[];
+  stale: boolean;                    // sources de l'index changées depuis l'enregistrement
+}
+
+// Import d'un classeur trié : la sélection créée et le bilan de la colonne « Garder ».
+export type SelectionImport = {
+  selection: SelectionSummary;
+  kept: number;
+  dropped: number;
+  ignored: number;                   // valeurs de « Garder » non reconnues
+}
+
 // Progression d'une recherche en flux. `load` compte des octets d'index.json, `scan` des mots
 // parcourus ; `parse` et `build` n'ont pas de granularité (total = 0 → barre indéterminée).
 export type SearchProgress = {

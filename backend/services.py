@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Iterable, Tuple
 from pathlib import Path
 from rapidfuzz import fuzz as _fuzz
 
@@ -3138,16 +3138,19 @@ class IndexesService:
         fuzzy_threshold: Optional[int] = None,
         whole_word: bool = False,
         exclude: Optional[str] = None,
+        within: Optional[Iterable[str]] = None,
     ) -> Optional[Dict]:
         """Recherche multi-termes avec intersection des pages.
         Retourne uniquement les pages où TOUS les termes sont présents.
         Si year_from/year_to sont fournis, filtre par période de registre.
         whole_word écarte les mots qui ne font que contenir un terme.
-        exclude écarte les pages qui contiennent au moins un de ses mots."""
+        exclude écarte les pages qui contiennent au moins un de ses mots.
+        within restreint la recherche à ces pages (celles d'une sélection enregistrée)."""
         result = None
         for event in IndexesService.search_words_iter(
             index_id, query, year_from=year_from, year_to=year_to,
             fuzzy_threshold=fuzzy_threshold, whole_word=whole_word, exclude=exclude,
+            within=within,
         ):
             if event.get('type') == 'result':
                 result = event['result']
@@ -3168,6 +3171,7 @@ class IndexesService:
         fuzzy_threshold: Optional[int] = None,
         whole_word: bool = False,
         exclude: Optional[str] = None,
+        within: Optional[Iterable[str]] = None,
     ):
         """Variante en flux de search_words : émet des événements de progression
         ({'type': 'progress', 'phase': 'load'|'parse'|'scan'|'build', 'current', 'total'})
@@ -3263,6 +3267,9 @@ class IndexesService:
             common_pages &= s
         # Une page qui contient un seul mot exclu est écartée.
         common_pages -= excluded_pages
+        # Recherche dans une sélection : seules ses pages restent.
+        if within is not None:
+            common_pages &= set(within)
 
         # Construire les résultats par page, triés par registre puis numéro de page
         def sort_key(page_name: str):
@@ -3612,40 +3619,68 @@ class IndexesService:
         return [(reg_dir, registre, members) for (reg_dir, registre), members in groups.items()]
 
     @staticmethod
-    def _resolve_pages_files(index_id: str, page_names: List[str]) -> Dict[str, tuple]:
-        """Résout en masse une liste de noms de pages vers (Path, registre_folder).
-        Chaque registre concerné est listé une fois, et seulement ceux-là
-        (cf. `_group_pages_by_registre`)."""
-        meta = IndexesService.get_index(index_id)
-        if not meta:
-            return {}
-
-        result: Dict[str, tuple] = {}
-        for reg_dir, registre, members in IndexesService._group_pages_by_registre(meta, page_names):
-            images = _scan_images(reg_dir) if reg_dir else {}
-            for name, real in members:
-                filename = _find_page_image(real, images)
-                result[name] = (reg_dir / filename if filename else None, registre)
-        return result
-
-    @staticmethod
     def resolve_result_pages(
         index_id: str, q: str,
         year_from: Optional[int] = None, year_to: Optional[int] = None,
         fuzzy_threshold: Optional[int] = None,
         whole_word: bool = False,
         exclude: Optional[str] = None,
+        within: Optional[Iterable[str]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Liste ordonnée des pages d'une recherche, avec registre, occurrences et chemin
-        du fichier image (relatif à DATA_DIR). Retourne None si l'index est absent."""
-        result = IndexesService.search_words(
+        du fichier image (relatif à DATA_DIR). Retourne None si l'index est absent.
+        `page_name` (nom interne) et `words` servent au classeur à trier."""
+        rows = None
+        for event in IndexesService.resolve_result_pages_iter(
             index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
-            whole_word=whole_word, exclude=exclude,
-        )
+            whole_word=whole_word, exclude=exclude, within=within,
+        ):
+            if event.get('type') == 'rows':
+                rows = event['rows']
+        return rows
+
+    @staticmethod
+    def resolve_result_pages_iter(
+        index_id: str, q: str,
+        year_from: Optional[int] = None, year_to: Optional[int] = None,
+        fuzzy_threshold: Optional[int] = None,
+        whole_word: bool = False,
+        exclude: Optional[str] = None,
+        within: Optional[Iterable[str]] = None,
+    ):
+        """Variante en flux de `resolve_result_pages`, pour que l'export CSV / Excel dise où il
+        en est : relaie la progression de la recherche (`search_words_iter`), émet
+        {'type': 'progress', 'phase': 'resolve', 'current', 'total', 'registre'} à chaque
+        registre inventorié — c'est l'étape longue sur le partage, ~0,2 s par registre —, puis
+        finit par {'type': 'rows', 'rows': [...] ou None si l'index est absent}.
+
+        Chaque registre concerné est listé une fois, et seulement ceux-là
+        (cf. `_group_pages_by_registre`)."""
+        result = None
+        for event in IndexesService.search_words_iter(
+            index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+            whole_word=whole_word, exclude=exclude, within=within,
+        ):
+            if event.get('type') == 'result':
+                result = event['result']
+            else:
+                yield event
+        meta = IndexesService.get_index(index_id) if result is not None else None
         if result is None:
-            return None
+            yield {"type": "rows", "rows": None}
+            return
         pages = result.get("pages", [])
-        files = IndexesService._resolve_pages_files(index_id, [p["page_name"] for p in pages])
+
+        files: Dict[str, tuple] = {}
+        groups = IndexesService._group_pages_by_registre(meta, [p["page_name"] for p in pages]) if meta else []
+        yield {"type": "progress", "phase": "resolve", "current": 0, "total": len(groups)}
+        for done, (reg_dir, registre, members) in enumerate(groups, start=1):
+            images = _scan_images(reg_dir) if reg_dir else {}
+            for name, real in members:
+                filename = _find_page_image(real, images)
+                files[name] = (reg_dir / filename if filename else None, registre)
+            yield {"type": "progress", "phase": "resolve", "current": done, "total": len(groups),
+                   "registre": registre}
 
         rows: List[Dict[str, Any]] = []
         for p in pages:
@@ -3655,6 +3690,8 @@ class IndexesService:
             chemin = os.path.relpath(str(path), DATA_DIR) if path else ""
             src = p.get("source") or {}
             rows.append({
+                "page_name": name,
+                "words": p.get("words", {}),
                 "page": IndexesService._display_page_name(name),
                 "registre": registre or p.get("registre") or "",
                 "source": src.get("collection_titre") or src.get("collection_folder") or "",
@@ -3663,7 +3700,7 @@ class IndexesService:
                 "path": path,
                 "chemin": chemin,
             })
-        return rows
+        yield {"type": "rows", "rows": rows}
 
     @staticmethod
     def resolve_result_zip_files_iter(
@@ -3672,6 +3709,7 @@ class IndexesService:
         fuzzy_threshold: Optional[int] = None,
         whole_word: bool = False,
         exclude: Optional[str] = None,
+        within: Optional[Iterable[str]] = None,
     ):
         """Fichiers à mettre dans le ZIP d'une recherche : les pages résultats ET leurs extra
         pages (même registre, même numéro principal), pour coller à ce qu'affiche la visionneuse.
@@ -3689,7 +3727,7 @@ class IndexesService:
         result = None
         for event in IndexesService.search_words_iter(
             index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
-            whole_word=whole_word, exclude=exclude,
+            whole_word=whole_word, exclude=exclude, within=within,
         ):
             if event.get('type') == 'result':
                 result = event['result']

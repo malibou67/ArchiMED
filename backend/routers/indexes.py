@@ -1,15 +1,22 @@
+import base64
+import csv
+import io
 import json
 import re
 import uuid
+from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from typing import List, Optional
 from models import (
     IndexMetadata, IndexCreate, IndexUpdate, IndexUpdates, IndexPreviewRequest,
-    WordSearchResponse, MultiSearchResponse,
+    WordSearchResponse, MultiSearchResponse, SelectionImport, SelectionSummary,
 )
 from services import IndexesService
+from selections_service import SelectionsService, SelectionNotFound
+import results_workbook
 from stats_service import IndexStatsService
 from export_service import PagesExportService, ExportCancelled
 from index_runner import enqueue_index
@@ -19,6 +26,27 @@ router = APIRouter()
 
 # Jeton d'export fourni par la page (UUID, ou repli horodaté hors contexte sécurisé).
 _DOWNLOAD_TOKEN = re.compile(r'^[A-Za-z0-9-]{8,64}$')
+
+
+def _within(index_id: str, within: Optional[str]) -> Optional[dict]:
+    """Sélection dans laquelle chercher (`{id, name, pages, steps}`), ou None pour tout l'index.
+    Résolue avant toute recherche : une sélection inconnue est un vrai 404, flux compris."""
+    if not within:
+        return None
+    try:
+        summary = SelectionsService.get(index_id, within)
+        return {'id': within, 'name': summary.get('name') or within,
+                'pages': SelectionsService.pages(index_id, within),
+                'steps': summary.get('steps') or []}
+    except SelectionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+def _attachment(filename: str) -> str:
+    """En-tête Content-Disposition d'un nom de fichier accentué : `filename*` en UTF-8 pour les
+    navigateurs, et un repli ASCII pour les autres."""
+    fallback = filename.encode('ascii', 'replace').decode('ascii').replace('?', '_').replace('"', '')
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
 class _ClosingStreamingResponse(StreamingResponse):
@@ -217,27 +245,127 @@ def export_results_csv(
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
     whole_word: bool = Query(False),
     exclude: Optional[str] = Query(None),
+    within: Optional[str] = Query(None),
 ):
     """Exporte les résultats d'une recherche en CSV (registre, page, occurrences, chemin)."""
+    search = dict(q=q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+                  whole_word=whole_word, exclude=exclude)
+    selection = _within(index_id, within)
     rows = IndexesService.resolve_result_pages(
-        index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
-        whole_word=whole_word, exclude=exclude,
-    )
+        index_id, within=selection['pages'] if selection else None, **search)
     if rows is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
+    filename, media_type, content = _results_file('csv', index_id, rows, search, selection)
+    return Response(content=content, media_type=media_type,
+                    headers={"Content-Disposition": _attachment(filename)})
 
-    import io, csv
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["collection", "modèle", "registre", "page", "occurrences", "chemin"])
-    for r in rows:
-        writer.writerow([r.get("source", ""), r.get("model", ""), r["registre"], r["page"], r["occurrences"], r["chemin"]])
-    content = '﻿' + buf.getvalue()  # BOM UTF-8 pour Excel
-    return Response(
-        content=content,
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{index_id}_resultats.csv"'},
-    )
+
+def _results_file(fmt: str, index_id: str, rows: List[dict], search: dict,
+                  selection: Optional[dict], lang: str = "fr") -> tuple:
+    """Le fichier d'export d'une recherche déjà résolue en `rows` (cf.
+    `IndexesService.resolve_result_pages`) : `(nom, type, octets)`. Partagé par les
+    téléchargements directs et par l'export en flux."""
+    if fmt == 'csv':
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["collection", "modèle", "registre", "page", "occurrences", "chemin"])
+        for r in rows:
+            writer.writerow([r.get("source", ""), r.get("model", ""), r["registre"], r["page"],
+                             r["occurrences"], r["chemin"]])
+        # BOM UTF-8 pour Excel
+        return f"{index_id}_resultats.csv", "text/csv", ('﻿' + buf.getvalue()).encode('utf-8')
+
+    # La chaîne de l'entonnoir : les recherches de la sélection où l'on cherche, puis celle-ci.
+    exclude = search.get('exclude') or ''
+    step = {
+        'query': search['q'].strip(), 'whole_word': search.get('whole_word', False),
+        'fuzzy_threshold': search.get('fuzzy_threshold'),
+        'excluded_terms': [t.strip("'\"") for t in exclude.lower().split() if t.strip("'\"")],
+        'year_from': search.get('year_from'), 'year_to': search.get('year_to'), 'found': len(rows),
+    }
+    chain = (selection['steps'] if selection else []) + [step]
+    meta = IndexesService.get_index(index_id) or {}
+    content = results_workbook.build_results_workbook(
+        index_id, meta.get('name') or index_id, rows, chain,
+        within_name=selection['name'] if selection else None, lang=lang)
+    return results_workbook.export_filename(chain, lang), results_workbook.MEDIA_TYPE, content
+
+
+@router.get("/{index_id}/export-results.xlsx")
+def export_results_xlsx(
+    index_id: str,
+    q: str = Query(..., description="Requête (mêmes termes que la recherche)"),
+    year_from: Optional[int] = Query(None),
+    year_to: Optional[int] = Query(None),
+    fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
+    whole_word: bool = Query(False),
+    exclude: Optional[str] = Query(None),
+    within: Optional[str] = Query(None),
+    lang: str = Query("fr", pattern="^(fr|en)$", description="Langue du classeur (celle de l'interface)"),
+):
+    """Exporte les résultats d'une recherche en classeur Excel à trier : une ligne par page,
+    une colonne « Garder » (oui / non ; « Keep », yes / no en anglais), un lien vers chaque
+    image. Trié puis réimporté (`POST /{index_id}/selections/import`), il devient une sélection
+    où chercher ensuite."""
+    search = dict(q=q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+                  whole_word=whole_word, exclude=exclude)
+    selection = _within(index_id, within)
+    rows = IndexesService.resolve_result_pages(
+        index_id, within=selection['pages'] if selection else None, **search)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
+    filename, media_type, content = _results_file('xlsx', index_id, rows, search, selection, lang)
+    return Response(content=content, media_type=media_type,
+                    headers={"Content-Disposition": _attachment(filename)})
+
+
+@router.get("/{index_id}/export-results/stream")
+def export_results_stream(
+    index_id: str,
+    fmt: str = Query(..., alias="format", pattern="^(csv|xlsx)$", description="csv ou xlsx"),
+    q: str = Query(..., description="Requête (mêmes termes que la recherche)"),
+    year_from: Optional[int] = Query(None),
+    year_to: Optional[int] = Query(None),
+    fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
+    whole_word: bool = Query(False),
+    exclude: Optional[str] = Query(None),
+    within: Optional[str] = Query(None),
+    lang: str = Query("fr", pattern="^(fr|en)$"),
+):
+    """Le même export que `export-results.csv` / `.xlsx`, mais en flux NDJSON, pour que la
+    page dise où il en est : la recherche (load/parse/scan/build), puis l'inventaire des images
+    registre par registre (`resolve`, l'étape longue sur le partage), puis `write`, et enfin
+    {"type": "file", "filename", "media_type", "data": <base64>}. Un téléchargement direct ne
+    montrait rien pendant ce temps, ni une erreur éventuelle."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="La requête de recherche est vide")
+    search = dict(q=q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
+                  whole_word=whole_word, exclude=exclude)
+    selection = _within(index_id, within)
+
+    def gen():
+        try:
+            rows = None
+            for event in IndexesService.resolve_result_pages_iter(
+                    index_id, within=selection['pages'] if selection else None, **search):
+                if event.get('type') == 'rows':
+                    rows = event['rows']
+                else:
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+            if rows is None:
+                yield json.dumps({"type": "error", "detail": "Index non trouvé ou non encore généré"},
+                                 ensure_ascii=False) + "\n"
+                return
+            yield json.dumps({"type": "progress", "phase": "write", "current": 0, "total": 0}) + "\n"
+            filename, media_type, content = _results_file(fmt, index_id, rows, search, selection, lang)
+            yield json.dumps({"type": "file", "filename": filename, "media_type": media_type,
+                              "data": base64.b64encode(content).decode('ascii')},
+                             ensure_ascii=False) + "\n"
+        except Exception as e:  # surface l'erreur dans le flux, sans casser la connexion
+            yield json.dumps({"type": "error", "detail": str(e) or type(e).__name__},
+                             ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 @router.get("/{index_id}/export-pages.zip")
@@ -249,6 +377,7 @@ def export_pages_zip(
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100),
     whole_word: bool = Query(False),
     exclude: Optional[str] = Query(None),
+    within: Optional[str] = Query(None),
     download_token: Optional[str] = Query(None, description="Identifiant de l'export, pour en suivre la progression"),
 ):
     """Exporte les images brutes (sans annotation) des pages résultats — et de leurs extra
@@ -263,7 +392,7 @@ def export_pages_zip(
         raise HTTPException(status_code=400, detail="Jeton de téléchargement invalide")
     job = PagesExportService.start(
         token, index_id, q, year_from=year_from, year_to=year_to, fuzzy_threshold=fuzzy_threshold,
-        whole_word=whole_word, exclude=exclude,
+        whole_word=whole_word, exclude=exclude, within=_within(index_id, within),
     )
     try:
         files = PagesExportService.prepare(job)
@@ -343,17 +472,21 @@ def search_in_index(
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100, description="Seuil de similarité (0-100). 100 = exact/substring, <100 = fuzzy."),
     whole_word: bool = Query(False, description="Mots entiers seulement : « par » ne trouve pas « parfois »."),
     exclude: Optional[str] = Query(None, description="Mots à exclure : une page qui en contient un est écartée."),
+    within: Optional[str] = Query(None, description="Id d'une sélection : ne chercher que dans ses pages."),
 ):
     """Recherche un ou plusieurs termes dans l'index avec intersection des pages.
     Les paramètres year_from et year_to permettent de restreindre la recherche à une période.
     fuzzy_threshold active la recherche approximative via rapidfuzz ; whole_word écarte les
     mots qui ne font que contenir un terme ; exclude écarte les pages qui contiennent un de
-    ses mots (mêmes règles de correspondance)."""
+    ses mots (mêmes règles de correspondance) ; within limite la recherche aux pages d'une
+    sélection enregistrée."""
     if not q.strip():
         raise HTTPException(status_code=400, detail="La requête de recherche est vide")
+    selection = _within(index_id, within)
     result = IndexesService.search_words(index_id, q, year_from=year_from, year_to=year_to,
                                          fuzzy_threshold=fuzzy_threshold, whole_word=whole_word,
-                                         exclude=exclude)
+                                         exclude=exclude,
+                                         within=selection['pages'] if selection else None)
     if result is None:
         raise HTTPException(status_code=404, detail="Index non trouvé ou non encore généré")
     return result
@@ -368,6 +501,7 @@ def search_in_index_stream(
     fuzzy_threshold: Optional[int] = Query(None, ge=0, le=100, description="Seuil de similarité (0-100). 100 = exact/substring, <100 = fuzzy."),
     whole_word: bool = Query(False, description="Mots entiers seulement : « par » ne trouve pas « parfois »."),
     exclude: Optional[str] = Query(None, description="Mots à exclure : une page qui en contient un est écartée."),
+    within: Optional[str] = Query(None, description="Id d'une sélection : ne chercher que dans ses pages."),
 ):
     """Même recherche que /search, mais en flux NDJSON : une ligne JSON par événement de
     progression ({"type": "progress", "phase", "current", "total"}), puis le résultat
@@ -375,12 +509,14 @@ def search_in_index_stream(
     le flux permet d'afficher une barre de progression au lieu d'un spinner."""
     if not q.strip():
         raise HTTPException(status_code=400, detail="La requête de recherche est vide")
+    selection = _within(index_id, within)
 
     def gen():
         try:
             for event in IndexesService.search_words_iter(
                 index_id, q, year_from=year_from, year_to=year_to,
                 fuzzy_threshold=fuzzy_threshold, whole_word=whole_word, exclude=exclude,
+                within=selection['pages'] if selection else None,
             ):
                 if event.get('type') == 'result' and event.get('result') is None:
                     yield json.dumps({"type": "error", "detail": "Index non trouvé ou non encore généré"},
@@ -391,6 +527,59 @@ def search_in_index_stream(
             yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+# ── Sélections de pages (recherche en entonnoir) ─────────────────────────────
+
+@router.get("/{index_id}/selections", response_model=List[SelectionSummary])
+def list_selections(index_id: str):
+    """Sélections enregistrées sur cet index, de la plus récente à la plus ancienne (sans
+    leurs pages)."""
+    try:
+        return SelectionsService.summaries(index_id)
+    except SelectionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/{index_id}/selections/import", response_model=SelectionImport)
+def import_selection(index_id: str, file: UploadFile = File(...)):
+    """Importe un classeur exporté par `export-results.xlsx` puis trié, en français ou en
+    anglais : les pages à « oui » de la colonne Garder deviennent une sélection, nommée d'après
+    le fichier. Un refus est un 400 dont le `detail` porte un `code` que la page traduit
+    (`unreadable`, `not_archimed`, `missing_keep_column`, `missing_id_column`, `other_index`,
+    `nothing_kept`), ses `params`, et un `message` en français."""
+    WorkbookError = results_workbook.WorkbookError
+    try:
+        if IndexesService.get_index(index_id) is None:
+            raise SelectionNotFound(f"Index inconnu : {index_id}")
+        content = results_workbook.read_kept_pages(file.file.read())
+        if content['index_id'] and content['index_id'] != index_id:
+            origin = content['index_name'] or content['index_id']
+            raise WorkbookError("other_index", f"Ce fichier a été exporté depuis l'index « {origin} », "
+                                "pas depuis celui-ci.", index=origin)
+        if not content['pages']:
+            raise WorkbookError("nothing_kept", "Aucune page n'est à « oui » dans la colonne Garder.")
+        name = Path(file.filename or '').stem or "Sélection importée"
+        selection = SelectionsService.create(index_id, name, content['pages'], content['steps'],
+                                             source_file=file.filename)
+    except SelectionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except WorkbookError as e:
+        raise HTTPException(status_code=400, detail={'code': e.code, 'params': e.params,
+                                                     'message': str(e)})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {'selection': selection, 'kept': content['kept'], 'dropped': content['dropped'],
+            'ignored': content['ignored']}
+
+
+@router.delete("/{index_id}/selections/{sel_id}")
+def delete_selection(index_id: str, sel_id: str):
+    try:
+        SelectionsService.delete(index_id, sel_id)
+    except SelectionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"deleted": sel_id}
 
 
 # ── Statistiques ──────────────────────────────────────────────────────────────

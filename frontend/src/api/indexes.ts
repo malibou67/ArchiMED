@@ -10,6 +10,8 @@ import {
   MultiSearchResponse,
   PagesExportStatus,
   SearchProgress,
+  SelectionImport,
+  SelectionSummary,
   VocabularyResponse,
   WordPagesResponse,
   CorpusStatsResponse,
@@ -26,6 +28,7 @@ export type SearchOptions = {
   fuzzyThreshold?: number;
   wholeWord?: boolean;
   exclude?: string;   // mots à exclure, séparés par des espaces
+  within?: string;    // id d'une sélection : ne chercher que dans ses pages
 };
 
 const searchParams = (query: string, o: SearchOptions): URLSearchParams => {
@@ -35,7 +38,37 @@ const searchParams = (query: string, o: SearchOptions): URLSearchParams => {
   if (o.fuzzyThreshold !== undefined && o.fuzzyThreshold < 100) params.set('fuzzy_threshold', String(o.fuzzyThreshold));
   if (o.wholeWord) params.set('whole_word', 'true');
   if (o.exclude?.trim()) params.set('exclude', o.exclude.trim());
+  if (o.within) params.set('within', o.within);
   return params;
+};
+
+// Paramètres d'un export de résultats : ceux de la recherche affichée, telle que le serveur l'a
+// décrite (MultiSearchResponse), plus la langue du classeur et le jeton du ZIP.
+export type ResultsExportParams = {
+  q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number; whole_word?: boolean;
+  exclude?: string; within?: string; lang?: string; download_token?: string;
+};
+
+// Étape d'un export en flux : celles de la recherche (load/parse/scan/build), puis l'inventaire
+// des images (`resolve`, compté en registres) et l'écriture du fichier (`write`).
+export type ResultsExportProgress = {
+  phase: 'load' | 'parse' | 'scan' | 'build' | 'resolve' | 'write';
+  current: number;
+  total: number;
+};
+
+const resultsExportQuery = (params: ResultsExportParams): URLSearchParams => {
+  const qs = new URLSearchParams();
+  qs.set('q', params.q);
+  if (params.year_from != null) qs.set('year_from', String(params.year_from));
+  if (params.year_to != null) qs.set('year_to', String(params.year_to));
+  if (params.fuzzy_threshold != null && params.fuzzy_threshold < 100) qs.set('fuzzy_threshold', String(params.fuzzy_threshold));
+  if (params.whole_word) qs.set('whole_word', 'true');
+  if (params.exclude?.trim()) qs.set('exclude', params.exclude.trim());
+  if (params.within) qs.set('within', params.within);
+  if (params.lang) qs.set('lang', params.lang);   // langue du classeur Excel
+  if (params.download_token) qs.set('download_token', params.download_token);
+  return qs;
 };
 
 export const indexesApi = {
@@ -208,19 +241,60 @@ export const indexesApi = {
 
   getResultsExportUrl: (
     indexId: string,
-    kind: 'csv' | 'zip',
-    params: { q: string; year_from?: number; year_to?: number; fuzzy_threshold?: number; whole_word?: boolean; exclude?: string; download_token?: string },
+    kind: 'csv' | 'xlsx' | 'zip',
+    params: ResultsExportParams,
   ): string => {
-    const qs = new URLSearchParams();
-    qs.set('q', params.q);
-    if (params.year_from != null) qs.set('year_from', String(params.year_from));
-    if (params.year_to != null) qs.set('year_to', String(params.year_to));
-    if (params.fuzzy_threshold != null && params.fuzzy_threshold < 100) qs.set('fuzzy_threshold', String(params.fuzzy_threshold));
-    if (params.whole_word) qs.set('whole_word', 'true');
-    if (params.exclude?.trim()) qs.set('exclude', params.exclude.trim());
-    if (params.download_token) qs.set('download_token', params.download_token);
-    const file = kind === 'csv' ? 'export-results.csv' : 'export-pages.zip';
-    return `/api/indexes/${indexId}/${file}?${qs.toString()}`;
+    const file = { csv: 'export-results.csv', xlsx: 'export-results.xlsx', zip: 'export-pages.zip' }[kind];
+    return `/api/indexes/${indexId}/${file}?${resultsExportQuery(params).toString()}`;
+  },
+
+  // Export CSV / Excel en flux : onProgress suit la recherche, puis l'inventaire des images
+  // registre par registre (l'étape longue sur le partage), puis l'écriture ; le fichier arrive
+  // dans le dernier événement. Un lien de téléchargement direct ne montrait rien de cette
+  // attente, ni une erreur éventuelle.
+  exportResultsStream: async (
+    indexId: string,
+    format: 'csv' | 'xlsx',
+    params: ResultsExportParams,
+    onProgress: (p: ResultsExportProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<{ filename: string; blob: Blob }> => {
+    const qs = resultsExportQuery(params);
+    qs.set('format', format);
+    let file: { filename: string; blob: Blob } | null = null;
+    await readNdjson(`/api/indexes/${indexId}/export-results/stream?${qs}`, { signal }, (event) => {
+      if (event.type === 'progress') {
+        onProgress({ phase: event.phase, current: event.current, total: event.total });
+      } else if (event.type === 'file') {
+        const bytes = Uint8Array.from(atob(event.data), c => c.charCodeAt(0));
+        file = { filename: event.filename, blob: new Blob([bytes], { type: event.media_type }) };
+      }
+    });
+    if (!file) throw new Error('Fichier d\'export manquant');
+    return file;
+  },
+
+  // Sélections de pages (recherche en entonnoir), partagées par tous les postes. `timeout: 0` :
+  // elles sont lues et écrites sur le partage, qui peut être lent.
+  listSelections: async (indexId: string): Promise<SelectionSummary[]> => {
+    const response = await api.get(`/api/indexes/${indexId}/selections`, { timeout: 0 });
+    return response.data;
+  },
+
+  // Importe un classeur exporté en « Liste à trier (Excel) » puis trié : ses lignes à « oui »
+  // deviennent une sélection.
+  importSelection: async (indexId: string, file: File): Promise<SelectionImport> => {
+    const form = new FormData();
+    form.append('file', file);
+    // L'instance axios envoie du JSON par défaut : sans cet en-tête, le fichier n'arrive pas.
+    const response = await api.post(`/api/indexes/${indexId}/selections/import`, form, {
+      timeout: 0, headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
+  deleteSelection: async (indexId: string, selectionId: string): Promise<void> => {
+    await api.delete(`/api/indexes/${indexId}/selections/${selectionId}`, { timeout: 0 });
   },
 
   // Suivi d'un export ZIP lancé avec `download_token` : le téléchargement est natif, la page
